@@ -1,0 +1,47 @@
+version: 1
+poll_interval_seconds: 300
+state_path: ./examples/data/demo-state.json
+
+# This validates and exercises account separation without external fleet
+# commands. Replace static observers and none actuators using the focused
+# examples before production use.
+accounts:
+  claude-anthropic:
+    source:
+      type: normalized_file
+      path: ./examples/data/claude-anthropic.json
+    fleet:
+      min_workers: 0
+      max_workers: 8
+      observer: { type: static, workers: 2 }
+      actuator: { type: none }
+    utilization:
+      reserve_fraction: 0.15
+      stale_after_seconds: 315360000
+
+  codex:
+    source:
+      type: normalized_file
+      path: ./examples/data/codex.json
+    fleet:
+      min_workers: 0
+      max_workers: 12
+      observer: { type: static, workers: 3 }
+      actuator: { type: none }
+    utilization:
+      target_utilization: 0.90
+      stale_after_seconds: 315360000
+
+  claude-zai:
+    source:
+      type: normalized_file
+      path: ./examples/data/claude-zai.json
+    fleet:
+      min_workers: 0
+      max_workers: 8
+      observer: { type: static, workers: 2 }
+      actuator: { type: none }
+    utilization:
+      reserve_fraction: 0.10
+      stale_after_seconds: 315360000
+

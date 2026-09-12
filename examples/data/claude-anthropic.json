@@ -1,0 +1,9 @@
+{
+  "observed_at": "2026-09-12T12:00:00Z",
+  "fresh": true,
+  "windows": [
+    {"id":"five_hour","used_fraction":0.35,"resets_at":"2030-09-12T17:00:00Z","duration_minutes":300},
+    {"id":"seven_day","used_fraction":0.46,"resets_at":"2030-09-17T00:00:00Z","duration_minutes":10080}
+  ]
+}
+

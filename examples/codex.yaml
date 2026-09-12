@@ -1,0 +1,37 @@
+version: 1
+poll_interval_seconds: 300
+state_path: ~/.local/state/subscription-governor/codex.json
+
+accounts:
+  codex:
+    source:
+      type: codex_app_server
+      executable: codex
+      timeout_seconds: 15
+    fleet:
+      min_workers: 0
+      max_workers: 12
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 2
+      max_scale_down_per_cycle: 3
+      # A file observer/actuator pair is convenient when another reconciler
+      # owns process creation. Both files contain one integer.
+      observer:
+        type: file
+        path: /run/user/1000/codex-workers.current
+      actuator:
+        type: target_file
+        path: /run/user/1000/codex-workers.target
+    utilization:
+      target_utilization: 0.90
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: min_workers
+      minimum_sample_seconds: 300
+      # Codex ids are <limit_id>.primary and <limit_id>.secondary. Unlisted
+      # ids still inherit the 90% account target.
+      windows:
+        codex.primary:
+          reserve_fraction: 0.15
+        codex.secondary:
+          target_utilization: 0.95

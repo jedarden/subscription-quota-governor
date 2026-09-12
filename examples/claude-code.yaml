@@ -1,0 +1,35 @@
+version: 1
+poll_interval_seconds: 300
+state_path: ~/.local/state/subscription-governor/claude-code.json
+
+accounts:
+  claude-anthropic:
+    source:
+      type: anthropic_oauth
+      credentials_path: ~/.claude/.credentials.json
+      timeout_seconds: 15
+    fleet:
+      min_workers: 0
+      max_workers: 8
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 2
+      # Replace these helper paths with commands for your worker manager.
+      observer:
+        type: command
+        argv: [/usr/local/bin/count-ai-workers, claude-anthropic]
+      actuator:
+        type: command
+        argv: [/usr/local/bin/set-ai-worker-target, claude-anthropic, "{desired_workers}"]
+    utilization:
+      # Consume 85% and preserve 15% for interactive Claude Code use.
+      reserve_fraction: 0.15
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      minimum_sample_seconds: 300
+      windows:
+        five_hour:
+          reserve_fraction: 0.20
+        weekly_scoped:
+          target_utilization: 0.90

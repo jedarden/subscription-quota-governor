@@ -1,0 +1,26 @@
+[package]
+name = "subscription-governor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Provider-neutral subscription quota pacing for AI coding agents"
+repository = "https://git.ardenone.com/jedarden/subscription-quota-governor"
+
+[[bin]]
+name = "subgov"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6.0"
+fs2 = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "2.0"
+ureq = { version = "2.12", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3.20"

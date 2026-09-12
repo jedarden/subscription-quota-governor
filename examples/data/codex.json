@@ -1,0 +1,9 @@
+{
+  "observed_at": "2026-09-12T12:00:00Z",
+  "fresh": true,
+  "windows": [
+    {"id":"codex.primary","used_fraction":0.28,"resets_at":"2030-09-12T17:00:00Z","duration_minutes":300},
+    {"id":"codex.secondary","used_fraction":0.51,"resets_at":"2030-09-17T00:00:00Z","duration_minutes":10080}
+  ]
+}
+

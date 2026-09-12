@@ -1,0 +1,34 @@
+version: 1
+poll_interval_seconds: 60
+state_path: ~/.local/state/subscription-governor/claude-zai.json
+
+accounts:
+  claude-zai:
+    # Keep provider-specific credentials and collection in a site-local helper.
+    # It emits the normalized JSON contract documented in the README.
+    source:
+      type: command
+      argv: [/usr/local/bin/read-subscription-quota, claude-zai]
+    fleet:
+      min_workers: 0
+      max_workers: 8
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 2
+      observer:
+        type: command
+        argv: [/usr/local/bin/count-ai-workers, claude-zai]
+      actuator:
+        type: command
+        argv: [/usr/local/bin/set-ai-worker-target, claude-zai, "{desired_workers}"]
+    utilization:
+      reserve_fraction: 0.10
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      minimum_sample_seconds: 120
+      windows:
+        five_hour:
+          reserve_fraction: 0.15
+        weekly:
+          target_utilization: 0.95
