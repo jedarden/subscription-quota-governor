@@ -41,6 +41,8 @@ Status notation:
 - Predicting provider pricing or token costs when the subscription surface
   already reports utilization.
 - Managing provider login workflows.
+- Redeeming, consuming, or otherwise mutating banked reset credits. The
+  governor may recommend redemption, but a human performs it.
 - Embedding private deployment topology or provider-specific infrastructure.
 - Mutating a Kubernetes fleet directly. A Kubernetes installation should write
   desired state through its normal GitOps or controller boundary.
@@ -189,10 +191,11 @@ Build requirements:
   details from `account/rateLimits/read`.
 - [x] Support a configurable banked-reset pace with a 2x default floor and
   deadline-aware acceleration.
-- [x] Redeem through the supported App Server method only, behind explicit
-  opt-in and a durable idempotency record.
-- [x] Reconcile with a full rate-limit read after each definitive redemption
-  outcome and before fleet actuation.
+- [x] Emit a structured manual-redemption recommendation at the configured
+  utilization threshold and drain the governed fleet at that boundary.
+- [x] Exclude reset-credit consumption from configuration, CLI commands,
+  provider adapters, and state. Redemption remains human-controlled per
+  [ADR-0001](../adr/0001-human-controlled-reset-redemption.md).
 - [ ] Add a fake app-server executable for handshake, interleaved notification,
   timeout, child-exit, sparse-window, and protocol-error tests.
 - [ ] Replace per-poll process startup with a supervised long-lived session.
@@ -389,7 +392,26 @@ minimum of those counts. Then:
 The emitted decision retains every per-window result and reason, even when a
 different window wins.
 
-### 9.7 Future estimator hardening
+### 9.7 Banked-reset pacing and human handoff
+
+When `banked_resets.enabled` and `available_count > 0`, the controller raises
+the weekly target to at least `redeem_at_utilization` and computes:
+
+```text
+minimum banked burn = minimum_pace_multiplier * target / window duration
+expiry burn         = remaining generations / time to expiry safety deadline
+required banked burn = max(minimum banked burn, each known expiry burn)
+```
+
+The resulting worker count is a floor on ordinary weekly pacing, but a reached
+shorter window remains binding. At the redemption threshold, the controller
+sets `manual_redemption_recommended: true` and drains toward `min_workers`.
+The governor then waits for a human redemption and observes the new generation
+through the normal read path. It has no reset-credit mutation path. This
+boundary is normative per
+[ADR-0001](../adr/0001-human-controlled-reset-redemption.md).
+
+### 9.8 Future estimator hardening
 
 The two-point estimator is the v0.1 baseline. Before v1 production scaling:
 
@@ -530,6 +552,8 @@ Decision events include:
 - every window's utilization, target, reset, proposed count, and reason;
 - derived burn rate when usable;
 - the binding window ID in v1.
+- banked-reset balance, expiry pressure, and whether manual redemption is
+  recommended.
 
 Planned metrics:
 
@@ -575,6 +599,7 @@ provider payloads, model prompts, raw errors, or unbounded provider labels.
 | `src/main.rs` | CLI, cycles, error isolation, and process lifecycle. |
 | `examples/` | Safe configurations and synthetic normalized data. |
 | `docs/notes/` | Operator-facing configuration and future design decisions. |
+| `docs/adr/` | Accepted architectural decisions and their consequences. |
 | `docs/research/` | Public provider-surface evidence and compatibility notes. |
 | `docs/plan/plan.md` | Build sequence, contracts, and acceptance criteria. |
 
@@ -792,6 +817,8 @@ V1 is ready only when all of the following are true:
 - [ ] State has a version, migration path, restrictive permissions, and crash
   tests.
 - [ ] Observe-only mode is proven to perform no actuator mutation.
+- [ ] Contract tests prove no governor path can call a reset-credit consumption
+  method and that a ready credit produces a manual recommendation.
 - [ ] JSONL and metrics contain no secrets or unbounded provider labels.
 - [ ] Security/advisory and fixture-secret scans pass.
 - [ ] Service, operations, and rollback documentation is complete.
@@ -843,6 +870,6 @@ These require evidence from observation-mode traces:
 - whether a long-lived Codex session materially improves reliability;
 - which fleet-manager-specific adapters merit first-party support.
 
-Record each decision in `docs/notes/` with the trace or test evidence that
-supports it. Changes to the normalized contract or safety invariants require an
-explicit plan revision.
+Record architectural decisions in `docs/adr/` and operational evidence in
+`docs/notes/`. Changes to the normalized contract or safety invariants require
+an explicit plan revision.

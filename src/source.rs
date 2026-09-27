@@ -40,81 +40,6 @@ pub fn collect(source: &SourceConfig) -> Result<QuotaSnapshot> {
     validate_snapshot(snapshot)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResetConsumeOutcome {
-    Reset,
-    AlreadyRedeemed,
-    NothingToReset,
-    NoCredit,
-    Other(String),
-}
-
-impl ResetConsumeOutcome {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Reset => "reset",
-            Self::AlreadyRedeemed => "alreadyRedeemed",
-            Self::NothingToReset => "nothingToReset",
-            Self::NoCredit => "noCredit",
-            Self::Other(value) => value,
-        }
-    }
-
-    pub fn is_success(&self) -> bool {
-        matches!(self, Self::Reset | Self::AlreadyRedeemed)
-    }
-}
-
-/// Consume one Codex banked reset through the supported app-server method.
-///
-/// The caller owns idempotency persistence. An uncertain retry must reuse the
-/// same key so a completed request cannot consume a second credit.
-pub fn consume_reset_credit(
-    source: &SourceConfig,
-    idempotency_key: &str,
-    credit_id: Option<&str>,
-) -> Result<ResetConsumeOutcome> {
-    let SourceConfig::CodexAppServer {
-        executable,
-        timeout_seconds,
-    } = source
-    else {
-        bail!("banked reset redemption requires a Codex app-server source");
-    };
-    if idempotency_key.trim().is_empty() {
-        bail!("banked reset redemption requires a non-empty idempotency key");
-    }
-    let mut params = serde_json::Map::new();
-    params.insert(
-        "idempotencyKey".to_owned(),
-        Value::String(idempotency_key.to_owned()),
-    );
-    if let Some(credit_id) = credit_id.filter(|value| !value.is_empty()) {
-        params.insert("creditId".to_owned(), Value::String(credit_id.to_owned()));
-    }
-    let result = codex_app_server_request(
-        executable,
-        *timeout_seconds,
-        "account/rateLimitResetCredit/consume",
-        Some(Value::Object(params)),
-    )?;
-    parse_reset_consume_outcome(&result)
-}
-
-fn parse_reset_consume_outcome(result: &Value) -> Result<ResetConsumeOutcome> {
-    let outcome = result
-        .get("outcome")
-        .and_then(Value::as_str)
-        .context("Codex reset response omitted outcome")?;
-    Ok(match outcome {
-        "reset" => ResetConsumeOutcome::Reset,
-        "alreadyRedeemed" => ResetConsumeOutcome::AlreadyRedeemed,
-        "nothingToReset" => ResetConsumeOutcome::NothingToReset,
-        "noCredit" => ResetConsumeOutcome::NoCredit,
-        other => ResetConsumeOutcome::Other(other.to_owned()),
-    })
-}
-
 fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
     let output = Command::new(&argv[0])
         .args(&argv[1..])
@@ -283,17 +208,11 @@ fn parse_anthropic_limit(id: &str, value: &Value) -> Option<QuotaWindow> {
 }
 
 fn collect_codex(executable: &Path, timeout_seconds: u64) -> Result<QuotaSnapshot> {
-    let result =
-        codex_app_server_request(executable, timeout_seconds, "account/rateLimits/read", None)?;
+    let result = read_codex_rate_limits(executable, timeout_seconds)?;
     parse_codex_rate_limits(&result, Utc::now())
 }
 
-fn codex_app_server_request(
-    executable: &Path,
-    timeout_seconds: u64,
-    method: &str,
-    params: Option<Value>,
-) -> Result<Value> {
+fn read_codex_rate_limits(executable: &Path, timeout_seconds: u64) -> Result<Value> {
     let child = Command::new(executable)
         .args(["app-server", "--listen", "stdio://"])
         .stdin(Stdio::piped())
@@ -344,24 +263,24 @@ fn codex_app_server_request(
     }
 
     writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}))?;
-    let mut request = json!({"id": 2, "method": method});
-    if let Some(params) = params {
-        request["params"] = params;
-    }
-    writeln!(stdin, "{request}")?;
+    writeln!(
+        stdin,
+        "{}",
+        json!({"id": 2, "method": "account/rateLimits/read"})
+    )?;
     stdin.flush()?;
     let response = receive_response(&receiver, 2, timeout_seconds);
     drop(stdin);
     child.terminate();
     let _ = reader.join();
-    let response = response.with_context(|| format!("timed out waiting for Codex {method}"))?;
+    let response = response.context("timed out reading Codex rate limits")?;
     if let Some(error) = response.get("error") {
-        bail!("Codex app-server rejected {method}: {error}");
+        bail!("Codex app-server rejected the rate-limit request: {error}");
     }
     response
         .get("result")
         .cloned()
-        .with_context(|| format!("Codex {method} response omitted result"))
+        .context("Codex rate-limit response omitted result")
 }
 
 struct ChildGuard(Child);
@@ -623,21 +542,6 @@ mod tests {
         assert_eq!(detail.id, "credit-1");
         assert_eq!(detail.status, "available");
         assert_eq!(detail.expires_at.unwrap().timestamp(), 1_800_200_000);
-    }
-
-    #[test]
-    fn parses_all_documented_reset_outcomes() {
-        for (wire, expected) in [
-            ("reset", ResetConsumeOutcome::Reset),
-            ("alreadyRedeemed", ResetConsumeOutcome::AlreadyRedeemed),
-            ("nothingToReset", ResetConsumeOutcome::NothingToReset),
-            ("noCredit", ResetConsumeOutcome::NoCredit),
-        ] {
-            assert_eq!(
-                parse_reset_consume_outcome(&json!({"outcome": wire})).unwrap(),
-                expected
-            );
-        }
     }
 
     #[test]

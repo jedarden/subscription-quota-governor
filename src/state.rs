@@ -20,20 +20,6 @@ pub struct AccountState {
     pub windows: BTreeMap<String, WindowSample>,
     #[serde(default)]
     pub last_target: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_reset_redemption: Option<PendingResetRedemption>,
-}
-
-/// A reset request durably recorded before it is sent to Codex.
-///
-/// Retrying this request with the same idempotency key is safe if the process
-/// loses the response after Codex has already consumed the credit.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PendingResetRedemption {
-    pub idempotency_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credit_id: Option<String>,
-    pub started_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

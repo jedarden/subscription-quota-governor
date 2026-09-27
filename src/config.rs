@@ -154,10 +154,7 @@ pub struct BankedResetConfig {
     /// advertised duration while a reset credit is available.
     #[serde(default = "default_minimum_pace_multiplier")]
     pub minimum_pace_multiplier: f64,
-    /// Allow the governor to redeem a reset after the governing weekly window
-    /// reaches `redeem_at_utilization`. This is deliberately opt-in.
-    #[serde(default)]
-    pub auto_redeem: bool,
+    /// Utilization at which the decision output asks a human to redeem.
     #[serde(default = "default_redeem_at_utilization")]
     pub redeem_at_utilization: f64,
     /// Finish deadline-driven consumption this far before credit expiry.
@@ -170,7 +167,6 @@ impl Default for BankedResetConfig {
         Self {
             enabled: false,
             minimum_pace_multiplier: default_minimum_pace_multiplier(),
-            auto_redeem: false,
             redeem_at_utilization: default_redeem_at_utilization(),
             deadline_safety_seconds: default_deadline_safety_seconds(),
         }
@@ -346,12 +342,6 @@ fn validate_banked_resets(account: &AccountConfig, name: &str) -> Result<()> {
     {
         bail!("account {name}: banked_resets.redeem_at_utilization must be in (0, 1]");
     }
-    if policy.auto_redeem && !policy.enabled {
-        bail!("account {name}: banked_resets.auto_redeem requires banked_resets.enabled");
-    }
-    if policy.auto_redeem && !matches!(&account.source, SourceConfig::CodexAppServer { .. }) {
-        bail!("account {name}: banked reset redemption requires source.type: codex_app_server");
-    }
     if policy.deadline_safety_seconds > i64::MAX as u64 {
         bail!("account {name}: banked_resets.deadline_safety_seconds is too large");
     }
@@ -440,7 +430,6 @@ mod tests {
     fn banked_resets_default_to_detection_without_actuation() {
         let policy = BankedResetConfig::default();
         assert!(!policy.enabled);
-        assert!(!policy.auto_redeem);
         assert_eq!(policy.minimum_pace_multiplier, 2.0);
     }
 }

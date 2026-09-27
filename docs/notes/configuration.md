@@ -57,8 +57,8 @@ Starts `codex app-server --listen stdio://`, completes initialization, calls
 
 The same read also captures `rateLimitResetCredits.availableCount` and any
 optional detail rows. The count, not the row count, is authoritative. The
-governor uses only the supported
-`account/rateLimitResetCredit/consume` App Server request to redeem a credit.
+governor does not call the reset-consumption method; redemption remains in an
+interactive, human-controlled Codex surface.
 
 ## Banked-reset policy
 
@@ -73,7 +73,8 @@ effective required burn = max(minimum required burn, each known deadline rate)
 
 The default multiplier is `2.0`. When a banked reset exists, the effective
 weekly target is at least `redeem_at_utilization` (default `1.0`), even if the
-ordinary policy preserves a reserve. This makes the next credit redeemable.
+ordinary policy preserves a reserve. This makes the next credit ready for a
+human to redeem.
 Shorter windows continue to constrain the final worker target.
 
 Detailed credit rows may be absent. In that case the governor still enforces
@@ -81,17 +82,12 @@ the minimum pace from the authoritative balance, but cannot calculate an
 expiry deadline. `deadline_safety_seconds` (default six hours) advances each
 known deadline to leave operational margin.
 
-`auto_redeem` defaults to false and is valid only with a `codex_app_server`
-source. `--observe-only` disables it. When enabled, the governor:
-
-1. waits until the weekly window reaches `redeem_at_utilization`;
-2. writes a pending UUID idempotency key and earliest-expiring known credit id
-   to its atomic state file;
-3. requests redemption and retains that record across transport uncertainty;
-4. clears it only for a documented definitive outcome; and
-5. re-reads rate limits and re-evaluates before fleet actuation.
-
-This prevents a lost response or process restart from consuming two credits.
+At the threshold, the controller sets
+`manual_redemption_recommended: true`, reports the reason
+`weekly_window_awaiting_manual_redemption`, and drains toward `min_workers`.
+An operator then verifies the account and redeems manually. There is no
+`auto_redeem` option, redemption CLI, or reset-consumption call in the
+governor. See [ADR-0001](../adr/0001-human-controlled-reset-redemption.md).
 
 ### `normalized_http`
 

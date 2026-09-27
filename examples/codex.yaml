@@ -42,6 +42,5 @@ accounts:
       minimum_pace_multiplier: 2.0
       redeem_at_utilization: 1.0
       deadline_safety_seconds: 21600
-      # Deliberately opt in only after observing decisions and wiring a real
-      # fleet. `--observe-only` suppresses redemption even when this is true.
-      auto_redeem: false
+      # Redemption is deliberately not configurable here: it remains a human
+      # action after the decision reports manual_redemption_recommended: true.

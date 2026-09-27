@@ -22,9 +22,10 @@ Unix-second `resetsAt` value.
 
 The same protocol reports `rateLimitResetCredits`, whose `availableCount` is
 authoritative even when detail rows are omitted, and provides
-`account/rateLimitResetCredit/consume` with a caller-supplied idempotency key.
-The documented success outcomes are `reset` and `alreadyRedeemed`; callers
-must reconcile with another full read after success.
+`account/rateLimitResetCredit/consume`. The governor deliberately uses only the
+read surface: reset redemption remains an explicit human action in an
+interactive Codex client, as recorded in
+[ADR-0001](../adr/0001-human-controlled-reset-redemption.md).
 
 Reference: [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
 

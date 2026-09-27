@@ -36,7 +36,8 @@ pub struct BankedResetDecision {
     pub minimum_pace_multiplier: f64,
     pub required_burn_per_hour: f64,
     pub desired_workers: u32,
-    pub redeem_recommended: bool,
+    /// A human should redeem one credit before resuming this weekly window.
+    pub manual_redemption_recommended: bool,
     pub deadline_missed: bool,
     pub reason: String,
     pub known_expirations: Vec<DateTime<Utc>>,
@@ -175,7 +176,7 @@ pub fn evaluate(
                 .is_some_and(|window| !is_weekly_window(window.duration_minutes))
     });
     let raw_desired = match &banked_resets {
-        Some(plan) if !plan.redeem_recommended && !short_window_reached => {
+        Some(plan) if !plan.manual_redemption_recommended && !short_window_reached => {
             ordinary_desired.max(plan.desired_workers)
         }
         _ => ordinary_desired,
@@ -240,10 +241,13 @@ fn banked_reset_decision(
         }
     }
 
-    let redeem_recommended =
+    let manual_redemption_recommended =
         window.reached || window.used_fraction >= config.banked_resets.redeem_at_utilization;
-    let (desired_workers, reason) = if redeem_recommended {
-        (config.fleet.min_workers, "weekly_window_ready_to_redeem")
+    let (desired_workers, reason) = if manual_redemption_recommended {
+        (
+            config.fleet.min_workers,
+            "weekly_window_awaiting_manual_redemption",
+        )
     } else if deadline_missed {
         (
             config.fleet.max_workers,
@@ -274,7 +278,7 @@ fn banked_reset_decision(
         minimum_pace_multiplier: config.banked_resets.minimum_pace_multiplier,
         required_burn_per_hour,
         desired_workers,
-        redeem_recommended,
+        manual_redemption_recommended,
         deadline_missed,
         reason: reason.to_owned(),
         known_expirations,
@@ -579,7 +583,7 @@ mod tests {
         let decision =
             evaluate("test", &config, &snapshot, &AccountState::default(), 3, now).unwrap();
         let banked = decision.banked_resets.unwrap();
-        assert!(banked.redeem_recommended);
+        assert!(banked.manual_redemption_recommended);
         assert_eq!(decision.desired_workers, 0);
     }
 
