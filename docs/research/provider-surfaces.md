@@ -20,7 +20,13 @@ The official Codex app-server protocol exposes `account/rateLimits/read` and
 Primary and secondary windows report `usedPercent`, `windowDurationMins`, and a
 Unix-second `resetsAt` value.
 
-Reference: [Codex App Server documentation](https://developers.openai.com/codex/app-server).
+The same protocol reports `rateLimitResetCredits`, whose `availableCount` is
+authoritative even when detail rows are omitted, and provides
+`account/rateLimitResetCredit/consume` with a caller-supplied idempotency key.
+The documented success outcomes are `reset` and `alreadyRedeemed`; callers
+must reconcile with another full read after success.
+
+Reference: [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
 
 ## Claude Code / Z.AI
 

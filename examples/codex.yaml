@@ -35,3 +35,13 @@ accounts:
           reserve_fraction: 0.15
         codex.secondary:
           target_utilization: 0.95
+    banked_resets:
+      # Detect banked resets and consume ordinary quota at no less than twice
+      # the weekly-window pace. Known credit expirations can require more.
+      enabled: true
+      minimum_pace_multiplier: 2.0
+      redeem_at_utilization: 1.0
+      deadline_safety_seconds: 21600
+      # Deliberately opt in only after observing decisions and wiring a real
+      # fleet. `--observe-only` suppresses redemption even when this is true.
+      auto_redeem: false

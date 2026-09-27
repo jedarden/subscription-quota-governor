@@ -8,8 +8,10 @@ use std::time::Duration;
 use subscription_governor::config::{ActuatorConfig, Config};
 use subscription_governor::controller::evaluate;
 use subscription_governor::fleet;
+use subscription_governor::model::QuotaSnapshot;
 use subscription_governor::source;
-use subscription_governor::state::{State, StateLock};
+use subscription_governor::state::{PendingResetRedemption, State, StateLock};
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "subgov", version, about)]
@@ -66,7 +68,7 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<()> {
     let _lock = StateLock::acquire(&state_path)?;
     let mut state = State::load(&state_path)?;
     loop {
-        let failures = run_cycle(&config, &mut state, observe_only);
+        let failures = run_cycle(&config, &mut state, &state_path, observe_only);
         state.save(&state_path)?;
         if once {
             if failures > 0 {
@@ -78,14 +80,82 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<()> {
     }
 }
 
-fn run_cycle(config: &Config, state: &mut State, observe_only: bool) -> usize {
+fn run_cycle(
+    config: &Config,
+    state: &mut State,
+    state_path: &std::path::Path,
+    observe_only: bool,
+) -> usize {
     let mut failures = 0;
     for (name, account_config) in &config.accounts {
         let result = (|| -> Result<()> {
-            let snapshot = source::collect(&account_config.source)?;
+            let mut snapshot = source::collect(&account_config.source)?;
             let workers = fleet::current_workers(&account_config.fleet)?;
             let prior = state.accounts.get(name).cloned().unwrap_or_default();
-            let decision = evaluate(name, account_config, &snapshot, &prior, workers, Utc::now())?;
+            let mut decision =
+                evaluate(name, account_config, &snapshot, &prior, workers, Utc::now())?;
+
+            let pending = state
+                .accounts
+                .get(name)
+                .and_then(|account| account.pending_reset_redemption.clone());
+            let should_redeem = account_config.banked_resets.auto_redeem
+                && !observe_only
+                && (pending.is_some()
+                    || decision
+                        .banked_resets
+                        .as_ref()
+                        .is_some_and(|banked| banked.redeem_recommended));
+            if should_redeem {
+                let redemption = match pending {
+                    Some(pending) => pending,
+                    None => {
+                        let pending = PendingResetRedemption {
+                            idempotency_key: Uuid::new_v4().to_string(),
+                            credit_id: earliest_available_credit_id(&snapshot),
+                            started_at: Utc::now(),
+                        };
+                        state
+                            .accounts
+                            .entry(name.clone())
+                            .or_default()
+                            .pending_reset_redemption = Some(pending.clone());
+                        // This write-ahead record must reach disk before the
+                        // irreversible provider request is sent.
+                        state.save(state_path)?;
+                        pending
+                    }
+                };
+                let outcome = source::consume_reset_credit(
+                    &account_config.source,
+                    &redemption.idempotency_key,
+                    redemption.credit_id.as_deref(),
+                )?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "event": "reset_redemption",
+                        "account": name,
+                        "outcome": outcome.as_str(),
+                    }))?
+                );
+                if let source::ResetConsumeOutcome::Other(value) = &outcome {
+                    bail!(
+                        "Codex returned an unrecognized reset outcome {value:?}; retaining the pending idempotency key"
+                    );
+                }
+                state
+                    .accounts
+                    .entry(name.clone())
+                    .or_default()
+                    .pending_reset_redemption = None;
+                // Reconcile all definitive outcomes. Success requires an
+                // authoritative read; failure outcomes can also mean the
+                // pre-request balance was stale.
+                snapshot = source::collect(&account_config.source)?;
+                decision = evaluate(name, account_config, &snapshot, &prior, workers, Utc::now())?;
+            }
+
             let changed = decision.desired_workers != workers;
             let has_actuator = !matches!(&account_config.fleet.actuator, ActuatorConfig::None);
             let actuated = changed && !observe_only && has_actuator;
@@ -123,4 +193,71 @@ fn run_cycle(config: &Config, state: &mut State, observe_only: bool) -> usize {
         }
     }
     failures
+}
+
+fn earliest_available_credit_id(snapshot: &QuotaSnapshot) -> Option<String> {
+    snapshot
+        .reset_credits
+        .as_ref()?
+        .credits
+        .as_deref()?
+        .iter()
+        .filter(|credit| credit.status == "available")
+        .min_by_key(|credit| (credit.expires_at.is_none(), credit.expires_at))
+        .map(|credit| credit.id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use subscription_governor::model::{ResetCredit, ResetCreditsSnapshot};
+
+    #[test]
+    fn chooses_earliest_expiring_available_credit() {
+        let expiration = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let snapshot = QuotaSnapshot {
+            observed_at: Utc::now(),
+            fresh: true,
+            windows: Vec::new(),
+            reset_credits: Some(ResetCreditsSnapshot {
+                available_count: 3,
+                credits: Some(vec![
+                    reset_credit("no-expiry", "available", None),
+                    reset_credit(
+                        "redeemed",
+                        "redeemed",
+                        Some(expiration - chrono::Duration::days(1)),
+                    ),
+                    reset_credit("earliest", "available", Some(expiration)),
+                    reset_credit(
+                        "later",
+                        "available",
+                        Some(expiration + chrono::Duration::days(1)),
+                    ),
+                ]),
+            }),
+        };
+
+        assert_eq!(
+            earliest_available_credit_id(&snapshot).as_deref(),
+            Some("earliest")
+        );
+    }
+
+    fn reset_credit(
+        id: &str,
+        status: &str,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> ResetCredit {
+        ResetCredit {
+            id: id.to_owned(),
+            reset_type: Some("weekly".into()),
+            status: status.to_owned(),
+            granted_at: None,
+            expires_at,
+            title: None,
+            description: None,
+        }
+    }
 }

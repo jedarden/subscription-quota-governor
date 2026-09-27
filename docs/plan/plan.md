@@ -185,6 +185,14 @@ Build requirements:
   `<limit_id>.primary` and `<limit_id>.secondary`.
 - [x] Bound request time and terminate the child on success or failure.
 - [x] Keep authentication inside the Codex process.
+- [x] Capture the authoritative banked-reset balance and optional expiration
+  details from `account/rateLimits/read`.
+- [x] Support a configurable banked-reset pace with a 2x default floor and
+  deadline-aware acceleration.
+- [x] Redeem through the supported App Server method only, behind explicit
+  opt-in and a durable idempotency record.
+- [x] Reconcile with a full rate-limit read after each definitive redemption
+  outcome and before fleet actuation.
 - [ ] Add a fake app-server executable for handshake, interleaved notification,
   timeout, child-exit, sparse-window, and protocol-error tests.
 - [ ] Replace per-poll process startup with a supervised long-lived session.

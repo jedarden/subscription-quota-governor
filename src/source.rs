@@ -1,5 +1,5 @@
 use crate::config::SourceConfig;
-use crate::model::{QuotaSnapshot, QuotaWindow};
+use crate::model::{QuotaSnapshot, QuotaWindow, ResetCredit, ResetCreditsSnapshot};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{json, Value};
@@ -38,6 +38,81 @@ pub fn collect(source: &SourceConfig) -> Result<QuotaSnapshot> {
         } => collect_codex(executable, *timeout_seconds)?,
     };
     validate_snapshot(snapshot)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResetConsumeOutcome {
+    Reset,
+    AlreadyRedeemed,
+    NothingToReset,
+    NoCredit,
+    Other(String),
+}
+
+impl ResetConsumeOutcome {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Reset => "reset",
+            Self::AlreadyRedeemed => "alreadyRedeemed",
+            Self::NothingToReset => "nothingToReset",
+            Self::NoCredit => "noCredit",
+            Self::Other(value) => value,
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Reset | Self::AlreadyRedeemed)
+    }
+}
+
+/// Consume one Codex banked reset through the supported app-server method.
+///
+/// The caller owns idempotency persistence. An uncertain retry must reuse the
+/// same key so a completed request cannot consume a second credit.
+pub fn consume_reset_credit(
+    source: &SourceConfig,
+    idempotency_key: &str,
+    credit_id: Option<&str>,
+) -> Result<ResetConsumeOutcome> {
+    let SourceConfig::CodexAppServer {
+        executable,
+        timeout_seconds,
+    } = source
+    else {
+        bail!("banked reset redemption requires a Codex app-server source");
+    };
+    if idempotency_key.trim().is_empty() {
+        bail!("banked reset redemption requires a non-empty idempotency key");
+    }
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "idempotencyKey".to_owned(),
+        Value::String(idempotency_key.to_owned()),
+    );
+    if let Some(credit_id) = credit_id.filter(|value| !value.is_empty()) {
+        params.insert("creditId".to_owned(), Value::String(credit_id.to_owned()));
+    }
+    let result = codex_app_server_request(
+        executable,
+        *timeout_seconds,
+        "account/rateLimitResetCredit/consume",
+        Some(Value::Object(params)),
+    )?;
+    parse_reset_consume_outcome(&result)
+}
+
+fn parse_reset_consume_outcome(result: &Value) -> Result<ResetConsumeOutcome> {
+    let outcome = result
+        .get("outcome")
+        .and_then(Value::as_str)
+        .context("Codex reset response omitted outcome")?;
+    Ok(match outcome {
+        "reset" => ResetConsumeOutcome::Reset,
+        "alreadyRedeemed" => ResetConsumeOutcome::AlreadyRedeemed,
+        "nothingToReset" => ResetConsumeOutcome::NothingToReset,
+        "noCredit" => ResetConsumeOutcome::NoCredit,
+        other => ResetConsumeOutcome::Other(other.to_owned()),
+    })
 }
 
 fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
@@ -173,6 +248,7 @@ pub fn parse_anthropic_usage(payload: &Value, observed_at: DateTime<Utc>) -> Res
         observed_at,
         fresh: true,
         windows: windows.into_values().collect(),
+        reset_credits: None,
     })
 }
 
@@ -207,6 +283,17 @@ fn parse_anthropic_limit(id: &str, value: &Value) -> Option<QuotaWindow> {
 }
 
 fn collect_codex(executable: &Path, timeout_seconds: u64) -> Result<QuotaSnapshot> {
+    let result =
+        codex_app_server_request(executable, timeout_seconds, "account/rateLimits/read", None)?;
+    parse_codex_rate_limits(&result, Utc::now())
+}
+
+fn codex_app_server_request(
+    executable: &Path,
+    timeout_seconds: u64,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value> {
     let child = Command::new(executable)
         .args(["app-server", "--listen", "stdio://"])
         .stdin(Stdio::piped())
@@ -257,24 +344,24 @@ fn collect_codex(executable: &Path, timeout_seconds: u64) -> Result<QuotaSnapsho
     }
 
     writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}))?;
-    writeln!(
-        stdin,
-        "{}",
-        json!({"id": 2, "method": "account/rateLimits/read"})
-    )?;
+    let mut request = json!({"id": 2, "method": method});
+    if let Some(params) = params {
+        request["params"] = params;
+    }
+    writeln!(stdin, "{request}")?;
     stdin.flush()?;
     let response = receive_response(&receiver, 2, timeout_seconds);
     drop(stdin);
     child.terminate();
     let _ = reader.join();
-    let response = response.context("timed out reading Codex rate limits")?;
+    let response = response.with_context(|| format!("timed out waiting for Codex {method}"))?;
     if let Some(error) = response.get("error") {
-        bail!("Codex app-server rejected the rate-limit request: {error}");
+        bail!("Codex app-server rejected {method}: {error}");
     }
-    let result = response
+    response
         .get("result")
-        .context("Codex rate-limit response omitted result")?;
-    parse_codex_rate_limits(result, Utc::now())
+        .cloned()
+        .with_context(|| format!("Codex {method} response omitted result"))
 }
 
 struct ChildGuard(Child);
@@ -334,6 +421,54 @@ pub fn parse_codex_rate_limits(
         observed_at,
         fresh: true,
         windows,
+        reset_credits: parse_reset_credits(result),
+    })
+}
+
+fn parse_reset_credits(result: &Value) -> Option<ResetCreditsSnapshot> {
+    let summary = result.get("rateLimitResetCredits")?.as_object()?;
+    let available_count = summary.get("availableCount")?.as_u64()?;
+    let credits = match summary.get("credits") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(rows)) => Some(
+            rows.iter()
+                .filter_map(|row| {
+                    let id = row.get("id")?.as_str()?.trim();
+                    if id.is_empty() {
+                        return None;
+                    }
+                    let timestamp = |field: &str| {
+                        row.get(field)
+                            .and_then(Value::as_i64)
+                            .and_then(|value| Utc.timestamp_opt(value, 0).single())
+                    };
+                    Some(ResetCredit {
+                        id: id.to_owned(),
+                        reset_type: row
+                            .get("resetType")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        status: row
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                        granted_at: timestamp("grantedAt"),
+                        expires_at: timestamp("expiresAt"),
+                        title: row.get("title").and_then(Value::as_str).map(str::to_owned),
+                        description: row
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+                })
+                .collect(),
+        ),
+        Some(_) => None,
+    };
+    Some(ResetCreditsSnapshot {
+        available_count,
+        credits,
     })
 }
 
@@ -371,6 +506,13 @@ fn validate_snapshot(snapshot: QuotaSnapshot) -> Result<QuotaSnapshot> {
         }
         if !window.used_fraction.is_finite() || !(0.0..=1.0).contains(&window.used_fraction) {
             bail!("quota window {} used_fraction must be in [0, 1]", window.id);
+        }
+    }
+    if let Some(reset_credits) = &snapshot.reset_credits {
+        for credit in reset_credits.credits.as_deref().unwrap_or_default() {
+            if credit.id.trim().is_empty() {
+                bail!("quota snapshot has a reset credit with an empty id");
+            }
         }
     }
     Ok(snapshot)
@@ -452,6 +594,50 @@ mod tests {
             .windows
             .iter()
             .any(|window| window.id == "codex.secondary"));
+    }
+
+    #[test]
+    fn parses_codex_reset_credit_balance_and_details() {
+        let result = json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "secondary": {"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1800100000}
+            },
+            "rateLimitResetCredits": {
+                "availableCount": 3,
+                "credits": [{
+                    "id": "credit-1",
+                    "resetType": "weekly",
+                    "status": "available",
+                    "grantedAt": 1799000000,
+                    "expiresAt": 1800200000,
+                    "title": "Reset",
+                    "description": "One rate-limit reset"
+                }]
+            }
+        });
+        let snapshot = parse_codex_rate_limits(&result, observed()).unwrap();
+        let credits = snapshot.reset_credits.unwrap();
+        assert_eq!(credits.available_count, 3);
+        let detail = &credits.credits.unwrap()[0];
+        assert_eq!(detail.id, "credit-1");
+        assert_eq!(detail.status, "available");
+        assert_eq!(detail.expires_at.unwrap().timestamp(), 1_800_200_000);
+    }
+
+    #[test]
+    fn parses_all_documented_reset_outcomes() {
+        for (wire, expected) in [
+            ("reset", ResetConsumeOutcome::Reset),
+            ("alreadyRedeemed", ResetConsumeOutcome::AlreadyRedeemed),
+            ("nothingToReset", ResetConsumeOutcome::NothingToReset),
+            ("noCredit", ResetConsumeOutcome::NoCredit),
+        ] {
+            assert_eq!(
+                parse_reset_consume_outcome(&json!({"outcome": wire})).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

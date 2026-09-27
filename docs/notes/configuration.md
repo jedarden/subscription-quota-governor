@@ -55,6 +55,44 @@ Starts `codex app-server --listen stdio://`, completes initialization, calls
 `rateLimitsByLimitId` is retained. Window ids are `<limit_id>.primary` and
 `<limit_id>.secondary`; the older `rateLimits` field is a fallback only.
 
+The same read also captures `rateLimitResetCredits.availableCount` and any
+optional detail rows. The count, not the row count, is authoritative. The
+governor uses only the supported
+`account/rateLimitResetCredit/consume` App Server request to redeem a credit.
+
+## Banked-reset policy
+
+`banked_resets.enabled` activates pacing whenever a source reports a positive
+credit balance. It does not itself authorize redemption. For weekly windows:
+
+```text
+minimum required burn = minimum_pace_multiplier * target / window duration
+deadline required burn = remaining generations / time to credit expiry
+effective required burn = max(minimum required burn, each known deadline rate)
+```
+
+The default multiplier is `2.0`. When a banked reset exists, the effective
+weekly target is at least `redeem_at_utilization` (default `1.0`), even if the
+ordinary policy preserves a reserve. This makes the next credit redeemable.
+Shorter windows continue to constrain the final worker target.
+
+Detailed credit rows may be absent. In that case the governor still enforces
+the minimum pace from the authoritative balance, but cannot calculate an
+expiry deadline. `deadline_safety_seconds` (default six hours) advances each
+known deadline to leave operational margin.
+
+`auto_redeem` defaults to false and is valid only with a `codex_app_server`
+source. `--observe-only` disables it. When enabled, the governor:
+
+1. waits until the weekly window reaches `redeem_at_utilization`;
+2. writes a pending UUID idempotency key and earliest-expiring known credit id
+   to its atomic state file;
+3. requests redemption and retains that record across transport uncertainty;
+4. clears it only for a documented definitive outcome; and
+5. re-reads rate limits and re-evaluates before fleet actuation.
+
+This prevents a lost response or process restart from consuming two credits.
+
 ### `normalized_http`
 
 Reads the normalized JSON contract directly from an HTTP endpoint. This is

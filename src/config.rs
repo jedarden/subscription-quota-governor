@@ -21,6 +21,8 @@ pub struct AccountConfig {
     pub source: SourceConfig,
     pub fleet: FleetConfig,
     pub utilization: UtilizationConfig,
+    #[serde(default)]
+    pub banked_resets: BankedResetConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -141,6 +143,40 @@ pub struct WindowPolicy {
     pub strategy: Option<Strategy>,
 }
 
+/// Policy for earned, one-shot quota resets such as Codex banked resets.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BankedResetConfig {
+    /// Raise the account's worker floor while reset credits are available.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Never pace slower than this multiple of one full quota window per its
+    /// advertised duration while a reset credit is available.
+    #[serde(default = "default_minimum_pace_multiplier")]
+    pub minimum_pace_multiplier: f64,
+    /// Allow the governor to redeem a reset after the governing weekly window
+    /// reaches `redeem_at_utilization`. This is deliberately opt-in.
+    #[serde(default)]
+    pub auto_redeem: bool,
+    #[serde(default = "default_redeem_at_utilization")]
+    pub redeem_at_utilization: f64,
+    /// Finish deadline-driven consumption this far before credit expiry.
+    #[serde(default = "default_deadline_safety_seconds")]
+    pub deadline_safety_seconds: u64,
+}
+
+impl Default for BankedResetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            minimum_pace_multiplier: default_minimum_pace_multiplier(),
+            auto_redeem: false,
+            redeem_at_utilization: default_redeem_at_utilization(),
+            deadline_safety_seconds: default_deadline_safety_seconds(),
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes =
@@ -191,6 +227,7 @@ impl Config {
             }
             validate_source(&account.source, name)?;
             validate_fleet(&account.fleet, name)?;
+            validate_banked_resets(account, name)?;
         }
         Ok(())
     }
@@ -298,6 +335,29 @@ fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_banked_resets(account: &AccountConfig, name: &str) -> Result<()> {
+    let policy = &account.banked_resets;
+    if !policy.minimum_pace_multiplier.is_finite() || policy.minimum_pace_multiplier < 1.0 {
+        bail!("account {name}: banked_resets.minimum_pace_multiplier must be finite and >= 1");
+    }
+    if !policy.redeem_at_utilization.is_finite()
+        || !(0.0..=1.0).contains(&policy.redeem_at_utilization)
+        || policy.redeem_at_utilization == 0.0
+    {
+        bail!("account {name}: banked_resets.redeem_at_utilization must be in (0, 1]");
+    }
+    if policy.auto_redeem && !policy.enabled {
+        bail!("account {name}: banked_resets.auto_redeem requires banked_resets.enabled");
+    }
+    if policy.auto_redeem && !matches!(&account.source, SourceConfig::CodexAppServer { .. }) {
+        bail!("account {name}: banked reset redemption requires source.type: codex_app_server");
+    }
+    if policy.deadline_safety_seconds > i64::MAX as u64 {
+        bail!("account {name}: banked_resets.deadline_safety_seconds is too large");
+    }
+    Ok(())
+}
+
 fn validate_argv(argv: &[String], context: &str, require_placeholder: bool) -> Result<()> {
     if argv.is_empty() || argv.iter().any(String::is_empty) {
         bail!("{context}: argv must contain non-empty arguments");
@@ -348,6 +408,15 @@ fn default_anthropic_token_url() -> String {
 fn default_codex_executable() -> PathBuf {
     PathBuf::from("codex")
 }
+fn default_minimum_pace_multiplier() -> f64 {
+    2.0
+}
+fn default_redeem_at_utilization() -> f64 {
+    1.0
+}
+fn default_deadline_safety_seconds() -> u64 {
+    6 * 60 * 60
+}
 
 #[cfg(test)]
 mod tests {
@@ -365,5 +434,13 @@ mod tests {
             windows: BTreeMap::new(),
         };
         assert_eq!(config.policy_for("weekly").unwrap().target, 0.85);
+    }
+
+    #[test]
+    fn banked_resets_default_to_detection_without_actuation() {
+        let policy = BankedResetConfig::default();
+        assert!(!policy.enabled);
+        assert!(!policy.auto_redeem);
+        assert_eq!(policy.minimum_pace_multiplier, 2.0);
     }
 }

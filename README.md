@@ -13,6 +13,12 @@ The initial release includes native quota collectors for:
 - normalized JSON over files, HTTP, or command output for Z.AI and custom
   integrations.
 
+The Codex collector also reports banked rate-limit reset credits through the
+supported App Server protocol. An optional policy can increase weekly quota
+consumption to a configured minimum pace (2x by default), account for known
+credit expiration dates, and redeem a credit once the weekly generation is
+consumed.
+
 ## Why account identity is explicit
 
 An agent speaking the Anthropic protocol may actually consume Z.AI Coding Plan
@@ -70,6 +76,33 @@ Stale data never scales up. `stale_behavior: hold` retains the current worker
 count; `min_workers` drains toward the configured minimum. Per-cycle scale-up
 and scale-down limits apply to every decision.
 
+## Codex banked resets
+
+Banked-reset pacing is separate from ordinary utilization policy and disabled
+by default. Enable detection and pacing without allowing redemption first:
+
+```yaml
+banked_resets:
+  enabled: true
+  minimum_pace_multiplier: 2.0
+  redeem_at_utilization: 1.0
+  deadline_safety_seconds: 21600
+  auto_redeem: false
+```
+
+While credits are available, weekly windows are paced toward at least one full
+generation every `window duration / minimum_pace_multiplier`. If detailed
+expiration rows are available, the controller raises that pace enough to use
+each known credit before its deadline. Shorter quota windows remain hard
+constraints and can still hold or drain the fleet.
+
+Set `auto_redeem: true` only after observing decisions with the actual fleet.
+It is accepted only for `codex_app_server` sources, and `--observe-only` always
+suppresses redemption. Before calling
+`account/rateLimitResetCredit/consume`, the governor durably records an
+idempotency key and optional earliest-expiring credit id. A retry reuses the
+same key, and every definitive outcome is followed by a fresh quota read.
+
 ## Quota and fleet adapters
 
 Quota sources normalize to this JSON contract:
@@ -86,9 +119,23 @@ Quota sources normalize to this JSON contract:
       "duration_minutes": 10080,
       "reached": false
     }
-  ]
+  ],
+  "reset_credits": {
+    "available_count": 2,
+    "credits": [
+      {
+        "id": "example-credit-id",
+        "reset_type": "weekly",
+        "status": "available",
+        "expires_at": "2026-10-04T12:00:00Z"
+      }
+    ]
+  }
 }
 ```
+
+`reset_credits` is optional for generic sources. `available_count` is the
+authoritative balance; providers may omit or cap the optional detail list.
 
 Use `source.type: command` for another observer; the command must emit exactly
 one normalized object on stdout. Commands are argument arrays and never passed
@@ -113,6 +160,8 @@ See [configuration notes](docs/notes/configuration.md), the
   to logs, stdout, command arguments, or state. A refresh updates the credential
   file atomically with mode `0600`.
 - Codex authentication remains inside the installed `codex` process.
+- Automatic reset redemption is off by default, suppressed in observe-only
+  mode, and protected by a write-ahead idempotency record.
 - Z.AI authentication remains inside a site-local collector; `subgov` reads
   only the normalized, non-secret quota projection.
 - Source or account failures are isolated; a failed account is not actuated.
