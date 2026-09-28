@@ -13,6 +13,12 @@ pub struct Decision {
     pub desired_workers: u32,
     pub stale: bool,
     pub windows: Vec<WindowDecision>,
+    /// The window whose raw desired count won the §9.6 multi-window
+    /// arbitration (the minimum across `windows`), before banked-reset
+    /// floors and step limits are applied. `None` for a stale decision,
+    /// which observes no windows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_window: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub banked_resets: Option<BankedResetDecision>,
 }
@@ -75,6 +81,7 @@ pub fn evaluate(
             desired_workers: apply_step_limits(raw, current_workers, config).min(current_workers),
             stale: true,
             windows: Vec::new(),
+            binding_window: None,
             banked_resets: None,
         });
     }
@@ -167,11 +174,14 @@ pub fn evaluate(
     if decisions.is_empty() {
         bail!("account {account_name}: no enabled quota windows were observed");
     }
-    let ordinary_desired = decisions
-        .iter()
+    // §9.6: "the account result is the minimum of those counts." Ties fall to
+    // the first matching window in snapshot order (Iterator::min_by_key's
+    // documented tie-break), since the plan does not prescribe one.
+    let binding = decisions.iter().min_by_key(|decision| decision.desired_workers);
+    let ordinary_desired = binding
         .map(|decision| decision.desired_workers)
-        .min()
         .unwrap_or(current_workers);
+    let binding_window = binding.map(|decision| decision.id.clone());
     let banked_resets = banked_reset_decision(config, snapshot, &decisions, current_workers, now);
     let short_window_reached = decisions.iter().any(|decision| {
         decision.reason == "target_reached"
@@ -194,6 +204,7 @@ pub fn evaluate(
         desired_workers: apply_step_limits(raw_desired, current_workers, config),
         stale: false,
         windows: decisions,
+        binding_window,
         banked_resets,
     })
 }
@@ -395,6 +406,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decision.desired_workers, 0);
+        assert_eq!(decision.binding_window.as_deref(), Some("weekly"));
+    }
+
+    #[test]
+    fn stale_decision_has_no_binding_window() {
+        let now = Utc::now();
+        let snapshot = QuotaSnapshot {
+            observed_at: now - Duration::hours(1),
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.1,
+                resets_at: now + Duration::days(2),
+                duration_minutes: None,
+                reached: false,
+            }],
+            reset_credits: None,
+        };
+        let decision = evaluate(
+            "test",
+            &account(),
+            &snapshot,
+            &AccountState::default(),
+            3,
+            now,
+        )
+        .unwrap();
+        assert!(decision.stale);
+        assert_eq!(decision.binding_window, None);
+    }
+
+    #[test]
+    fn binding_window_ties_favor_the_first_window_in_snapshot_order() {
+        let now = Utc::now();
+        let mut config = account();
+        config.utilization.strategy = Strategy::CeilingOnly;
+        config.utilization.target_utilization = Some(0.9);
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![
+                QuotaWindow {
+                    id: "first_at_target".into(),
+                    used_fraction: 1.0,
+                    resets_at: now + Duration::hours(2),
+                    duration_minutes: Some(300),
+                    reached: false,
+                },
+                QuotaWindow {
+                    id: "second_at_target".into(),
+                    used_fraction: 1.0,
+                    resets_at: now + Duration::days(2),
+                    duration_minutes: Some(10_080),
+                    reached: false,
+                },
+            ],
+            reset_credits: None,
+        };
+        let decision = evaluate(
+            "test",
+            &config,
+            &snapshot,
+            &AccountState::default(),
+            4,
+            now,
+        )
+        .unwrap();
+        // Both windows tie at fleet.min_workers (target_reached); the first
+        // window in snapshot order wins the tie.
+        assert_eq!(decision.binding_window.as_deref(), Some("first_at_target"));
     }
 
     #[test]
