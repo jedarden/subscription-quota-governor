@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use fs2::FileExt;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1002,6 +1002,14 @@ fn validate_snapshot(snapshot: QuotaSnapshot) -> Result<QuotaSnapshot> {
     if snapshot.windows.is_empty() {
         bail!("quota snapshot has no windows");
     }
+    // Tracks ids already seen so far, to catch a duplicate on a later
+    // window (plan.md §6.2: "id is stable within one source and account...
+    // Duplicate IDs ... fail the snapshot"). schema/quota-snapshot.schema.json
+    // documents this exact rule as a known gap it cannot mechanically
+    // enforce (JSON Schema has no portable keyword for per-property
+    // array-item uniqueness), so this check is this repo's sole enforcement
+    // of it.
+    let mut seen_ids = HashSet::with_capacity(snapshot.windows.len());
     for (index, window) in snapshot.windows.iter().enumerate() {
         // window.id is source-supplied content (arbitrary for a generic
         // command/file/http source) and is deliberately never echoed into
@@ -1012,6 +1020,9 @@ fn validate_snapshot(snapshot: QuotaSnapshot) -> Result<QuotaSnapshot> {
         }
         if !window.used_fraction.is_finite() || !(0.0..=1.0).contains(&window.used_fraction) {
             bail!("quota snapshot window {index} used_fraction must be in [0, 1]");
+        }
+        if !seen_ids.insert(window.id.as_str()) {
+            bail!("quota snapshot window {index} has a duplicate id (already used by an earlier window)");
         }
     }
     if let Some(reset_credits) = &snapshot.reset_credits {
@@ -1491,6 +1502,75 @@ mod tests {
     fn read_bounded_rejects_data_over_the_limit() {
         let mut cursor = std::io::Cursor::new(vec![7u8; 11]);
         assert!(read_bounded(&mut cursor, 10).is_err());
+    }
+
+    #[test]
+    fn collect_rejects_a_snapshot_with_duplicate_window_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate.json");
+        fs::write(
+            &path,
+            r#"{
+                "observed_at": "2026-09-28T12:00:00Z",
+                "windows": [
+                    {"id": "weekly", "used_fraction": 0.2, "resets_at": "2026-09-30T00:00:00Z"},
+                    {"id": "weekly", "used_fraction": 0.9, "resets_at": "2026-10-05T00:00:00Z"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        let error = collect(&source).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("duplicate"),
+            "expected a duplicate-id rejection: {error:#}"
+        );
+    }
+
+    #[test]
+    fn collect_accepts_distinct_window_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("distinct.json");
+        fs::write(
+            &path,
+            r#"{
+                "observed_at": "2026-09-28T12:00:00Z",
+                "windows": [
+                    {"id": "five_hour", "used_fraction": 0.2, "resets_at": "2026-09-28T17:00:00Z"},
+                    {"id": "weekly", "used_fraction": 0.9, "resets_at": "2026-10-05T00:00:00Z"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        assert!(collect(&source).is_ok());
+    }
+
+    #[test]
+    fn duplicate_window_id_error_never_leaks_the_id_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate.json");
+        fs::write(
+            &path,
+            r#"{
+                "observed_at": "2026-09-28T12:00:00Z",
+                "windows": [
+                    {"id": "sk-super-secret-token", "used_fraction": 0.2, "resets_at": "2026-09-30T00:00:00Z"},
+                    {"id": "sk-super-secret-token", "used_fraction": 0.5, "resets_at": "2026-10-05T00:00:00Z"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        let error = collect(&source).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("sk-super-secret-token"),
+            "the duplicate window id must never leak into the error text: {rendered}"
+        );
     }
 
     #[test]
