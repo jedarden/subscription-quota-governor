@@ -126,6 +126,13 @@ impl State {
             file.sync_all()?;
             fs::rename(&temporary, path)
                 .with_context(|| format!("failed to install state {}", path.display()))?;
+            // On Unix, the rename's directory-entry update is not itself
+            // durable until the containing directory is fsync'd -- without
+            // this, a crash can leave the rename visible in memory but lost
+            // on disk after power loss, even though the file's own fsync
+            // already committed its bytes.
+            sync_directory(parent)
+                .with_context(|| format!("failed to fsync directory {}", parent.display()))?;
             Ok(())
         })();
         if result.is_err() {
@@ -155,6 +162,17 @@ impl StateLock {
             .with_context(|| format!("another governor owns {}", lock_path.display()))?;
         Ok(Self { _file: file })
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> Result<()> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -188,6 +206,29 @@ mod tests {
         State::default().save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
         assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_directory_fsyncs_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_directory(dir.path()).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_directory_errors_on_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(sync_directory(&missing).is_err());
+    }
+
+    #[test]
+    fn save_fsyncs_the_state_directory_after_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        State::default().save(&path).unwrap();
+        assert!(path.exists());
     }
 
     #[test]
