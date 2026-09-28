@@ -842,4 +842,109 @@ mod tests {
         );
         assert!(!path.exists());
     }
+
+    // Migration tests below prove a governor started against an on-disk
+    // file from every schema version this binary actually supports reading
+    // migrates cleanly rather than failing or silently truncating (WP3).
+    // Per STATE_SCHEMA_VERSION's own doc comment, that set is exactly two
+    // shapes: a pre-versioning file with no `schema_version` key at all
+    // (the real v0.1 baseline -- no `history` field either, since that was
+    // introduced alongside versioning), and an explicit `schema_version: 1`
+    // file (the current version, a no-op "migration"). A version number
+    // this binary never wrote (anything > STATE_SCHEMA_VERSION) is not a
+    // supported source and is covered separately by
+    // `load_refuses_a_newer_schema_version`.
+
+    #[test]
+    fn migrates_a_legacy_pre_versioning_file_and_preserves_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        // The real v0.1 shape: no `schema_version` key, and no `history`
+        // key on the account -- both were added later.
+        fs::write(
+            &path,
+            r#"{
+                "accounts": {
+                    "acct": {
+                        "windows": {
+                            "5h": {
+                                "observed_at": "2026-01-01T00:00:00Z",
+                                "used_fraction": 0.42,
+                                "resets_at": "2026-01-01T05:00:00Z",
+                                "workers": 3
+                            }
+                        },
+                        "last_target": 3
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(
+            quarantined.is_none(),
+            "a legacy pre-versioning file is a supported source, not corruption"
+        );
+        assert_eq!(
+            loaded.schema_version, STATE_SCHEMA_VERSION,
+            "an absent schema_version must migrate to the current version in memory"
+        );
+        let account = &loaded.accounts["acct"];
+        assert_eq!(account.last_target, Some(3));
+        let window = &account.windows["5h"];
+        assert_eq!(window.used_fraction, 0.42);
+        assert_eq!(window.workers, 3);
+        assert!(
+            account.history.is_empty(),
+            "a field introduced after v0.1 must default rather than fail to parse"
+        );
+    }
+
+    #[test]
+    fn migrated_legacy_state_persists_the_current_schema_version_once_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        fs::write(
+            &path,
+            r#"{"accounts":{"acct":{"windows":{},"last_target":7}}}"#,
+        )
+        .unwrap();
+
+        let (migrated, _) = State::load(&path).unwrap();
+        migrated.save(&path).unwrap();
+
+        // Re-read the raw bytes (not through `State::load`, which would
+        // paper over a missing field via `#[serde(default)]`) to confirm
+        // the migration is sticky: once saved, the file explicitly carries
+        // the current version rather than relying on the reader to infer
+        // it again next time.
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["schema_version"],
+            serde_json::json!(STATE_SCHEMA_VERSION)
+        );
+
+        let (reloaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(reloaded.accounts["acct"].last_target, Some(7));
+    }
+
+    #[test]
+    fn explicit_current_schema_version_loads_without_migration_or_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":{STATE_SCHEMA_VERSION},"accounts":{{"acct":{{"windows":{{}},"last_target":5,"history":{{}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(loaded.accounts["acct"].last_target, Some(5));
+    }
 }
