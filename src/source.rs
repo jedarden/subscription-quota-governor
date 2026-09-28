@@ -569,20 +569,37 @@ fn read_json(path: &Path, label: &str) -> Result<Value> {
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {label}"))
 }
 
+/// Writes `value` to `path` via a same-directory temporary file and rename,
+/// preserving the original file's owner and permission bits when it already
+/// exists (falling back to `0o600` for a brand-new file), and fsyncing the
+/// parent directory after the rename so the new directory entry survives a
+/// crash. This is used for the Claude Code credentials file, which Claude
+/// Code itself owns and may read or write concurrently -- refreshing it must
+/// not silently narrow its permissions or leave the rename un-durable.
 fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let parent = path.parent().context("credentials path has no parent")?;
     let temporary = parent.join(format!(
         ".subscription-governor-credentials-{}.tmp",
         std::process::id()
     ));
+
+    #[cfg(unix)]
+    let original_metadata = fs::metadata(path).ok();
+
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
-        options.mode(0o600);
+        {
+            let mode = original_metadata
+                .as_ref()
+                .map(|metadata| metadata.mode() & 0o777)
+                .unwrap_or(0o600);
+            options.mode(mode);
+        }
         let mut file = options
             .open(&temporary)
             .context("failed to create temporary credentials file")?;
@@ -590,7 +607,29 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
             .context("failed to serialize refreshed credentials")?;
         file.write_all(b"\n")?;
         file.sync_all()?;
+        drop(file);
+
+        #[cfg(unix)]
+        if let Some(metadata) = &original_metadata {
+            std::os::unix::fs::chown(&temporary, Some(metadata.uid()), Some(metadata.gid()))
+                .context("failed to preserve credentials file owner")?;
+        }
+
         fs::rename(&temporary, path).context("failed to install refreshed credentials")?;
+
+        #[cfg(unix)]
+        {
+            let parent_dir = File::open(parent).with_context(|| {
+                format!(
+                    "failed to open {} to fsync the refreshed credentials rename",
+                    parent.display()
+                )
+            })?;
+            parent_dir.sync_all().with_context(|| {
+                format!("failed to fsync {} after credentials rename", parent.display())
+            })?;
+        }
+
         Ok(())
     })();
     if result.is_err() {
@@ -741,6 +780,69 @@ mod tests {
             oauth.get("unrelatedField").unwrap().as_str(),
             Some("preserved")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_write_preserves_original_file_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        write_credentials(&path, "old-access", "refresh-a", 1_000);
+        // Claude Code (or an operator) may have set a mode other than our
+        // own default; the refresh write must not narrow or widen it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let refreshed = json!({
+            "accessToken": "new-access",
+            "refreshToken": "refresh-b",
+            "expiresAt": Utc::now().timestamp_millis() + 3_600_000,
+        });
+        apply_refreshed_credentials(&path, "refresh-a", &refreshed).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_write_preserves_original_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        write_credentials(&path, "old-access", "refresh-a", 1_000);
+        let original = fs::metadata(&path).unwrap();
+
+        let refreshed = json!({
+            "accessToken": "new-access",
+            "refreshToken": "refresh-b",
+            "expiresAt": Utc::now().timestamp_millis() + 3_600_000,
+        });
+        apply_refreshed_credentials(&path, "refresh-a", &refreshed).unwrap();
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.uid(), original.uid());
+        assert_eq!(after.gid(), original.gid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_write_fsyncs_parent_directory_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        write_credentials(&path, "old-access", "refresh-a", 1_000);
+
+        let refreshed = json!({
+            "accessToken": "new-access",
+            "refreshToken": "refresh-b",
+            "expiresAt": Utc::now().timestamp_millis() + 3_600_000,
+        });
+        // Durability fsync of the parent directory happens as part of the
+        // write path; a successful result proves it did not error even
+        // though a directory fd (not a regular file) is being synced.
+        apply_refreshed_credentials(&path, "refresh-a", &refreshed).unwrap();
     }
 
     #[test]
