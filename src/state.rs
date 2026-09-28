@@ -1,9 +1,11 @@
 use crate::model::QuotaSnapshot;
+#[cfg(test)]
+use crate::model::QuotaWindow;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,12 +37,23 @@ impl Default for State {
     }
 }
 
+/// How many samples of burn-rate history to retain per window generation.
+/// The exact value is one of §21's evidence-gated forks (needs
+/// observation-mode traces to tune); this is a conservative placeholder
+/// that bounds memory and disk without deciding the final number.
+const MAX_HISTORY_SAMPLES_PER_GENERATION: usize = 16;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AccountState {
     #[serde(default)]
     pub windows: BTreeMap<String, WindowSample>,
     #[serde(default)]
     pub last_target: Option<u32>,
+    /// Bounded burn-rate history per window, keyed by window id. Reset
+    /// whenever a window's `resets_at` changes, since samples from a prior
+    /// generation cannot inform this generation's slope.
+    #[serde(default)]
+    pub history: BTreeMap<String, WindowHistory>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -48,6 +61,20 @@ pub struct WindowSample {
     pub observed_at: DateTime<Utc>,
     pub used_fraction: f64,
     pub resets_at: DateTime<Utc>,
+    pub workers: u32,
+}
+
+/// A bounded run of samples sharing one reset generation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WindowHistory {
+    pub resets_at: DateTime<Utc>,
+    pub samples: VecDeque<HistorySample>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HistorySample {
+    pub observed_at: DateTime<Utc>,
+    pub used_fraction: f64,
     pub workers: u32,
 }
 
@@ -68,6 +95,32 @@ impl AccountState {
                 )
             })
             .collect();
+
+        // Rebuilt fresh each call, like `windows` above, so a window that
+        // drops out of the snapshot (e.g. a policy change) doesn't leave an
+        // orphaned generation accumulating forever.
+        let mut history = BTreeMap::new();
+        for window in &snapshot.windows {
+            let mut entry = self
+                .history
+                .remove(&window.id)
+                .filter(|existing: &WindowHistory| existing.resets_at == window.resets_at)
+                .unwrap_or_else(|| WindowHistory {
+                    resets_at: window.resets_at,
+                    samples: VecDeque::new(),
+                });
+            entry.samples.push_back(HistorySample {
+                observed_at: snapshot.observed_at,
+                used_fraction: window.used_fraction,
+                workers,
+            });
+            while entry.samples.len() > MAX_HISTORY_SAMPLES_PER_GENERATION {
+                entry.samples.pop_front();
+            }
+            history.insert(window.id.clone(), entry);
+        }
+        self.history = history;
+
         self.last_target = Some(target);
     }
 }
@@ -206,6 +259,108 @@ fn temporary_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn snapshot_with_one_window(id: &str, used_fraction: f64, resets_at: DateTime<Utc>) -> QuotaSnapshot {
+        QuotaSnapshot {
+            observed_at: Utc::now(),
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: id.to_string(),
+                used_fraction,
+                resets_at,
+                duration_minutes: None,
+                reached: false,
+            }],
+            reset_credits: None,
+        }
+    }
+
+    #[test]
+    fn record_bounds_history_length_per_generation() {
+        let mut account = AccountState::default();
+        let resets_at = Utc::now() + chrono::Duration::hours(5);
+        for i in 0..(MAX_HISTORY_SAMPLES_PER_GENERATION + 5) {
+            let snapshot =
+                snapshot_with_one_window("5h", i as f64 * 0.01, resets_at);
+            account.record(&snapshot, 1, 3);
+        }
+        let history = account.history.get("5h").unwrap();
+        assert_eq!(history.samples.len(), MAX_HISTORY_SAMPLES_PER_GENERATION);
+        // FIFO eviction: the oldest samples (lowest used_fraction) are gone,
+        // the most recent one survives.
+        let last = history.samples.back().unwrap();
+        assert_eq!(
+            last.used_fraction,
+            (MAX_HISTORY_SAMPLES_PER_GENERATION + 4) as f64 * 0.01
+        );
+    }
+
+    #[test]
+    fn record_clears_history_when_the_generation_rolls_over() {
+        let mut account = AccountState::default();
+        let first_generation = Utc::now() + chrono::Duration::hours(5);
+        for i in 0..3 {
+            let snapshot = snapshot_with_one_window("5h", i as f64 * 0.1, first_generation);
+            account.record(&snapshot, 1, 3);
+        }
+        assert_eq!(account.history.get("5h").unwrap().samples.len(), 3);
+
+        let next_generation = first_generation + chrono::Duration::days(1);
+        let snapshot = snapshot_with_one_window("5h", 0.0, next_generation);
+        account.record(&snapshot, 1, 3);
+
+        let history = account.history.get("5h").unwrap();
+        assert_eq!(history.resets_at, next_generation);
+        assert_eq!(
+            history.samples.len(),
+            1,
+            "a new generation must not inherit the prior generation's samples"
+        );
+    }
+
+    #[test]
+    fn record_drops_history_for_windows_no_longer_in_the_snapshot() {
+        let mut account = AccountState::default();
+        let resets_at = Utc::now() + chrono::Duration::hours(5);
+        account.record(&snapshot_with_one_window("5h", 0.1, resets_at), 1, 3);
+        assert!(account.history.contains_key("5h"));
+
+        let empty_snapshot = QuotaSnapshot {
+            observed_at: Utc::now(),
+            fresh: true,
+            windows: Vec::new(),
+            reset_credits: None,
+        };
+        account.record(&empty_snapshot, 1, 3);
+        assert!(
+            account.history.is_empty(),
+            "a window dropped from the snapshot must not leak stale history forever"
+        );
+    }
+
+    #[test]
+    fn history_round_trips_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let resets_at = Utc::now() + chrono::Duration::hours(5);
+
+        let mut state = State::default();
+        let account = state.accounts.entry("acct".to_string()).or_default();
+        account.record(&snapshot_with_one_window("5h", 0.2, resets_at), 2, 3);
+        account.record(&snapshot_with_one_window("5h", 0.3, resets_at), 2, 3);
+        state.save(&path).unwrap();
+
+        let loaded = State::load(&path).unwrap();
+        let history = loaded.accounts["acct"].history.get("5h").unwrap();
+        assert_eq!(history.samples.len(), 2);
+        assert_eq!(history.samples.back().unwrap().used_fraction, 0.3);
+    }
+
+    #[test]
+    fn missing_history_field_defaults_to_empty() {
+        let account: AccountState = serde_json::from_str("{}").unwrap();
+        assert!(account.history.is_empty());
+    }
+
     #[test]
     fn fresh_state_carries_current_schema_version() {
         let state = State::default();
@@ -299,6 +454,7 @@ mod tests {
             AccountState {
                 windows: BTreeMap::new(),
                 last_target: Some(3),
+                ..Default::default()
             },
         );
         good.save(&path).unwrap();
@@ -354,6 +510,7 @@ mod tests {
             AccountState {
                 windows: BTreeMap::new(),
                 last_target: Some(9),
+                ..Default::default()
             },
         );
         let result = next.save(&path);
