@@ -1,11 +1,13 @@
-//! An in-memory, scripted stand-in for `crate::fleet::Observer`.
+//! In-memory, scripted stand-ins for `crate::fleet::Observer` and
+//! `crate::fleet::Actuator`.
 //!
-//! The real `Observer` implementations in `fleet.rs` read a file or spawn a
-//! command. A controller-cycle test needs a fleet's reported worker count
-//! without touching disk or a process -- mirroring `FakeSource`'s role for
+//! The real implementations in `fleet.rs` read a file, write a file, or
+//! spawn a command. A controller-cycle test needs a fleet's reported worker
+//! count, and a record of what an actuator was told to do, without touching
+//! disk or a process -- mirroring `FakeSource`'s role for
 //! `crate::source::collect`.
 
-use crate::fleet::Observer;
+use crate::fleet::{Actuator, Observer};
 use anyhow::{anyhow, Result};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -51,6 +53,31 @@ impl Observer for FakeObserver {
     }
 }
 
+/// Records every `desired` count it is given, in call order, instead of
+/// writing a file or running a command.
+#[derive(Default)]
+pub(crate) struct FakeActuator {
+    calls: RefCell<Vec<u32>>,
+}
+
+impl FakeActuator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The `desired` count from every call so far, in call order.
+    pub(crate) fn calls(&self) -> Vec<u32> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl Actuator for FakeActuator {
+    fn actuate(&self, desired: u32) -> Result<()> {
+        self.calls.borrow_mut().push(desired);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod observer_tests {
     use super::*;
@@ -87,5 +114,25 @@ mod observer_tests {
     fn panics_when_the_script_runs_out() {
         let observer = FakeObserver::new();
         let _ = observer.current_workers();
+    }
+}
+
+#[cfg(test)]
+mod actuator_tests {
+    use super::*;
+
+    #[test]
+    fn records_every_desired_count_in_call_order() {
+        let actuator = FakeActuator::new();
+        actuator.actuate(3).unwrap();
+        actuator.actuate(9).unwrap();
+        actuator.actuate(0).unwrap();
+        assert_eq!(actuator.calls(), vec![3, 9, 0]);
+    }
+
+    #[test]
+    fn starts_with_no_recorded_calls() {
+        let actuator = FakeActuator::new();
+        assert!(actuator.calls().is_empty());
     }
 }
