@@ -93,7 +93,7 @@ fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
 }
 
 fn collect_normalized_http(url: &str, timeout_seconds: u64) -> Result<QuotaSnapshot> {
-    let agent = http_agent(timeout_seconds);
+    let agent = http_agent(timeout_seconds)?;
     let response = agent
         .get(url)
         .call()
@@ -129,7 +129,7 @@ fn collect_anthropic(
 ) -> Result<QuotaSnapshot> {
     let access_token = obtain_access_token(credentials_path, token_url, timeout_seconds)?;
 
-    let response = http_agent(timeout_seconds)
+    let response = http_agent(timeout_seconds)?
         .get(usage_url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
@@ -301,7 +301,7 @@ fn apply_refreshed_credentials(
 }
 
 fn refresh_anthropic(refresh_token: &str, token_url: &str, timeout_seconds: u64) -> Result<Value> {
-    let response = http_agent(timeout_seconds)
+    let response = http_agent(timeout_seconds)?
         .post(token_url)
         .set("Content-Type", "application/json")
         .set("User-Agent", "claude-code/2.1.114")
@@ -611,10 +611,17 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
-fn http_agent(timeout_seconds: u64) -> ureq::Agent {
-    ureq::AgentBuilder::new()
+/// Builds an HTTP client with a mandatory, finite overall-request timeout
+/// (connect through reading the full response body) -- plan.md §7.4: "HTTP
+/// requests have mandatory finite timeouts." `timeout_seconds: 0` is refused
+/// rather than silently producing a request with no effective deadline.
+fn http_agent(timeout_seconds: u64) -> Result<ureq::Agent> {
+    if timeout_seconds == 0 {
+        bail!("HTTP source timeout_seconds must be greater than zero");
+    }
+    Ok(ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(timeout_seconds))
-        .build()
+        .build())
 }
 
 fn read_json(path: &Path, label: &str) -> Result<Value> {
@@ -1081,14 +1088,19 @@ mod tests {
     }
 
     /// Serves `body` once over raw HTTP/1.1 on an ephemeral loopback port,
-    /// with no request-size mocking library required.
-    fn spawn_http_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+    /// with no request-size mocking library required, and returns the raw
+    /// request bytes the client sent so tests can inspect exactly what went
+    /// over the wire.
+    fn spawn_http_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<Vec<u8>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
+            let mut request = Vec::new();
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
+                let mut buf = [0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf) {
+                    request.extend_from_slice(&buf[..n]);
+                }
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -1096,6 +1108,7 @@ mod tests {
                 let _ = stream.write_all(header.as_bytes());
                 let _ = stream.write_all(&body);
             }
+            request
         });
         (format!("http://127.0.0.1:{port}/"), handle)
     }
@@ -1125,5 +1138,56 @@ mod tests {
         };
         assert!(collect(&source).is_err());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn collect_normalized_http_sends_no_credential_headers() {
+        let body = br#"{"observed_at":"2026-09-12T12:00:00Z","windows":[{"id":"w","used_fraction":0.1,"resets_at":"2026-09-13T00:00:00Z"}]}"#.to_vec();
+        let (url, handle) = spawn_http_server(body);
+
+        let source = SourceConfig::NormalizedHttp {
+            url,
+            timeout_seconds: 5,
+        };
+        collect(&source).unwrap();
+
+        let request = String::from_utf8_lossy(&handle.join().unwrap()).to_lowercase();
+        assert!(
+            !request.contains("authorization:"),
+            "a generic normalized_http source must never auto-attach a credential header: {request}"
+        );
+        assert!(!request.contains("cookie:"));
+    }
+
+    #[test]
+    fn http_agent_rejects_a_zero_timeout() {
+        assert!(http_agent(0).is_err());
+    }
+
+    #[test]
+    fn http_agent_accepts_a_positive_timeout() {
+        assert!(http_agent(1).is_ok());
+    }
+
+    #[test]
+    fn collect_normalized_http_rejects_zero_timeout_without_dialing_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let source = SourceConfig::NormalizedHttp {
+            url: format!("http://127.0.0.1:{port}/"),
+            timeout_seconds: 0,
+        };
+        assert!(collect(&source).is_err());
+
+        // Give a stray connection attempt a brief window to arrive, then
+        // prove none did: the zero-timeout rejection happens before dialing
+        // out at all, not by racing an immediate connect-timeout.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            listener.accept().is_err(),
+            "a zero-timeout source must never attempt a connection"
+        );
     }
 }
