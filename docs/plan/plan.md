@@ -439,14 +439,25 @@ boundary is normative per
 The two-point estimator is the v0.1 baseline. Before v1 production scaling:
 
 - [ ] retain a bounded history per generation;
-- [ ] model provider percentage quantization as an interval rather than a
-  precise point;
-- [ ] use a robust slope estimator that cannot learn zero from censored data;
-- [ ] distinguish externally consumed quota from governed-worker burn where
-  supporting signals exist;
-- [ ] add hysteresis or minimum target dwell time after proving it does not
-  violate binding windows;
+- deferred — model provider percentage quantization as an interval rather
+  than a precise point (the exact interval model is one of §21's
+  evidence-gated forks; not a bead until observation-mode traces exist);
+- [ ] use a robust slope estimator that cannot learn zero from censored data
+  (the general property is buildable now; only the exact parametric form is
+  the §21 fork, refined later with evidence);
+- deferred — distinguish externally consumed quota from governed-worker burn
+  where supporting signals exist (§21: "whether external-consumption
+  estimation is reliable enough to expose" is unresolved, not a bead);
+- deferred — add hysteresis or minimum target dwell time after proving it
+  does not violate binding windows (§21: the proof this bullet requires
+  doesn't exist yet, so there is nothing to build against);
 - [ ] simulate estimator behavior against bursty, idle, and reset-heavy traces.
+
+The three "deferred" bullets above are the same forks §21 already lists as
+needing observation-mode evidence before they can be decided, not merely
+unbuilt work — per this project's rule that an unresolved decision is never a
+bead, they stay here as plan text rather than becoming one. The other three
+bullets are concrete, buildable requirements and are beaded.
 
 ## 10. State and concurrency
 
@@ -898,7 +909,10 @@ These require evidence from observation-mode traces:
 - bounded history length;
 - whether external-consumption estimation is reliable enough to expose;
 - whether a long-lived Codex session materially improves reliability;
-- which fleet-manager-specific adapters merit first-party support.
+- which fleet-manager-specific adapters merit first-party support;
+- whether/when to adopt a cost-aware placement objective in place of
+  proportional-by-headroom distribution (§22.7), pending real multi-host
+  placement traces.
 
 Record architectural decisions in `docs/adr/` and operational evidence in
 `docs/notes/`. Changes to the normalized contract or safety invariants require
@@ -1110,9 +1124,11 @@ Invariants, mirroring §9.6/§17.2's property-test style:
 
 Future placement hardening (parity with §9.8, not blocking v1.1):
 
-- [ ] Replace proportional-by-headroom with a cost-aware objective (per-host
-  $-cost, mirroring cgov's `distribute_workers_by_cost_priority`) once v1.1
-  ships and real placement traces exist.
+- deferred — replace proportional-by-headroom with a cost-aware objective
+  (per-host $-cost, mirroring cgov's `distribute_workers_by_cost_priority`)
+  once v1.1 ships and real placement traces exist; like §9.8's evidence-gated
+  bullets, there is nothing to build against yet, so this is plan text, not
+  a bead, until those traces exist.
 - [ ] Per-host step-limit overrides.
 - [ ] Bounded placement history for oscillation detection, parity with §9.8's
   bursty/idle trace simulation.
