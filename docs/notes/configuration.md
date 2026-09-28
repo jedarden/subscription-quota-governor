@@ -135,3 +135,9 @@ redirection do not occur.
 
 Start with `none` or `--observe-only`. Confirm two or more same-generation
 samples and decision output before granting process-management authority.
+
+A cross-host observer or actuator reached over SSH (`argv: [ssh, <host>,
+...]`) uses this same `command` primitive with no special transport --
+see [the SSH remote-command policy](ssh-remote-command-policy.md) for the
+injection-safety boundary that shifts once SSH re-parses the remote
+command through the remote shell.
