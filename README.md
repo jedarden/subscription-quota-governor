@@ -145,8 +145,10 @@ an atomic target file or execute an argv array containing
 default.
 
 See [architecture decisions](docs/adr/README.md),
-[configuration notes](docs/notes/configuration.md), the
-[implementation plan](docs/plan/plan.md), and the ready-to-edit
+[configuration notes](docs/notes/configuration.md),
+[configuration compatibility policy](docs/notes/compatibility.md), the
+[implementation plan](docs/plan/plan.md), the [changelog](CHANGELOG.md), a
+[hardened systemd service example](deploy/systemd/), and the ready-to-edit
 [Claude Code](examples/claude-code.yaml), [Codex](examples/codex.yaml), and
 [Claude-on-Z.AI](examples/claude-zai.yaml) examples.
 
