@@ -623,4 +623,261 @@ mod tests {
         assert_eq!(banked.desired_workers, config.fleet.max_workers);
         serde_json::to_string(&decision).unwrap();
     }
+
+    // --- §9.2 policy resolution: table-driven target/reserve boundary tests ---
+    //
+    // Each case pins Strategy::CeilingOnly so the resolved target's
+    // reached/not-reached outcome (fleet.max_workers vs fleet.min_workers) is
+    // determined purely by policy resolution, independent of burn-rate
+    // pacing (§9.4), which is out of scope for this boundary sweep.
+
+    struct PolicyBoundaryCase {
+        name: &'static str,
+        account_target: Option<f64>,
+        account_reserve: Option<f64>,
+        window_override: Option<WindowPolicy>,
+        used_fraction: f64,
+        reached_flag: bool,
+        expect_target: f64,
+        expect_reason: &'static str,
+    }
+
+    #[test]
+    fn policy_resolution_boundary_values() {
+        let now = Utc::now();
+        let resets_at = now + Duration::hours(4);
+        let cases = [
+            PolicyBoundaryCase {
+                name: "target at maximum edge (1.0) reached exactly at full utilization",
+                account_target: Some(1.0),
+                account_reserve: None,
+                window_override: None,
+                used_fraction: 1.0,
+                reached_flag: false,
+                expect_target: 1.0,
+                expect_reason: "target_reached",
+            },
+            PolicyBoundaryCase {
+                name: "target at maximum edge (1.0) not reached just below full utilization",
+                account_target: Some(1.0),
+                account_reserve: None,
+                window_override: None,
+                used_fraction: 0.999_999_999,
+                reached_flag: false,
+                expect_target: 1.0,
+                expect_reason: "below_ceiling",
+            },
+            PolicyBoundaryCase {
+                name: "near-zero target not reached at zero utilization",
+                account_target: Some(0.000_1),
+                account_reserve: None,
+                window_override: None,
+                used_fraction: 0.0,
+                reached_flag: false,
+                expect_target: 0.000_1,
+                expect_reason: "below_ceiling",
+            },
+            PolicyBoundaryCase {
+                name: "zero utilization stays below a maximal target",
+                account_target: Some(1.0),
+                account_reserve: None,
+                window_override: None,
+                used_fraction: 0.0,
+                reached_flag: false,
+                expect_target: 1.0,
+                expect_reason: "below_ceiling",
+            },
+            PolicyBoundaryCase {
+                name: "reserve_fraction at minimum edge (0.0) converts to target 1.0 and reaches at full utilization",
+                account_target: None,
+                account_reserve: Some(0.0),
+                window_override: None,
+                used_fraction: 1.0,
+                reached_flag: false,
+                expect_target: 1.0,
+                expect_reason: "target_reached",
+            },
+            PolicyBoundaryCase {
+                name: "reserve_fraction at minimum edge (0.0) does not reach just below full utilization",
+                account_target: None,
+                account_reserve: Some(0.0),
+                window_override: None,
+                used_fraction: 0.999_999_999,
+                reached_flag: false,
+                expect_target: 1.0,
+                expect_reason: "below_ceiling",
+            },
+            PolicyBoundaryCase {
+                name: "window override target_utilization wins over the account default target",
+                account_target: Some(0.5),
+                account_reserve: None,
+                window_override: Some(WindowPolicy {
+                    target_utilization: Some(1.0),
+                    ..Default::default()
+                }),
+                used_fraction: 1.0,
+                reached_flag: false,
+                expect_target: 1.0,
+                expect_reason: "target_reached",
+            },
+            PolicyBoundaryCase {
+                name: "window override reserve_fraction at minimum edge wins over the account default target",
+                account_target: Some(0.5),
+                account_reserve: None,
+                window_override: Some(WindowPolicy {
+                    reserve_fraction: Some(0.0),
+                    ..Default::default()
+                }),
+                used_fraction: 1.0,
+                reached_flag: false,
+                expect_target: 1.0,
+                expect_reason: "target_reached",
+            },
+            PolicyBoundaryCase {
+                name: "window override with enabled=true and no target falls back to the account default",
+                account_target: Some(0.9),
+                account_reserve: None,
+                window_override: Some(WindowPolicy {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                used_fraction: 0.9,
+                reached_flag: false,
+                expect_target: 0.9,
+                expect_reason: "target_reached",
+            },
+            PolicyBoundaryCase {
+                name: "provider-reported reached flag wins even far below the resolved target",
+                account_target: Some(0.9),
+                account_reserve: None,
+                window_override: None,
+                used_fraction: 0.1,
+                reached_flag: true,
+                expect_target: 0.9,
+                expect_reason: "target_reached",
+            },
+        ];
+
+        for case in cases {
+            let mut windows = BTreeMap::new();
+            if let Some(policy) = case.window_override {
+                windows.insert("weekly".to_string(), policy);
+            }
+            let mut config = account();
+            config.utilization.target_utilization = case.account_target;
+            config.utilization.reserve_fraction = case.account_reserve;
+            config.utilization.strategy = Strategy::CeilingOnly;
+            config.utilization.windows = windows;
+
+            let snapshot = QuotaSnapshot {
+                observed_at: now,
+                fresh: true,
+                windows: vec![QuotaWindow {
+                    id: "weekly".into(),
+                    used_fraction: case.used_fraction,
+                    resets_at,
+                    duration_minutes: Some(10_080),
+                    reached: case.reached_flag,
+                }],
+                reset_credits: None,
+            };
+
+            let decision = evaluate("test", &config, &snapshot, &AccountState::default(), 2, now)
+                .unwrap_or_else(|err| panic!("case {:?}: evaluate failed: {err}", case.name));
+            assert_eq!(
+                decision.windows[0].target_utilization, case.expect_target,
+                "case {:?}: resolved target mismatch",
+                case.name
+            );
+            assert_eq!(
+                decision.windows[0].reason, case.expect_reason,
+                "case {:?}: reason mismatch",
+                case.name
+            );
+            let expected_window_workers = if case.expect_reason == "target_reached" {
+                config.fleet.min_workers
+            } else {
+                config.fleet.max_workers
+            };
+            assert_eq!(
+                decision.windows[0].desired_workers, expected_window_workers,
+                "case {:?}: per-window desired_workers mismatch",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_window_is_skipped_while_other_windows_are_still_evaluated() {
+        let now = Utc::now();
+        let mut windows = BTreeMap::new();
+        windows.insert(
+            "disabled_window".to_string(),
+            WindowPolicy {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        let mut config = account();
+        config.utilization.windows = windows;
+
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![
+                QuotaWindow {
+                    id: "disabled_window".into(),
+                    used_fraction: 1.0,
+                    resets_at: now + Duration::hours(1),
+                    duration_minutes: Some(300),
+                    reached: true,
+                },
+                QuotaWindow {
+                    id: "weekly".into(),
+                    used_fraction: 0.1,
+                    resets_at: now + Duration::days(1),
+                    duration_minutes: Some(10_080),
+                    reached: false,
+                },
+            ],
+            reset_credits: None,
+        };
+
+        let decision =
+            evaluate("test", &config, &snapshot, &AccountState::default(), 2, now).unwrap();
+        assert_eq!(decision.windows.len(), 1);
+        assert_eq!(decision.windows[0].id, "weekly");
+    }
+
+    #[test]
+    fn all_windows_disabled_fails_evaluation() {
+        let now = Utc::now();
+        let mut windows = BTreeMap::new();
+        windows.insert(
+            "weekly".to_string(),
+            WindowPolicy {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        let mut config = account();
+        config.utilization.windows = windows;
+
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.5,
+                resets_at: now + Duration::days(1),
+                duration_minutes: Some(10_080),
+                reached: false,
+            }],
+            reset_credits: None,
+        };
+
+        let error =
+            evaluate("test", &config, &snapshot, &AccountState::default(), 2, now).unwrap_err();
+        assert!(error.to_string().contains("no enabled quota windows"));
+    }
 }
