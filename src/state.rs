@@ -97,6 +97,24 @@ impl State {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create state directory {}", parent.display()))?;
+
+        // Serialize and round-trip in memory before touching disk at all.
+        // serde_json encodes a non-finite f64 (NaN/Infinity) as JSON `null`
+        // without erroring, which would otherwise write "successfully" and
+        // get promoted over the rename -- clobbering the last state that
+        // was actually loadable with one that no longer is. Catching that
+        // here keeps the temp-file-then-rename path fail closed: nothing
+        // that can't be read back ever reaches `path`.
+        let mut payload =
+            serde_json::to_vec_pretty(self).context("failed to serialize state")?;
+        serde_json::from_slice::<Self>(&payload).with_context(|| {
+            format!(
+                "serialized state for {} does not round-trip; refusing to persist it over the last valid state",
+                path.display()
+            )
+        })?;
+        payload.push(b'\n');
+
         let temporary = temporary_path(path);
         let result = (|| -> Result<()> {
             let mut file = OpenOptions::new()
@@ -104,8 +122,7 @@ impl State {
                 .write(true)
                 .open(&temporary)
                 .with_context(|| format!("failed to create {}", temporary.display()))?;
-            serde_json::to_writer_pretty(&mut file, self)?;
-            file.write_all(b"\n")?;
+            file.write_all(&payload)?;
             file.sync_all()?;
             fs::rename(&temporary, path)
                 .with_context(|| format!("failed to install state {}", path.display()))?;
@@ -171,6 +188,84 @@ mod tests {
         State::default().save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
         assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn save_never_clobbers_last_valid_state_with_a_non_finite_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+
+        let mut good = State::default();
+        good.accounts.insert(
+            "acct".to_string(),
+            AccountState {
+                windows: BTreeMap::new(),
+                last_target: Some(3),
+            },
+        );
+        good.save(&path).unwrap();
+        let good_bytes = fs::read(&path).unwrap();
+
+        let mut bad = good.clone();
+        bad.accounts.get_mut("acct").unwrap().windows.insert(
+            "5h".to_string(),
+            WindowSample {
+                observed_at: Utc::now(),
+                used_fraction: f64::NAN,
+                resets_at: Utc::now(),
+                workers: 1,
+            },
+        );
+        let error = bad.save(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("round-trip"),
+            "unexpected error: {error}"
+        );
+
+        let bytes_after = fs::read(&path).unwrap();
+        assert_eq!(
+            good_bytes, bytes_after,
+            "a failed write must not change the persisted state"
+        );
+        let temp_leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            temp_leftovers.is_empty(),
+            "temp file must be cleaned up on failure"
+        );
+    }
+
+    #[test]
+    fn save_leaves_last_valid_state_untouched_when_rename_target_is_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        State::default().save(&path).unwrap();
+        let good_bytes = fs::read(&path).unwrap();
+
+        // Pre-create the temp file so `create_new` fails, simulating a
+        // write-path failure that never reaches the rename step at all.
+        let temporary = temporary_path(&path);
+        fs::write(&temporary, b"garbage").unwrap();
+
+        let mut next = State::default();
+        next.accounts.insert(
+            "acct".to_string(),
+            AccountState {
+                windows: BTreeMap::new(),
+                last_target: Some(9),
+            },
+        );
+        let result = next.save(&path);
+        assert!(result.is_err());
+
+        let bytes_after = fs::read(&path).unwrap();
+        assert_eq!(
+            good_bytes, bytes_after,
+            "a failed write must not change the persisted state"
+        );
     }
 
     #[test]
