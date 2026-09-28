@@ -44,9 +44,27 @@ up, because the governor cannot prove that capacity is free.
 ### `anthropic_oauth`
 
 Reads the same credential shape as Claude Code and polls the Anthropic OAuth
-usage endpoint. It refreshes tokens within five minutes of expiry and atomically
-updates the credential file while preserving unknown JSON fields. No token is
-persisted in governor state.
+usage endpoint (`usage_url`, defaulting to `https://api.anthropic.com/api/oauth/usage`).
+It refreshes tokens within five minutes of expiry and atomically updates the
+credential file while preserving unknown JSON fields. No token is persisted in
+governor state.
+
+**This endpoint's shape and availability are controlled by Anthropic, not by
+this project, and may change without notice.** It is not documented as a
+stable public API; it is the same internal usage surface Claude Code itself
+polls. `subgov` only claims to normalize the response shapes it has observed
+(legacy named windows and the generic `limits[]` array -- see
+[provider surfaces](../research/provider-surfaces.md)), and both `usage_url`
+and `token_url` are configurable so a deployment can point at a changed or
+mirrored endpoint without a code change.
+
+A parse failure, an HTTP error, or an unexpected response shape from this
+source fails that account's cycle before any fleet decision is made --
+`source::collect` returns an error, `run_cycle` (`src/main.rs`) catches it,
+counts it, and moves on to the next account. The account is never actuated,
+scaled, or assumed-healthy on a failed poll, and other accounts in the same
+process are unaffected. See the README's
+[safety boundaries](../../README.md#safety-boundaries).
 
 ### `codex_app_server`
 
