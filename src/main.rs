@@ -4,6 +4,8 @@ use clap::{Parser, Subcommand};
 use rand::Rng;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use subscription_governor::config::{ActuatorConfig, Config};
@@ -66,10 +68,11 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<()> {
     let state_path = config.state_path();
     let _lock = StateLock::acquire(&state_path)?;
     let mut state = State::load(&state_path)?;
+    let shutdown = install_shutdown_flag()?;
     let interval = Duration::from_secs(config.poll_interval_seconds);
     let mut anchor = Instant::now();
     loop {
-        let failures = run_cycle(&config, &mut state, observe_only);
+        let failures = run_cycle(&config, &mut state, observe_only, &shutdown);
         state.save(&state_path)?;
         if once {
             if failures > 0 {
@@ -77,9 +80,52 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<()> {
             }
             return Ok(());
         }
+        if shutdown.load(Ordering::SeqCst) {
+            shutdown_complete();
+            return Ok(());
+        }
         let (next_anchor, sleep_for) = advance_schedule(anchor, interval, Instant::now());
         anchor = next_anchor;
-        thread::sleep(sleep_for + bounded_jitter(interval));
+        interruptible_sleep(sleep_for + bounded_jitter(interval), &shutdown);
+        if shutdown.load(Ordering::SeqCst) {
+            shutdown_complete();
+            return Ok(());
+        }
+    }
+}
+
+/// Installs a SIGTERM/SIGINT handler that flips a shared flag rather than
+/// terminating the process immediately, so the run loop can finish or
+/// abandon the in-flight cycle and persist valid state before exiting.
+fn install_shutdown_flag() -> Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        handler_flag.store(true, Ordering::SeqCst);
+    })
+    .context("failed to install SIGINT/SIGTERM handler")?;
+    Ok(shutdown)
+}
+
+fn shutdown_complete() {
+    eprintln!(
+        "{}",
+        json!({"event": "shutdown", "time": Utc::now(), "reason": "signal"})
+    );
+}
+
+/// Sleeps for `duration`, but returns promptly (within one `STEP`) once
+/// `shutdown` is set instead of blocking for the full duration.
+fn interruptible_sleep(duration: Duration, shutdown: &AtomicBool) {
+    const STEP: Duration = Duration::from_millis(200);
+    let mut remaining = duration;
+    while remaining > Duration::ZERO {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let slice = remaining.min(STEP);
+        thread::sleep(slice);
+        remaining -= slice;
     }
 }
 
@@ -113,9 +159,17 @@ fn bounded_jitter(interval: Duration) -> Duration {
     Duration::from_millis(millis)
 }
 
-fn run_cycle(config: &Config, state: &mut State, observe_only: bool) -> usize {
+fn run_cycle(
+    config: &Config,
+    state: &mut State,
+    observe_only: bool,
+    shutdown: &AtomicBool,
+) -> usize {
     let mut failures = 0;
     for (name, account_config) in &config.accounts {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         let result = (|| -> Result<()> {
             let snapshot = source::collect(&account_config.source)?;
             let workers = fleet::current_workers(&account_config.fleet)?;
@@ -206,5 +260,101 @@ mod scheduling_tests {
     #[test]
     fn jitter_is_zero_for_a_zero_interval() {
         assert_eq!(bounded_jitter(Duration::ZERO), Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use subscription_governor::config::{
+        AccountConfig, BankedResetConfig, FleetConfig, SourceConfig, StaleBehavior, Strategy,
+        UtilizationConfig, WorkerObserverConfig,
+    };
+
+    fn account_config(path: PathBuf) -> AccountConfig {
+        AccountConfig {
+            source: SourceConfig::NormalizedFile { path },
+            fleet: FleetConfig {
+                min_workers: 0,
+                max_workers: 4,
+                bootstrap_workers: 1,
+                max_scale_up_per_cycle: 1,
+                max_scale_down_per_cycle: 1,
+                observer: WorkerObserverConfig::Static { workers: 1 },
+                actuator: ActuatorConfig::None,
+            },
+            utilization: UtilizationConfig {
+                target_utilization: Some(0.9),
+                reserve_fraction: None,
+                strategy: Strategy::CeilingOnly,
+                stale_after_seconds: 900,
+                stale_behavior: StaleBehavior::Hold,
+                minimum_sample_seconds: 60,
+                windows: BTreeMap::new(),
+            },
+            banked_resets: BankedResetConfig::default(),
+        }
+    }
+
+    // Every account source points at a file that does not exist, so an
+    // account that is actually attempted always fails collection. This lets
+    // the tests below distinguish "abandoned" (never attempted, no failure)
+    // from "attempted" (failure recorded) without needing a working fixture.
+    fn config_with_unreachable_sources() -> Config {
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            "a".to_string(),
+            account_config(PathBuf::from("/nonexistent/subgov-test-a.json")),
+        );
+        accounts.insert(
+            "b".to_string(),
+            account_config(PathBuf::from("/nonexistent/subgov-test-b.json")),
+        );
+        Config {
+            version: 1,
+            poll_interval_seconds: 300,
+            state_path: None,
+            accounts,
+        }
+    }
+
+    #[test]
+    fn run_cycle_abandons_every_account_when_shutdown_is_already_requested() {
+        let config = config_with_unreachable_sources();
+        let mut state = State::default();
+        let shutdown = AtomicBool::new(true);
+        let failures = run_cycle(&config, &mut state, true, &shutdown);
+        assert_eq!(failures, 0, "no account should have been attempted");
+    }
+
+    #[test]
+    fn run_cycle_attempts_every_account_when_not_shutting_down() {
+        let config = config_with_unreachable_sources();
+        let mut state = State::default();
+        let shutdown = AtomicBool::new(false);
+        let failures = run_cycle(&config, &mut state, true, &shutdown);
+        assert_eq!(failures, 2);
+    }
+
+    #[test]
+    fn interruptible_sleep_returns_promptly_when_already_shutting_down() {
+        let shutdown = AtomicBool::new(true);
+        let start = Instant::now();
+        interruptible_sleep(Duration::from_secs(5), &shutdown);
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn interruptible_sleep_stops_within_one_step_of_a_late_signal() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        interruptible_sleep(Duration::from_secs(5), &shutdown);
+        assert!(start.elapsed() < Duration::from_millis(400));
     }
 }
