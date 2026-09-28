@@ -251,6 +251,10 @@ impl Actuator for CommandActuator {
     }
 }
 
+/// The non-secret environment variable an idempotency token is passed
+/// through (plan.md §11.2). See [`idempotency_token`] for the contract.
+const IDEMPOTENCY_TOKEN_ENV: &str = "SUBGOV_IDEMPOTENCY_TOKEN";
+
 /// The `CommandActuator` implementation, with the timeout as a parameter so
 /// tests can use a short one instead of waiting out `CHILD_TIMEOUT`.
 fn command_actuator_actuate(argv: &[String], desired: u32, timeout: Duration) -> Result<()> {
@@ -261,6 +265,10 @@ fn command_actuator_actuate(argv: &[String], desired: u32, timeout: Duration) ->
     let mut command = new_process_group_command(&rendered[0]);
     command
         .args(&rendered[1..])
+        .env(
+            IDEMPOTENCY_TOKEN_ENV,
+            idempotency_token(&rendered, desired),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -273,6 +281,40 @@ fn command_actuator_actuate(argv: &[String], desired: u32, timeout: Duration) ->
         bail!("fleet actuator {} exited with {status}", rendered[0]);
     }
     Ok(())
+}
+
+/// A stable idempotency token for one command-actuator invocation (plan.md
+/// §11.2: "optionally support an idempotency token through a non-secret
+/// environment variable after its contract is specified").
+///
+/// Contract:
+///
+/// - passed to the child as `SUBGOV_IDEMPOTENCY_TOKEN`; using it is entirely
+///   optional for the receiving script, which is free to ignore an
+///   environment variable it does not recognize;
+/// - a hex-encoded, deterministic hash of the rendered command and the
+///   desired count -- *not* a random nonce, and *not* derived from the
+///   process id, a path, or wall-clock time -- so it is stable across
+///   process restarts, not just within one;
+/// - identical for two invocations that represent the same logical
+///   actuation: an account whose actuation failed or hung is retried
+///   unchanged on the next reconciliation cycle (plan.md §11.2: "retain the
+///   prior state on actuation failure so the next cycle reconciles"), so the
+///   retry renders the same command against the same desired count and
+///   produces the same token, letting a script de-duplicate the retried
+///   partial actuation. It changes whenever the rendered command or the
+///   desired count changes, since either means a genuinely different
+///   actuation is being requested;
+/// - carries no quota, credential, or account-identifying data -- the
+///   `Actuator` trait passes none of that in to begin with -- so it is safe
+///   to log.
+fn idempotency_token(rendered_argv: &[String], desired: u32) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    rendered_argv.hash(&mut hasher);
+    desired.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Waits for `child` to exit, polling rather than blocking so a deadline can
@@ -638,6 +680,43 @@ mod tests {
             !marker.exists(),
             "grandchild should have been killed along with the rest of the process group"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idempotency_token_is_stable_for_the_same_command_and_desired_count() {
+        let argv = vec!["/usr/bin/true".to_string(), "arg".to_string()];
+        assert_eq!(idempotency_token(&argv, 5), idempotency_token(&argv, 5));
+    }
+
+    #[test]
+    fn idempotency_token_changes_when_the_desired_count_changes() {
+        let argv = vec!["/usr/bin/true".to_string()];
+        assert_ne!(idempotency_token(&argv, 5), idempotency_token(&argv, 6));
+    }
+
+    #[test]
+    fn idempotency_token_changes_when_the_command_changes() {
+        assert_ne!(
+            idempotency_token(&["/usr/bin/true".to_string()], 5),
+            idempotency_token(&["/usr/bin/false".to_string()], 5)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_actuator_passes_the_idempotency_token_as_a_non_secret_env_var() {
+        let dir = std::env::temp_dir().join(format!("subgov-fleet-idem-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("token");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo \"$SUBGOV_IDEMPOTENCY_TOKEN\" > {}", marker.display()),
+        ];
+        command_actuator_actuate(&argv, 7, Duration::from_millis(500)).unwrap();
+        let recorded = fs::read_to_string(&marker).unwrap();
+        assert_eq!(recorded.trim(), idempotency_token(&argv, 7));
         let _ = fs::remove_dir_all(&dir);
     }
 
