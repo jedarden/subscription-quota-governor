@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.ardenone.com/jedarden/subscription-quota-governor/raw/branch/main/schema/governor-config.schema.json",
+  "title": "Governor configuration (version 1)",
+  "description": "The §8 versioned config contract, hand-written against the actual Deserialize/validate() behavior of Config and its nested types in src/config.rs, and checked against every real fixture under examples/*.yaml. version is pinned to the literal 1 because Config::validate() rejects anything else outright ('unsupported config version'); a future version 2 gets its own schema file rather than a union here, matching the plan's 'new top-level version' compatibility rule. Every object here mirrors a #[serde(deny_unknown_fields)] struct, so additionalProperties is false throughout (unlike quota-snapshot.schema.json, which mirrors permissive structs). Two classes of Config::validate() rule are documented but NOT enforced by this schema, because vanilla JSON Schema has no portable way to express them: (1) cross-field numeric comparisons on sibling properties -- max_workers >= min_workers, bootstrap_workers <= max_workers -- there is no standard keyword to compare two named properties against each other; (2) positivity/boundedness of stale_after_seconds, minimum_sample_seconds, and every timeout_seconds, which src/config.rs actually does not check either today despite §8 saying 'Poll, staleness, sample, and transport durations are positive and bounded' -- filed as subgov-634ba279 alongside this schema. Where JSON Schema can express a Config::validate() rule (target/reserve exclusivity and ranges, non-empty argv, the {desired_workers} placeholder, non-empty accounts map), it does.",
+  "type": "object",
+  "required": ["version", "accounts"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Config::validate() requires this to equal 1 exactly."
+    },
+    "poll_interval_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 300,
+      "description": "Config::validate() rejects 0; there is no documented upper bound."
+    },
+    "state_path": {
+      "type": "string",
+      "description": "A leading ~/ is expanded; no other shell/environment expansion runs."
+    },
+    "accounts": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "At least one account is required. Keys are account names; non-emptiness and uniqueness of keys are guaranteed by object/mapping syntax itself.",
+      "propertyNames": { "minLength": 1 },
+      "additionalProperties": { "$ref": "#/$defs/account" }
+    }
+  },
+  "$defs": {
+    "account": {
+      "type": "object",
+      "required": ["source", "fleet", "utilization"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "$ref": "#/$defs/source" },
+        "fleet": { "$ref": "#/$defs/fleet" },
+        "utilization": { "$ref": "#/$defs/utilization" },
+        "banked_resets": { "$ref": "#/$defs/bankedResets" }
+      }
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "validate_argv(): non-empty array, no empty element. Never interpreted by a shell (§7.4)."
+    },
+    "source": {
+      "description": "SourceConfig -- internally tagged on `type`, rename_all snake_case, deny_unknown_fields per variant.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "path"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "normalized_file" },
+            "path": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "url"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "normalized_http" },
+            "url": { "type": "string" },
+            "timeout_seconds": { "type": "integer", "minimum": 0, "default": 15 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "argv"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "command" },
+            "argv": { "$ref": "#/$defs/argv" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "anthropic_oauth" },
+            "credentials_path": { "type": "string", "default": "~/.claude/.credentials.json" },
+            "usage_url": { "type": "string", "default": "https://api.anthropic.com/api/oauth/usage" },
+            "token_url": { "type": "string", "default": "https://platform.claude.com/v1/oauth/token" },
+            "timeout_seconds": { "type": "integer", "minimum": 0, "default": 15 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "codex_app_server" },
+            "executable": { "type": "string", "default": "codex" },
+            "timeout_seconds": { "type": "integer", "minimum": 0, "default": 15 }
+          }
+        }
+      ]
+    },
+    "observer": {
+      "description": "WorkerObserverConfig -- internally tagged on `type`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "workers"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "static" },
+            "workers": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "path"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "file" },
+            "path": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "argv"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "command" },
+            "argv": { "$ref": "#/$defs/argv" }
+          }
+        }
+      ]
+    },
+    "actuator": {
+      "description": "ActuatorConfig -- internally tagged on `type`, defaults to {\"type\": \"none\"} when the account omits `actuator` entirely (schema-level default only; this schema validates the document as written, it does not itself substitute the default into a missing key).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "none" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "path"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "target_file" },
+            "path": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "argv"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "command" },
+            "argv": {
+              "allOf": [
+                { "$ref": "#/$defs/argv" },
+                {
+                  "contains": { "type": "string", "pattern": "\\{desired_workers\\}" },
+                  "description": "validate_fleet() requires an actuator command to contain {desired_workers} in at least one argument; source and observer commands do not have this requirement."
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "fleet": {
+      "type": "object",
+      "required": ["max_workers", "observer"],
+      "additionalProperties": false,
+      "description": "max_workers >= min_workers and bootstrap_workers <= max_workers are enforced by Config::validate() but not expressible here -- see the top-level description.",
+      "properties": {
+        "min_workers": { "type": "integer", "minimum": 0, "default": 0 },
+        "max_workers": { "type": "integer", "minimum": 0 },
+        "bootstrap_workers": { "type": "integer", "minimum": 0, "default": 1 },
+        "max_scale_up_per_cycle": { "type": "integer", "minimum": 0, "default": 1 },
+        "max_scale_down_per_cycle": { "type": "integer", "minimum": 0, "default": 1 },
+        "observer": { "$ref": "#/$defs/observer" },
+        "actuator": { "$ref": "#/$defs/actuator", "default": { "type": "none" } }
+      }
+    },
+    "strategy": {
+      "enum": ["linear_to_reset", "ceiling_only"],
+      "default": "linear_to_reset"
+    },
+    "utilization": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "validate_target(..., required=true): exactly one of target_utilization/reserve_fraction is required at account level.",
+      "oneOf": [
+        {
+          "required": ["target_utilization"],
+          "not": { "required": ["reserve_fraction"] }
+        },
+        {
+          "required": ["reserve_fraction"],
+          "not": { "required": ["target_utilization"] }
+        }
+      ],
+      "properties": {
+        "target_utilization": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "reserve_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
+        "strategy": { "$ref": "#/$defs/strategy" },
+        "stale_after_seconds": { "type": "integer", "minimum": 0, "default": 900 },
+        "stale_behavior": {
+          "enum": ["hold", "min_workers"],
+          "default": "hold"
+        },
+        "minimum_sample_seconds": { "type": "integer", "minimum": 0, "default": 300 },
+        "windows": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": { "$ref": "#/$defs/windowPolicy" }
+        }
+      }
+    },
+    "windowPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "validate_target(..., required=false): a window override may set at most one of target_utilization/reserve_fraction, and either or both may be entirely absent (inherits the account-level policy).",
+      "not": { "required": ["target_utilization", "reserve_fraction"] },
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "target_utilization": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "reserve_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
+        "strategy": { "$ref": "#/$defs/strategy" }
+      }
+    },
+    "bankedResets": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Policy for earned, one-shot quota resets (e.g. Codex banked resets). Every field has a Rust-side default, so none are required.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "minimum_pace_multiplier": { "type": "number", "minimum": 1, "default": 2.0 },
+        "redeem_at_utilization": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 1.0 },
+        "deadline_safety_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807,
+          "default": 21600,
+          "description": "Config::validate() rejects a value above i64::MAX."
+        }
+      }
+    }
+  }
+}
