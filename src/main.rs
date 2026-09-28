@@ -1,16 +1,20 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use subscription_governor::config::{ActuatorConfig, Config};
-use subscription_governor::controller::evaluate;
+use subscription_governor::controller::{evaluate, Decision};
 use subscription_governor::fleet;
 use subscription_governor::source;
 use subscription_governor::state::{State, StateLock};
@@ -39,6 +43,9 @@ enum Commands {
         #[arg(long)]
         observe_only: bool,
     },
+    /// Print each account's readiness classification from the last
+    /// completed cycle, without inspecting credentials or live sources.
+    Status,
 }
 
 /// Stable exit-code categories (plan.md §12). Each carries the underlying
@@ -105,6 +112,7 @@ fn run_cli() -> Result<(), GovernorError> {
         }
         Commands::Snapshot { account } => snapshot(&config, &account),
         Commands::Run { once, observe_only } => run(config, once, observe_only),
+        Commands::Status => status(&config),
     }
 }
 
@@ -122,6 +130,49 @@ fn snapshot(config: &Config, account: &str) -> Result<(), GovernorError> {
     .map_err(GovernorError::Source)
 }
 
+/// Prints one JSONL line per configured account classifying it as
+/// `healthy_learning`, `intentional_hold`, `provider_failure`,
+/// `stale_drain`, or `actuation_failure` (plan.md §16 WP6), read from the
+/// sidecar status file the run loop writes after every cycle. This never
+/// contacts a source, observer, or actuator, so it never needs credentials
+/// and never blocks on a live provider.
+fn status(config: &Config) -> Result<(), GovernorError> {
+    let path = status_path(&config.state_path());
+    let recorded: BTreeMap<String, AccountReadiness> = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse status file {}", path.display()))
+            .map_err(GovernorError::State)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => {
+            return Err(GovernorError::State(
+                anyhow::Error::new(error)
+                    .context(format!("failed to read status file {}", path.display())),
+            ))
+        }
+    };
+    for name in config.accounts.keys() {
+        let line = match recorded.get(name) {
+            Some(readiness) => json!({
+                "event": "status",
+                "account": name,
+                "time": Utc::now(),
+                "status": readiness,
+            }),
+            None => json!({
+                "event": "status",
+                "account": name,
+                "time": Utc::now(),
+                "status": {"state": "unknown", "reason": "no cycle has completed yet"},
+            }),
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&line).map_err(|error| GovernorError::State(error.into()))?
+        );
+    }
+    Ok(())
+}
+
 fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorError> {
     let state_path = config.state_path();
     let _lock = StateLock::acquire(&state_path).map_err(GovernorError::State)?;
@@ -129,9 +180,16 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
     let shutdown = install_shutdown_flag().map_err(GovernorError::State)?;
     let interval = Duration::from_secs(config.poll_interval_seconds);
     let mut anchor = Instant::now();
+    let status_path = status_path(&state_path);
     loop {
         let outcome = run_cycle(&config, &mut state, observe_only, &shutdown);
         state.save(&state_path).map_err(GovernorError::State)?;
+        if let Err(error) = merge_status_report(&status_path, &outcome.statuses) {
+            eprintln!(
+                "{}",
+                json!({"event": "status_write_error", "time": Utc::now(), "error": format!("{error:#}")})
+            );
+        }
         if once {
             if outcome.actuation_failures > 0 {
                 return Err(GovernorError::Actuation(anyhow!(
@@ -159,6 +217,148 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
             return Ok(());
         }
     }
+}
+
+/// An account's readiness classification (plan.md §16 WP6 definition of
+/// done): distinguishes healthy learning, an intentional hold at the
+/// configured target, a provider/observer failure, a stale-data drain, and
+/// an actuation failure -- all without exposing credentials or raw
+/// provider errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReadinessState {
+    HealthyLearning,
+    IntentionalHold,
+    ProviderFailure,
+    StaleDrain,
+    ActuationFailure,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AccountReadiness {
+    state: ReadinessState,
+    reason: String,
+    updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_workers: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desired_workers: Option<u32>,
+}
+
+fn readiness_for_decision(decision: &Decision) -> AccountReadiness {
+    let base = AccountReadiness {
+        state: ReadinessState::HealthyLearning,
+        reason: String::new(),
+        updated_at: Utc::now(),
+        observed_at: Some(decision.observed_at),
+        current_workers: Some(decision.current_workers),
+        desired_workers: Some(decision.desired_workers),
+    };
+    if decision.stale {
+        return AccountReadiness {
+            state: ReadinessState::StaleDrain,
+            reason: "stale_data_holding".to_owned(),
+            ..base
+        };
+    }
+    let intentional_hold = decision
+        .windows
+        .iter()
+        .any(|window| window.reason == "target_reached")
+        || decision
+            .banked_resets
+            .as_ref()
+            .is_some_and(|banked| banked.manual_redemption_recommended);
+    if intentional_hold {
+        return AccountReadiness {
+            state: ReadinessState::IntentionalHold,
+            reason: "target_reached".to_owned(),
+            ..base
+        };
+    }
+    let binding = decision
+        .binding_window
+        .as_ref()
+        .and_then(|id| decision.windows.iter().find(|window| &window.id == id))
+        .or_else(|| {
+            decision
+                .windows
+                .iter()
+                .find(|window| window.desired_workers == decision.desired_workers)
+        });
+    let reason = binding
+        .map(|window| window.reason.clone())
+        .unwrap_or_else(|| "healthy".to_owned());
+    AccountReadiness { reason, ..base }
+}
+
+fn readiness_for_failure(failure: &AccountFailure) -> AccountReadiness {
+    let (state, reason) = match failure {
+        AccountFailure::Observation(_) => {
+            (ReadinessState::ProviderFailure, "source_or_observer_error")
+        }
+        AccountFailure::Actuation(_) => (ReadinessState::ActuationFailure, "actuator_error"),
+    };
+    AccountReadiness {
+        state,
+        reason: reason.to_owned(),
+        updated_at: Utc::now(),
+        observed_at: None,
+        current_workers: None,
+        desired_workers: None,
+    }
+}
+
+fn status_path(state_path: &Path) -> PathBuf {
+    state_path.with_file_name("status.json")
+}
+
+/// Reads the existing status file (tolerating a missing or corrupt file by
+/// starting empty, since this is a derived, best-effort surface rather than
+/// durable state), applies `updates` on top, and atomically rewrites it.
+fn merge_status_report(path: &Path, updates: &BTreeMap<String, AccountReadiness>) -> Result<()> {
+    let mut recorded: BTreeMap<String, AccountReadiness> = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    for (name, readiness) in updates {
+        recorded.insert(name.clone(), readiness.clone());
+    }
+    write_status_report(path, &recorded)
+}
+
+fn write_status_report(path: &Path, statuses: &BTreeMap<String, AccountReadiness>) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create status directory {}", parent.display()))?;
+    let temporary = temporary_status_path(path);
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        serde_json::to_writer_pretty(&mut file, statuses)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to install status {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn temporary_status_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("status.json");
+    path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
 }
 
 /// Installs a SIGTERM/SIGINT handler that flips a shared flag rather than
@@ -228,11 +428,13 @@ fn bounded_jitter(interval: Duration) -> Duration {
 
 /// Per-cycle failure counts, split by the exit-code category (plan.md §12)
 /// they map to: source/observer failures (exit 4) vs. actuation failures
-/// (exit 5).
+/// (exit 5); and each processed account's readiness classification for the
+/// status surface (plan.md §16 WP6).
 #[derive(Debug, Default)]
 struct CycleOutcome {
     observation_failures: usize,
     actuation_failures: usize,
+    statuses: BTreeMap<String, AccountReadiness>,
 }
 
 /// Why one account's cycle failed, carrying enough to both count it under
@@ -307,6 +509,9 @@ fn run_cycle(
                 };
                 account_state.record(&snapshot, sample_workers, decision.desired_workers);
             }
+            outcome
+                .statuses
+                .insert(name.clone(), readiness_for_decision(&decision));
             Ok(())
         })();
         if let Err(failure) = result {
@@ -314,6 +519,9 @@ fn run_cycle(
                 "actuation" => outcome.actuation_failures += 1,
                 _ => outcome.observation_failures += 1,
             }
+            outcome
+                .statuses
+                .insert(name.clone(), readiness_for_failure(&failure));
             eprintln!(
                 "{}",
                 json!({
@@ -557,5 +765,129 @@ mod exit_code_tests {
         let outcome = run_cycle(&config, &mut state, false, &shutdown);
         assert_eq!(outcome.actuation_failures, 1);
         assert_eq!(outcome.observation_failures, 0);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use subscription_governor::controller::{BankedResetDecision, WindowDecision};
+
+    fn decision(stale: bool, windows: Vec<WindowDecision>) -> Decision {
+        let binding_window = windows.first().map(|window| window.id.clone());
+        Decision {
+            account: "a".to_owned(),
+            observed_at: Utc::now(),
+            current_workers: 1,
+            desired_workers: 1,
+            stale,
+            windows,
+            binding_window,
+            banked_resets: None,
+        }
+    }
+
+    fn window(reason: &str, desired_workers: u32) -> WindowDecision {
+        WindowDecision {
+            id: "five_hour".to_owned(),
+            used_fraction: 0.5,
+            target_utilization: 0.9,
+            resets_at: Utc::now(),
+            desired_workers,
+            reason: reason.to_owned(),
+            observed_burn_per_worker_hour: None,
+        }
+    }
+
+    #[test]
+    fn stale_decision_is_a_stale_drain() {
+        let readiness = readiness_for_decision(&decision(true, Vec::new()));
+        assert_eq!(readiness.state, ReadinessState::StaleDrain);
+    }
+
+    #[test]
+    fn target_reached_window_is_an_intentional_hold() {
+        let readiness = readiness_for_decision(&decision(false, vec![window("target_reached", 0)]));
+        assert_eq!(readiness.state, ReadinessState::IntentionalHold);
+    }
+
+    #[test]
+    fn manual_redemption_recommended_is_an_intentional_hold() {
+        let mut d = decision(false, vec![window("paced_to_reset", 0)]);
+        d.banked_resets = Some(BankedResetDecision {
+            available_count: 1,
+            governing_window: "weekly".to_owned(),
+            minimum_pace_multiplier: 2.0,
+            required_burn_per_hour: 0.1,
+            desired_workers: 0,
+            manual_redemption_recommended: true,
+            deadline_missed: false,
+            reason: "weekly_window_awaiting_manual_redemption".to_owned(),
+            known_expirations: Vec::new(),
+        });
+        let readiness = readiness_for_decision(&d);
+        assert_eq!(readiness.state, ReadinessState::IntentionalHold);
+    }
+
+    #[test]
+    fn an_ordinary_decision_is_healthy_learning_with_the_binding_reason() {
+        let readiness = readiness_for_decision(&decision(false, vec![window("paced_to_reset", 2)]));
+        assert_eq!(readiness.state, ReadinessState::HealthyLearning);
+        assert_eq!(readiness.reason, "paced_to_reset");
+    }
+
+    #[test]
+    fn observation_failure_is_a_provider_failure() {
+        let readiness = readiness_for_failure(&AccountFailure::Observation(anyhow!("boom")));
+        assert_eq!(readiness.state, ReadinessState::ProviderFailure);
+    }
+
+    #[test]
+    fn actuation_failure_is_an_actuation_failure() {
+        let readiness = readiness_for_failure(&AccountFailure::Actuation(anyhow!("boom")));
+        assert_eq!(readiness.state, ReadinessState::ActuationFailure);
+    }
+
+    #[test]
+    fn merge_status_report_updates_only_the_given_accounts_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+
+        let mut first = BTreeMap::new();
+        first.insert(
+            "a".to_owned(),
+            readiness_for_failure(&AccountFailure::Observation(anyhow!("x"))),
+        );
+        first.insert(
+            "b".to_owned(),
+            readiness_for_decision(&decision(true, Vec::new())),
+        );
+        merge_status_report(&path, &first).unwrap();
+
+        let mut second = BTreeMap::new();
+        second.insert(
+            "a".to_owned(),
+            readiness_for_decision(&decision(false, vec![window("below_ceiling", 3)])),
+        );
+        merge_status_report(&path, &second).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let recorded: BTreeMap<String, AccountReadiness> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "account b must survive an update that only touches a"
+        );
+        assert_eq!(recorded["a"].state, ReadinessState::HealthyLearning);
+        assert_eq!(recorded["b"].state, ReadinessState::StaleDrain);
+    }
+
+    #[test]
+    fn status_path_is_a_sibling_of_the_state_file() {
+        let path = status_path(Path::new("/var/lib/subscription-governor/state.json"));
+        assert_eq!(
+            path,
+            PathBuf::from("/var/lib/subscription-governor/status.json")
+        );
     }
 }
