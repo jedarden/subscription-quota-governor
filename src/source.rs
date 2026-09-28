@@ -21,6 +21,12 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// v1."). A normalized quota snapshot is a small JSON document, so this is
 /// generous headroom rather than a tight budget.
 const MAX_GENERIC_SOURCE_BYTES: u64 = 1024 * 1024;
+/// Maximum bytes for one Codex app-server stdout line -- one JSON-RPC frame
+/// plus its terminating newline (plan.md §7.2: "Bound stdout frame size and
+/// ignore unrelated frames without unbounded buffering"). A rate-limit
+/// response is a small JSON document, so this is generous headroom rather
+/// than a tight budget, matching [`MAX_GENERIC_SOURCE_BYTES`].
+const MAX_CODEX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A 3xx response encountered where redirects are disabled. `Display`
 /// includes only the response's own status code and the requested URL --
@@ -729,15 +735,25 @@ fn spawn_and_handshake_codex(executable: &Path, timeout_seconds: u64) -> Result<
     let stdout = child.0.stdout.take().ok_or(CodexSourceError::NoStdout)?;
     let (sender, receiver) = mpsc::channel();
     let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            match line {
-                Ok(line) => {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_bounded_codex_frame(&mut reader, MAX_CODEX_FRAME_BYTES) {
+                Ok(Some(CodexFrame::Line(line))) => {
+                    // A line that isn't valid JSON (or, further downstream
+                    // in receive_response, a notification or a mismatched
+                    // id) is an unrelated frame -- ignore it and keep
+                    // reading rather than treating it as fatal.
                     if let Ok(value) = serde_json::from_str::<Value>(&line) {
                         if sender.send(value).is_err() {
                             return;
                         }
                     }
                 }
+                Ok(Some(CodexFrame::Oversized)) => {
+                    // Already discarded without retaining its bytes; treat
+                    // it like any other unrelated frame and keep reading.
+                }
+                Ok(None) => return, // EOF: the app-server closed its stdout.
                 Err(_) => return,
             }
         }
@@ -810,6 +826,58 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+/// One outcome of [`read_bounded_codex_frame`]: either a complete line
+/// (parsed as JSON or discarded as garbage by the caller) or a frame that
+/// was discarded here because it exceeded the size bound.
+enum CodexFrame {
+    Line(String),
+    Oversized,
+}
+
+/// Reads one newline-terminated line (the newline itself stripped) from
+/// `reader`, up to `limit` bytes. A line that reaches `limit` bytes without
+/// a newline is discarded -- its already-read bytes are dropped and the
+/// remainder up to the next newline is drained in small fixed-size chunks
+/// rather than accumulated -- and reported as [`CodexFrame::Oversized`]
+/// instead of growing the buffer without bound (plan.md §7.2: "Bound stdout
+/// frame size ... without unbounded buffering"). Returns `Ok(None)` at true
+/// EOF (no bytes read at all).
+fn read_bounded_codex_frame(
+    reader: &mut impl BufRead,
+    limit: usize,
+) -> std::io::Result<Option<CodexFrame>> {
+    let mut buffer = Vec::new();
+    let read = reader.by_ref().take(limit as u64).read_until(b'\n', &mut buffer)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if buffer.last() == Some(&b'\n') {
+        buffer.pop();
+        return Ok(Some(CodexFrame::Line(String::from_utf8_lossy(&buffer).into_owned())));
+    }
+    // `limit` bytes were consumed without finding a newline: either a
+    // too-long frame or the stream ended mid-line (e.g. the process died
+    // while writing). Either way, resynchronize on the next newline so a
+    // later, well-formed frame is not itself treated as a continuation of
+    // this discarded one.
+    drain_until_newline(reader)?;
+    Ok(Some(CodexFrame::Oversized))
+}
+
+/// Discards bytes in small fixed-size chunks until a newline is consumed or
+/// EOF is reached, without ever holding more than one chunk in memory.
+fn drain_until_newline(reader: &mut impl BufRead) -> std::io::Result<()> {
+    const CHUNK: u64 = 4096;
+    let mut sink = Vec::new();
+    loop {
+        sink.clear();
+        let read = reader.by_ref().take(CHUNK).read_until(b'\n', &mut sink)?;
+        if read == 0 || sink.last() == Some(&b'\n') {
+            return Ok(());
+        }
     }
 }
 
@@ -1656,6 +1724,103 @@ mod tests {
 
         let error = CodexSourceError::InitializeRejected { code: None };
         assert!(!error.to_string().is_empty());
+    }
+
+    fn frame_line(value: Option<CodexFrame>) -> String {
+        match value {
+            Some(CodexFrame::Line(line)) => line,
+            other => panic!("expected CodexFrame::Line, got {}", match other {
+                Some(CodexFrame::Oversized) => "Oversized",
+                None => "None (EOF)",
+                _ => unreachable!(),
+            }),
+        }
+    }
+
+    #[test]
+    fn read_bounded_codex_frame_returns_an_ordinary_line_without_its_newline() {
+        let mut cursor = std::io::Cursor::new(b"{\"id\":1}\n".to_vec());
+        let frame = read_bounded_codex_frame(&mut cursor, 4096).unwrap();
+        assert_eq!(frame_line(frame), r#"{"id":1}"#);
+    }
+
+    #[test]
+    fn read_bounded_codex_frame_handles_multiple_lines_in_sequence() {
+        let mut cursor = std::io::Cursor::new(b"first\nsecond\n".to_vec());
+        let first = read_bounded_codex_frame(&mut cursor, 4096).unwrap();
+        assert_eq!(frame_line(first), "first");
+        let second = read_bounded_codex_frame(&mut cursor, 4096).unwrap();
+        assert_eq!(frame_line(second), "second");
+    }
+
+    #[test]
+    fn read_bounded_codex_frame_returns_none_at_true_eof() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let frame = read_bounded_codex_frame(&mut cursor, 4096).unwrap();
+        assert!(frame.is_none());
+    }
+
+    #[test]
+    fn read_bounded_codex_frame_discards_a_line_over_the_limit_instead_of_buffering_it() {
+        // Well over the limit; a naive unbounded reader would accumulate all
+        // of this before ever returning.
+        let oversized_content = "a".repeat(50_000);
+        let mut input = oversized_content.clone().into_bytes();
+        input.push(b'\n');
+        let mut cursor = std::io::Cursor::new(input);
+
+        let frame = read_bounded_codex_frame(&mut cursor, 1024).unwrap();
+        assert!(
+            matches!(frame, Some(CodexFrame::Oversized)),
+            "a line far exceeding the limit must be reported as Oversized, not buffered whole"
+        );
+    }
+
+    #[test]
+    fn read_bounded_codex_frame_resyncs_on_the_next_line_after_discarding_an_oversized_one() {
+        let oversized = "x".repeat(10_000);
+        let mut input = oversized.into_bytes();
+        input.push(b'\n');
+        input.extend_from_slice(b"a well-formed follow-up line\n");
+        let mut cursor = std::io::Cursor::new(input);
+
+        let first = read_bounded_codex_frame(&mut cursor, 1024).unwrap();
+        assert!(matches!(first, Some(CodexFrame::Oversized)));
+
+        let second = read_bounded_codex_frame(&mut cursor, 1024).unwrap();
+        assert_eq!(
+            frame_line(second),
+            "a well-formed follow-up line",
+            "the frame after a discarded oversized one must parse cleanly, proving the reader \
+             resynchronized on the next newline rather than losing frame boundaries"
+        );
+    }
+
+    #[test]
+    fn read_bounded_codex_frame_discards_an_oversized_final_line_with_no_trailing_newline() {
+        // The stream ends mid-line (no `\n` at all) past the limit -- e.g.
+        // the process died while writing a line that was already too long.
+        let input = "y".repeat(5_000).into_bytes();
+        let mut cursor = std::io::Cursor::new(input);
+
+        let frame = read_bounded_codex_frame(&mut cursor, 1024).unwrap();
+        assert!(matches!(frame, Some(CodexFrame::Oversized)));
+        // Nothing left to read afterward.
+        assert!(read_bounded_codex_frame(&mut cursor, 1024).unwrap().is_none());
+    }
+
+    #[test]
+    fn drain_until_newline_only_ever_holds_one_small_chunk_at_a_time() {
+        // Exercises the multi-chunk path directly: several chunk-widths of
+        // data before the terminating newline.
+        let mut input = vec![b'z'; 4096 * 3 + 100];
+        input.push(b'\n');
+        input.extend_from_slice(b"next\n");
+        let mut cursor = std::io::Cursor::new(input);
+
+        drain_until_newline(&mut cursor).unwrap();
+        let frame = read_bounded_codex_frame(&mut cursor, 4096).unwrap();
+        assert_eq!(frame_line(frame), "next");
     }
 
     fn resource_snapshot_json() -> &'static str {

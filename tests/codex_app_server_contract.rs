@@ -2,8 +2,11 @@
 //! against the scripted fake in `tests/support/fake_codex_app_server.rs`
 //! instead of a real Codex installation. Exercises the handshake,
 //! interleaved notifications, timeout, child-exit, sparse-window,
-//! protocol-error, and supervised-session-reuse/respawn cases named in that
-//! section's build requirements.
+//! protocol-error, supervised-session-reuse/respawn, and oversized-frame
+//! cases named in that section's build requirements. The bounded-frame
+//! reader's own edge cases (multi-chunk discard, resync after an oversized
+//! line, EOF mid-line) are unit-tested directly in `src/source.rs`; the
+//! test here proves the end-to-end wiring against a real child process.
 //!
 //! Every test goes through the same public entry point production code
 //! uses (`subscription_governor::source::collect`), so this is a true
@@ -404,4 +407,28 @@ fn a_dead_session_is_respawned_transparently_for_the_next_poll() {
         "the respawned session must run its own fresh handshake against the new script, not \
          reuse stale state from the dead session"
     );
+}
+
+#[test]
+fn an_oversized_stdout_frame_is_discarded_without_breaking_the_real_response() {
+    // Comfortably larger than any reasonable per-frame bound (source.rs's
+    // own MAX_CODEX_FRAME_BYTES is 1 MiB at the time of writing) -- this
+    // test only needs "large enough that an unbounded reader would notice,
+    // and a bounded one must discard", not to pin the exact constant.
+    let huge_garbage_line = Value::String("g".repeat(2_000_000));
+    let steps = vec![
+        read_step(),
+        write_step(json!({"id": 1, "result": {}})),
+        read_step(),
+        read_step(),
+        write_step(huge_garbage_line),
+        write_step(success_rate_limits_frame(2)),
+    ];
+    let (source, script) = scripted_source(&steps, 5);
+
+    let snapshot = collect_with_script(&source, &script).expect(
+        "an oversized frame ahead of the real response must be discarded, not hang, crash the \
+         reader thread, or otherwise prevent the real response from being delivered",
+    );
+    assert_eq!(snapshot.windows.len(), 2);
 }
