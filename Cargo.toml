@@ -23,4 +23,5 @@ thiserror = "2.0"
 ureq = { version = "2.12", features = ["json"] }
 
 [dev-dependencies]
+proptest = "1.11.0"
 tempfile = "3.20"
