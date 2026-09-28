@@ -2,16 +2,18 @@ use crate::config::SourceConfig;
 use crate::model::{QuotaSnapshot, QuotaWindow, ResetCredit, ResetCreditsSnapshot};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
+use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 const REFRESH_THRESHOLD_MILLIS: i64 = 300_000;
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn collect(source: &SourceConfig) -> Result<QuotaSnapshot> {
     let snapshot = match source {
@@ -71,53 +73,7 @@ fn collect_anthropic(
     token_url: &str,
     timeout_seconds: u64,
 ) -> Result<QuotaSnapshot> {
-    let mut credentials = read_json(credentials_path, "Claude Code credentials")?;
-    let oauth = credentials
-        .get_mut("claudeAiOauth")
-        .and_then(Value::as_object_mut)
-        .context("Claude Code credentials are missing claudeAiOauth")?;
-    let expires_at = oauth
-        .get("expiresAt")
-        .and_then(Value::as_i64)
-        .context("Claude Code credentials are missing expiresAt")?;
-
-    let access_token = if Utc::now().timestamp_millis() + REFRESH_THRESHOLD_MILLIS >= expires_at {
-        let refresh_token = oauth
-            .get("refreshToken")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .context("Claude Code credentials are missing refreshToken")?
-            .to_owned();
-        let refreshed = refresh_anthropic(&refresh_token, token_url, timeout_seconds)?;
-        let access = refreshed
-            .get("accessToken")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .context("Anthropic token refresh omitted accessToken")?
-            .to_owned();
-        let new_refresh = refreshed
-            .get("refreshToken")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .context("Anthropic token refresh omitted refreshToken")?
-            .to_owned();
-        let new_expiry = refreshed
-            .get("expiresAt")
-            .and_then(Value::as_i64)
-            .context("Anthropic token refresh omitted expiresAt")?;
-        oauth.insert("accessToken".into(), Value::String(access.clone()));
-        oauth.insert("refreshToken".into(), Value::String(new_refresh));
-        oauth.insert("expiresAt".into(), Value::Number(new_expiry.into()));
-        write_json_atomic(credentials_path, &credentials)?;
-        access
-    } else {
-        oauth
-            .get("accessToken")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .context("Claude Code credentials are missing accessToken")?
-            .to_owned()
-    };
+    let access_token = obtain_access_token(credentials_path, token_url, timeout_seconds)?;
 
     let response = http_agent(timeout_seconds)
         .get(usage_url)
@@ -130,6 +86,164 @@ fn collect_anthropic(
         .into_json()
         .context("Anthropic usage endpoint returned invalid JSON")?;
     parse_anthropic_usage(&payload, Utc::now())
+}
+
+/// Reads the Claude Code OAuth credentials and returns a valid access token,
+/// refreshing it first if it is near expiry.
+///
+/// Claude Code itself may be running concurrently and refresh the same file.
+/// An OS advisory lock on the credentials file serializes against any other
+/// locker (this process's other accounts sharing a path, another governor
+/// instance, or a cooperating Claude Code process) for the whole read-decide
+/// section. Because the lock alone cannot bind a non-cooperating writer, the
+/// refresh result is also never written blindly: immediately before the
+/// write, the file is re-read and the refresh token used for this refresh is
+/// compared against what is currently on disk. A mismatch means some other
+/// process already rotated it while the network round-trip was in flight, so
+/// this refresh is discarded rather than clobbering a legitimate concurrent
+/// rotation -- which would otherwise strand Claude Code on an
+/// already-consumed refresh token.
+fn obtain_access_token(
+    credentials_path: &Path,
+    token_url: &str,
+    timeout_seconds: u64,
+) -> Result<String> {
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(credentials_path)
+        .with_context(|| {
+            format!(
+                "failed to open Claude Code credentials {} for locking",
+                credentials_path.display()
+            )
+        })?;
+    lock_exclusive_bounded(&lock_file, timeout_seconds).with_context(|| {
+        format!(
+            "failed to lock Claude Code credentials {} (a concurrent writer may be holding it)",
+            credentials_path.display()
+        )
+    })?;
+    // Held until this function returns, so the whole read-decide(-refresh)
+    // section below is one critical section under the lock.
+    let _lock = lock_file;
+
+    let credentials = read_json(credentials_path, "Claude Code credentials")?;
+    let oauth = credentials
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .context("Claude Code credentials are missing claudeAiOauth")?;
+    if let Some(token) = fresh_access_token(oauth)? {
+        return Ok(token);
+    }
+    let refresh_token = required_refresh_token(oauth)?;
+    let refreshed = refresh_anthropic(&refresh_token, token_url, timeout_seconds)?;
+    apply_refreshed_credentials(credentials_path, &refresh_token, &refreshed)
+}
+
+fn lock_exclusive_bounded(file: &File, timeout_seconds: u64) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1));
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    bail!("timed out waiting for an exclusive lock");
+                }
+                std::thread::sleep(LOCK_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error).context("failed to acquire an exclusive lock"),
+        }
+    }
+}
+
+/// Returns `Some(accessToken)` if it is not within the refresh threshold of
+/// expiry, `None` if a refresh is needed.
+fn fresh_access_token(oauth: &serde_json::Map<String, Value>) -> Result<Option<String>> {
+    let expires_at = oauth
+        .get("expiresAt")
+        .and_then(Value::as_i64)
+        .context("Claude Code credentials are missing expiresAt")?;
+    if Utc::now().timestamp_millis() + REFRESH_THRESHOLD_MILLIS >= expires_at {
+        return Ok(None);
+    }
+    let token = oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Claude Code credentials are missing accessToken")?
+        .to_owned();
+    Ok(Some(token))
+}
+
+fn required_refresh_token(oauth: &serde_json::Map<String, Value>) -> Result<String> {
+    oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Claude Code credentials are missing refreshToken")
+        .map(str::to_owned)
+}
+
+/// Applies a completed Anthropic token refresh to the credentials file,
+/// unless the refresh token it was derived from is no longer the one on
+/// disk -- in which case another process already rotated it concurrently and
+/// this result is discarded instead of overwritten. Caller must hold the
+/// credentials file lock.
+fn apply_refreshed_credentials(
+    credentials_path: &Path,
+    expected_refresh_token: &str,
+    refreshed: &Value,
+) -> Result<String> {
+    let access = refreshed
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Anthropic token refresh omitted accessToken")?
+        .to_owned();
+    let new_refresh = refreshed
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Anthropic token refresh omitted refreshToken")?
+        .to_owned();
+    let new_expiry = refreshed
+        .get("expiresAt")
+        .and_then(Value::as_i64)
+        .context("Anthropic token refresh omitted expiresAt")?;
+
+    let mut current = read_json(credentials_path, "Claude Code credentials")?;
+    let current_oauth = current
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .context("Claude Code credentials are missing claudeAiOauth")?;
+    let current_refresh_token = current_oauth.get("refreshToken").and_then(Value::as_str);
+    if current_refresh_token != Some(expected_refresh_token) {
+        let current_access = current_oauth
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let current_expiry = current_oauth.get("expiresAt").and_then(Value::as_i64);
+        return match (current_access, current_expiry) {
+            (Some(access), Some(expiry))
+                if !access.is_empty()
+                    && Utc::now().timestamp_millis() + REFRESH_THRESHOLD_MILLIS < expiry =>
+            {
+                Ok(access)
+            }
+            _ => bail!(
+                "Claude Code credentials at {} were refreshed by another process during this \
+                 poll; skipping this cycle rather than overwriting a concurrent refresh",
+                credentials_path.display()
+            ),
+        };
+    }
+
+    current_oauth.insert("accessToken".into(), Value::String(access.clone()));
+    current_oauth.insert("refreshToken".into(), Value::String(new_refresh));
+    current_oauth.insert("expiresAt".into(), Value::Number(new_expiry.into()));
+    write_json_atomic(credentials_path, &current)?;
+    Ok(access)
 }
 
 fn refresh_anthropic(refresh_token: &str, token_url: &str, timeout_seconds: u64) -> Result<Value> {
@@ -456,7 +570,6 @@ fn read_json(path: &Path, label: &str) -> Result<Value> {
 }
 
 fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
-    use std::fs::OpenOptions;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -554,5 +667,127 @@ mod tests {
         let snapshot = parse_anthropic_usage(&payload, observed()).unwrap();
         assert_eq!(snapshot.windows.len(), 2);
         assert_eq!(snapshot.windows[0].used_fraction, 0.2);
+    }
+
+    fn write_credentials(path: &Path, access: &str, refresh: &str, expires_at_millis: i64) {
+        let document = json!({
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "expiresAt": expires_at_millis,
+                "unrelatedField": "preserved",
+            }
+        });
+        fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn obtain_access_token_returns_cached_token_without_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let far_future = Utc::now().timestamp_millis() + 3_600_000;
+        write_credentials(&path, "still-valid", "unused-refresh", far_future);
+
+        // token_url is intentionally unreachable: a fresh token must never
+        // trigger a network refresh.
+        let token = obtain_access_token(&path, "http://127.0.0.1:0/unreachable", 5).unwrap();
+        assert_eq!(token, "still-valid");
+    }
+
+    #[test]
+    fn obtain_access_token_times_out_when_another_process_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let far_future = Utc::now().timestamp_millis() + 3_600_000;
+        write_credentials(&path, "still-valid", "unused-refresh", far_future);
+
+        // Simulate a concurrently-running Claude Code process mid-write by
+        // holding the OS advisory lock from a separate file descriptor.
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock_exclusive().unwrap();
+
+        let started = std::time::Instant::now();
+        let result = obtain_access_token(&path, "http://127.0.0.1:0/unreachable", 1);
+        assert!(result.is_err(), "expected a lock-contention error");
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        holder.unlock().unwrap();
+    }
+
+    #[test]
+    fn apply_refreshed_credentials_writes_when_refresh_token_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        write_credentials(&path, "old-access", "refresh-a", 1_000);
+
+        let refreshed = json!({
+            "accessToken": "new-access",
+            "refreshToken": "refresh-b",
+            "expiresAt": Utc::now().timestamp_millis() + 3_600_000,
+        });
+        let token = apply_refreshed_credentials(&path, "refresh-a", &refreshed).unwrap();
+        assert_eq!(token, "new-access");
+
+        let on_disk = read_json(&path, "test credentials").unwrap();
+        let oauth = on_disk.get("claudeAiOauth").unwrap();
+        assert_eq!(oauth.get("accessToken").unwrap().as_str(), Some("new-access"));
+        assert_eq!(oauth.get("refreshToken").unwrap().as_str(), Some("refresh-b"));
+        // Unknown fields survive the refresh write.
+        assert_eq!(
+            oauth.get("unrelatedField").unwrap().as_str(),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn apply_refreshed_credentials_discards_stale_refresh_without_overwriting_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        // Simulates Claude Code having already refreshed concurrently: the
+        // refresh token on disk ("refresh-c") no longer matches the one our
+        // (now-stale) in-flight refresh was derived from ("refresh-a").
+        let claude_code_expiry = Utc::now().timestamp_millis() + 3_600_000;
+        write_credentials(&path, "claude-code-access", "refresh-c", claude_code_expiry);
+
+        let our_refreshed = json!({
+            "accessToken": "our-access",
+            "refreshToken": "refresh-b",
+            "expiresAt": Utc::now().timestamp_millis() + 7_200_000,
+        });
+        let token = apply_refreshed_credentials(&path, "refresh-a", &our_refreshed).unwrap();
+        // Must defer to Claude Code's fresher, concurrently-written token
+        // rather than clobbering it with our own.
+        assert_eq!(token, "claude-code-access");
+
+        let on_disk = read_json(&path, "test credentials").unwrap();
+        let oauth = on_disk.get("claudeAiOauth").unwrap();
+        assert_eq!(
+            oauth.get("refreshToken").unwrap().as_str(),
+            Some("refresh-c"),
+            "a concurrent rotation must never be overwritten"
+        );
+    }
+
+    #[test]
+    fn apply_refreshed_credentials_errors_without_writing_when_concurrent_state_is_also_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        write_credentials(&path, "stale-access", "refresh-c", 1_000);
+        let before = fs::read(&path).unwrap();
+
+        let our_refreshed = json!({
+            "accessToken": "our-access",
+            "refreshToken": "refresh-b",
+            "expiresAt": Utc::now().timestamp_millis() + 7_200_000,
+        });
+        let result = apply_refreshed_credentials(&path, "refresh-a", &our_refreshed);
+        assert!(result.is_err());
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(before, after, "file must be left untouched on discard");
     }
 }

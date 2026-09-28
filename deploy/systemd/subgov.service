@@ -1,0 +1,90 @@
+# Hardened example unit for `subgov run` (continuous mode). §16 WP6 of
+# docs/plan/plan.md. Copy this file to /etc/systemd/system/subgov.service,
+# replace every REPLACE_WITH_* placeholder, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now subgov.service
+#   journalctl -u subgov -f
+#
+# subgov does not manage its own service identity: the anthropic_oauth source
+# reads and atomically rewrites an existing Claude Code credential file, and
+# the codex_app_server source launches `codex app-server` as its own user.
+# Run this unit as the same unprivileged user that already has a working
+# Claude Code / Codex login on this host -- do not run it as root, and do not
+# use DynamicUser= here for that reason.
+#
+# See deploy/systemd/README.md for setup steps, the ReadWritePaths rationale,
+# and a caveat about SystemCallFilter with the codex_app_server source.
+
+[Unit]
+Description=Subscription Governor (subgov) quota pacing loop
+Documentation=https://git.ardenone.com/jedarden/subscription-quota-governor
+After=network-online.target
+Wants=network-online.target
+
+# Restart limits: retry a transient failure (a momentary network blip, a
+# refresh race with Claude Code) but stop retrying -- rather than actuate a
+# fleet from a crash loop -- once StartLimitBurst is exceeded within
+# StartLimitIntervalSec. `systemctl reset-failed subgov` clears the counter
+# after an operator has investigated.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=REPLACE_WITH_OPERATOR_USER
+Group=REPLACE_WITH_OPERATOR_USER
+
+ExecStart=/usr/local/bin/subgov --config /etc/subgov/governor.yaml run
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=30s
+# subgov does not yet install a SIGTERM handler of its own (tracked as
+# "signal-aware shutdown" in §16 WP5, still open) -- systemd's default
+# TERM-then-KILL sequence stops it at the next blocking call, not
+# necessarily between poll cycles.
+
+# --- Filesystem protections ---
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+# Grant write access only to what subgov actually mutates: its own state
+# directory and the OAuth credential file it refreshes in place. Update both
+# paths to match `state_path` and the anthropic_oauth `credentials_path` in
+# governor.yaml -- ProtectHome=read-only would otherwise block the
+# credential-file rewrite.
+ReadWritePaths=/var/lib/subgov /home/REPLACE_WITH_OPERATOR_USER/.claude/.credentials.json
+StateDirectory=subgov
+StateDirectoryMode=0700
+UMask=0077
+
+# --- Privilege restrictions ---
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+# --- Kernel, namespace, and execution-surface restrictions ---
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# NOTE: seccomp filters are inherited by child processes. If you use the
+# codex_app_server source, this filter also constrains the `codex
+# app-server` child this unit spawns. If that source starts failing only
+# under systemd (not when run interactively as the same user), comment out
+# SystemCallFilter first before assuming it's a quota or network problem.
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
