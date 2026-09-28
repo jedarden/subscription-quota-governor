@@ -1,5 +1,5 @@
 use crate::model::QuotaSnapshot;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -8,10 +8,31 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// The only schema version this binary can write, and the newest it can
+/// read. A file with no `schema_version` at all predates versioning but has
+/// the same shape as version 1, so it defaults to current rather than an
+/// unknown-legacy marker.
+pub const STATE_SCHEMA_VERSION: u32 = 1;
+
+fn current_schema_version() -> u32 {
+    STATE_SCHEMA_VERSION
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct State {
+    #[serde(default = "current_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub accounts: BTreeMap<String, AccountState>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            schema_version: STATE_SCHEMA_VERSION,
+            accounts: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -53,14 +74,23 @@ impl AccountState {
 
 impl State {
     pub fn load(path: &Path) -> Result<Self> {
-        match fs::read(path) {
+        let state: Self = match fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("failed to parse state {}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                .with_context(|| format!("failed to parse state {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => {
-                Err(error).with_context(|| format!("failed to read state {}", path.display()))
+                return Err(error).with_context(|| format!("failed to read state {}", path.display()))
             }
+        };
+        if state.schema_version > STATE_SCHEMA_VERSION {
+            bail!(
+                "state {} has schema version {}, newer than the {} this binary supports; refusing to load and risk misreading it",
+                path.display(),
+                state.schema_version,
+                STATE_SCHEMA_VERSION
+            );
         }
+        Ok(state)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -116,4 +146,42 @@ fn temporary_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("state.json");
     path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_state_carries_current_schema_version() {
+        let state = State::default();
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn missing_schema_version_defaults_to_current() {
+        let state: State = serde_json::from_str("{}").unwrap();
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        State::default().save(&path).unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn load_refuses_a_newer_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        fs::write(&path, r#"{"schema_version":999,"accounts":{}}"#).unwrap();
+        let error = State::load(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("schema version"),
+            "unexpected error: {error}"
+        );
+    }
 }
