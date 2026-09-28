@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.ardenone.com/jedarden/subscription-quota-governor/raw/branch/main/schema/decision-event.schema.json",
+  "title": "Decision event (JSONL, stdout)",
+  "description": "The §13 stable event contract for the one JSONL line `run_cycle` (src/main.rs) prints to stdout per account per cycle: `{\"event\": \"decision\", \"observe_only\": ..., \"actuated\": ..., \"decision\": <Decision>}`. Mirrors Decision/WindowDecision/BankedResetDecision in src/controller.rs exactly, including the `binding_window` field WP2 added for the §9.6 multi-window arbitration winner. additionalProperties is left open everywhere because the Rust structs do not use #[serde(deny_unknown_fields)] -- a field this schema does not yet know about is a forward-compatible addition, not a violation. `reason` and `windows[].reason` are closed enums because they are fixed Rust string literals, not provider- or user-supplied text; adding a new reason value is a change to this file, not just to the binary. This schema covers only the `decision` event -- `status`, `account_error`, and `shutdown` events (also printed per §13/12) are not in scope for this file.",
+  "type": "object",
+  "required": ["event", "observe_only", "actuated", "decision"],
+  "additionalProperties": true,
+  "properties": {
+    "event": {
+      "const": "decision"
+    },
+    "observe_only": {
+      "type": "boolean",
+      "description": "Echoes the CLI/config observe-only flag for this cycle. When true, `actuated` is always false -- the fleet actuator was never invoked."
+    },
+    "actuated": {
+      "type": "boolean",
+      "description": "Whether the fleet actuator was invoked and reported success this cycle. False for observe-only cycles, a stale decision that held at the current count, and any cycle whose actuation failed (which is instead reported via a separate `account_error` event, not this one)."
+    },
+    "decision": { "$ref": "#/$defs/decision" }
+  },
+  "$defs": {
+    "decision": {
+      "type": "object",
+      "required": [
+        "account",
+        "observed_at",
+        "current_workers",
+        "desired_workers",
+        "stale",
+        "windows"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "account": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The configured account name (a `config.accounts` map key), not a provider-assigned identifier."
+        },
+        "observed_at": { "$ref": "#/$defs/timestamp" },
+        "current_workers": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The worker count observed at the start of this cycle, before this decision's actuation (if any)."
+        },
+        "desired_workers": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The final desired count after §9.6 multi-window arbitration, the §9.7 banked-reset floor, and the §9.6 per-cycle step limits -- what the fleet actuator was (or, if `actuated` is false, would have been) asked to reach."
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "§9.1 freshness gate. When true, `windows` is always empty and `binding_window`/`banked_resets` are always absent -- a stale cycle observes no windows."
+        },
+        "windows": {
+          "type": "array",
+          "description": "One entry per enabled observed window (§9.2 policy resolution), in snapshot order. Always empty for a stale decision; otherwise never empty -- `evaluate` fails the cycle rather than emitting a decision with zero enabled windows.",
+          "items": { "$ref": "#/$defs/windowDecision" }
+        },
+        "binding_window": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The `windows[].id` whose raw desired count won the §9.6 arbitration (the minimum across `windows`), before the banked-reset floor and step limits are applied. Absent for a stale decision. A tie between windows favors the first in snapshot order."
+        },
+        "banked_resets": { "$ref": "#/$defs/bankedResetDecision" }
+      }
+    },
+    "windowDecision": {
+      "type": "object",
+      "required": [
+        "id",
+        "used_fraction",
+        "target_utilization",
+        "resets_at",
+        "desired_workers",
+        "reason"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Echoes the observed QuotaWindow.id this decision was computed for."
+        },
+        "used_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Echoes the observed window's used_fraction at `decision.observed_at`."
+        },
+        "target_utilization": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "The §9.2-resolved target for this window: account default, overridden per-window, reserve_fraction converted to 1 - reserve_fraction, and -- for a weekly window while a banked reset generation is available -- raised to at least banked_resets.redeem_at_utilization (§9.7)."
+        },
+        "resets_at": { "$ref": "#/$defs/timestamp" },
+        "desired_workers": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "This window's own raw desired count, clamped to [fleet.min_workers, fleet.max_workers] but not yet step-limited -- may differ from the top-level `decision.desired_workers`, which additionally applies §9.6 arbitration, the banked-reset floor, and per-cycle step limits."
+        },
+        "reason": {
+          "enum": [
+            "target_reached",
+            "reset_due",
+            "below_ceiling",
+            "paced_to_reset",
+            "no_observed_burn",
+            "bootstrap_burn_rate",
+            "learning_burn_rate"
+          ],
+          "description": "target_reached: used_fraction >= target or the provider's own `reached` flag. reset_due: resets_at has passed but the provider has not published a new generation yet (§9.3) -- holds, does not extrapolate. below_ceiling: Strategy::CeilingOnly, not yet at target. paced_to_reset: Strategy::LinearToReset with a usable same-generation burn-rate sample (§9.4). no_observed_burn: a same-generation sample exists but its delta is censored (quantized-zero, §9.8) -- holds, not a learned zero rate. bootstrap_burn_rate: no usable sample and current_workers == 0. learning_burn_rate: no usable sample and current_workers > 0 -- holds while learning."
+        },
+        "observed_burn_per_worker_hour": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "The §9.4 two-point burn-rate estimate (fraction of the window consumed per worker per hour), present only when `reason` is \"paced_to_reset\". Never present as exactly zero -- see estimate_burn_per_worker's doc comment in src/controller.rs."
+        }
+      }
+    },
+    "bankedResetDecision": {
+      "type": "object",
+      "required": [
+        "available_count",
+        "governing_window",
+        "minimum_pace_multiplier",
+        "required_burn_per_hour",
+        "desired_workers",
+        "manual_redemption_recommended",
+        "deadline_missed",
+        "reason",
+        "known_expirations"
+      ],
+      "additionalProperties": true,
+      "description": "Present only when config.banked_resets.enabled and the snapshot reports at least one available reset credit (§9.7). Every field is always present together -- unlike `windowDecision.observed_burn_per_worker_hour`, none of these are independently optional.",
+      "properties": {
+        "available_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Echoes snapshot.reset_credits.available_count at decision time."
+        },
+        "governing_window": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The weekly window (highest used_fraction among weekly windows) this banked-reset plan is computed against."
+        },
+        "minimum_pace_multiplier": {
+          "type": "number",
+          "minimum": 1,
+          "description": "Echoes config.banked_resets.minimum_pace_multiplier."
+        },
+        "required_burn_per_hour": {
+          "type": "number",
+          "minimum": 0,
+          "description": "The larger of the minimum banked-pace rate and every known credit's expiry-deadline pace (§9.7)."
+        },
+        "desired_workers": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The worker count this banked-reset plan alone requires; acts as a floor on the ordinary weekly pacing result unless manual redemption is recommended or a shorter (non-weekly) window has separately reached its own target."
+        },
+        "manual_redemption_recommended": {
+          "type": "boolean",
+          "description": "True once the governing window reaches redeem_at_utilization (or its own target). The governor has no reset-credit mutation path (ADR-0001) -- a human must redeem before this window resumes pacing."
+        },
+        "deadline_missed": {
+          "type": "boolean",
+          "description": "True when a known credit's expiry-safety deadline has already passed without the required generations being consumed."
+        },
+        "reason": {
+          "enum": [
+            "weekly_window_awaiting_manual_redemption",
+            "banked_reset_expiry_deadline_missed",
+            "minimum_banked_reset_pace",
+            "banked_reset_expiry_pace",
+            "bootstrap_banked_reset_burn_rate",
+            "learning_banked_reset_burn_rate"
+          ]
+        },
+        "known_expirations": {
+          "type": "array",
+          "description": "Every known available credit's expires_at, sorted ascending. May be empty when the provider reports available_count without per-credit detail.",
+          "items": { "$ref": "#/$defs/timestamp" }
+        }
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    }
+  },
+  "examples": [
+    {
+      "event": "decision",
+      "observe_only": false,
+      "actuated": true,
+      "decision": {
+        "account": "claude-anthropic",
+        "observed_at": "2026-09-28T12:00:00Z",
+        "current_workers": 2,
+        "desired_workers": 3,
+        "stale": false,
+        "windows": [
+          {
+            "id": "weekly",
+            "used_fraction": 0.42,
+            "target_utilization": 0.9,
+            "resets_at": "2026-10-03T00:00:00Z",
+            "desired_workers": 3,
+            "reason": "paced_to_reset",
+            "observed_burn_per_worker_hour": 0.006
+          }
+        ],
+        "binding_window": "weekly"
+      }
+    },
+    {
+      "event": "decision",
+      "observe_only": false,
+      "actuated": false,
+      "decision": {
+        "account": "claude-anthropic",
+        "observed_at": "2026-09-28T11:45:00Z",
+        "current_workers": 3,
+        "desired_workers": 3,
+        "stale": true,
+        "windows": []
+      }
+    }
+  ]
+}
