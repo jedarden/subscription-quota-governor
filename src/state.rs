@@ -125,14 +125,65 @@ impl AccountState {
     }
 }
 
+/// A state file exists but does not parse as a `State` at all (bad JSON,
+/// wrong shape) — as opposed to parsing fine with an unsupported
+/// `schema_version`, which stays a hard load failure since misreading a
+/// *newer* format is a correctness risk, not a corruption to recover from.
+/// Distinct from a missing file, which is a genuine first run.
+#[derive(Debug)]
+pub struct Quarantined {
+    /// Where the unparseable file was moved so it survives for forensics.
+    pub quarantined_path: PathBuf,
+    /// The parse error that triggered quarantine, for the caller to log.
+    pub error: String,
+}
+
+fn quarantine_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.json");
+    path.with_file_name(format!(
+        "{file_name}.corrupt-{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
+        std::process::id()
+    ))
+}
+
 impl State {
-    pub fn load(path: &Path) -> Result<Self> {
-        let state: Self = match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("failed to parse state {}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+    /// Loads state from `path`, or `Self::default()` for a missing file (a
+    /// genuine first run). A file that exists but fails to parse is moved
+    /// aside rather than either silently discarded or treated as a first
+    /// run: the second element of the returned tuple carries where it went
+    /// and why, for the caller to log.
+    pub fn load(path: &Path) -> Result<(Self, Option<Quarantined>)> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Self::default(), None))
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to read state {}", path.display()))
+            }
+        };
+        let state: Self = match serde_json::from_slice(&bytes) {
+            Ok(state) => state,
+            Err(parse_error) => {
+                let quarantined_path = quarantine_path(path);
+                fs::rename(path, &quarantined_path).with_context(|| {
+                    format!(
+                        "failed to quarantine malformed state {} to {}",
+                        path.display(),
+                        quarantined_path.display()
+                    )
+                })?;
+                return Ok((
+                    Self::default(),
+                    Some(Quarantined {
+                        quarantined_path,
+                        error: parse_error.to_string(),
+                    }),
+                ));
             }
         };
         if state.schema_version > STATE_SCHEMA_VERSION {
@@ -143,7 +194,7 @@ impl State {
                 STATE_SCHEMA_VERSION
             );
         }
-        Ok(state)
+        Ok((state, None))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -349,7 +400,8 @@ mod tests {
         account.record(&snapshot_with_one_window("5h", 0.3, resets_at), 2, 3);
         state.save(&path).unwrap();
 
-        let loaded = State::load(&path).unwrap();
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
         let history = loaded.accounts["acct"].history.get("5h").unwrap();
         assert_eq!(history.samples.len(), 2);
         assert_eq!(history.samples.back().unwrap().used_fraction, 0.3);
@@ -378,7 +430,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("governor-state.json");
         State::default().save(&path).unwrap();
-        let loaded = State::load(&path).unwrap();
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
         assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
     }
 
@@ -533,5 +586,79 @@ mod tests {
             error.to_string().contains("schema version"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn load_treats_a_missing_file_as_a_first_run_not_a_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+        assert!(loaded.accounts.is_empty());
+    }
+
+    #[test]
+    fn load_quarantines_unparseable_state_instead_of_starting_empty_unremarked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let garbage = b"not json at all {{{";
+        fs::write(&path, garbage).unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+
+        // Recovery still yields a usable, empty state...
+        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+        assert!(loaded.accounts.is_empty());
+
+        // ...but unlike a genuine first run, it is reported so the caller
+        // can log it, and the bad file is preserved rather than discarded.
+        let notice = quarantined.expect("malformed state must be reported, not silently ignored");
+        assert!(
+            notice.error.to_lowercase().contains("expected") || !notice.error.is_empty(),
+            "quarantine notice should carry the parse error: {}",
+            notice.error
+        );
+        assert!(
+            !path.exists(),
+            "the malformed file must be moved out of the live state path"
+        );
+        assert_eq!(
+            fs::read(&notice.quarantined_path).unwrap(),
+            garbage,
+            "the quarantined copy must preserve the original bytes for forensics"
+        );
+    }
+
+    #[test]
+    fn load_quarantines_valid_json_with_the_wrong_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        // Valid JSON, but not an object State can deserialize into.
+        fs::write(&path, r#"[1, 2, 3]"#).unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(loaded.accounts.is_empty());
+        let notice = quarantined.expect("wrong-shaped JSON must be quarantined, not accepted");
+        assert!(fs::read(&notice.quarantined_path).unwrap() == b"[1, 2, 3]");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_after_quarantine_can_save_a_fresh_state_at_the_original_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        fs::write(&path, b"corrupt").unwrap();
+
+        let (state, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_some());
+        state.save(&path).unwrap();
+
+        let (reloaded, quarantined_again) = State::load(&path).unwrap();
+        assert!(
+            quarantined_again.is_none(),
+            "the freshly saved state must load cleanly on the next cycle"
+        );
+        assert!(reloaded.accounts.is_empty());
     }
 }

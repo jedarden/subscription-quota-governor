@@ -176,7 +176,19 @@ fn status(config: &Config) -> Result<(), GovernorError> {
 fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorError> {
     let state_path = config.state_path();
     let _lock = StateLock::acquire(&state_path).map_err(GovernorError::State)?;
-    let mut state = State::load(&state_path).map_err(GovernorError::State)?;
+    let (mut state, quarantined) = State::load(&state_path).map_err(GovernorError::State)?;
+    if let Some(quarantined) = quarantined {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "state_quarantined",
+                "time": Utc::now(),
+                "state_path": state_path.display().to_string(),
+                "quarantined_path": quarantined.quarantined_path.display().to_string(),
+                "error": quarantined.error,
+            })
+        );
+    }
     let shutdown = install_shutdown_flag().map_err(GovernorError::State)?;
     let interval = Duration::from_secs(config.poll_interval_seconds);
     let mut anchor = Instant::now();
