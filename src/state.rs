@@ -661,4 +661,185 @@ mod tests {
         );
         assert!(reloaded.accounts.is_empty());
     }
+
+    // Crash-consistency tests below exercise the four boundaries `save`
+    // crosses on every write: before any byte reaches the temp file, after
+    // the temp file is written but not yet fsynced, after fsync but before
+    // rename, and after rename but before the parent directory is fsynced.
+    // Real fault injection (killing the process mid-syscall) isn't
+    // reachable from a unit test, so each boundary is instead reproduced by
+    // directly constructing the on-disk artifact a crash at that point
+    // would leave -- using the same private `temporary_path`/`sync_directory`
+    // helpers `save` itself uses, via `use super::*` -- and asserting the
+    // safety property that matters for that boundary.
+
+    fn state_with_target(target: u32) -> State {
+        let mut state = State::default();
+        state.accounts.insert(
+            "acct".to_string(),
+            AccountState {
+                last_target: Some(target),
+                ..Default::default()
+            },
+        );
+        state
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn crash_before_any_write_leaves_original_state_untouched_and_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        state_with_target(1).save(&path).unwrap();
+        let good_bytes = fs::read(&path).unwrap();
+
+        // No write permission on the parent directory means `save` fails at
+        // `OpenOptions::create_new` for the temp file -- before a single
+        // byte of the new state has been written anywhere.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = state_with_target(2).save(&path);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "save must fail when it cannot create the temp file"
+        );
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            good_bytes,
+            "a crash before the temp file is created must not alter the live state"
+        );
+        let temp_leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != path.file_name().unwrap())
+            .collect();
+        assert!(
+            temp_leftovers.is_empty(),
+            "no partial artifact should exist when the write never started: {temp_leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn crash_after_write_before_rename_leaves_original_state_loadable() {
+        // Covers both "after write, before fsync" and "after fsync, before
+        // rename": from the perspective of anything reading `path`, those
+        // two points are indistinguishable -- the new content exists only
+        // at the temp path, and `path` itself has not moved yet.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        state_with_target(1).save(&path).unwrap();
+        let good_bytes = fs::read(&path).unwrap();
+
+        let new_state = state_with_target(2);
+        let payload = serde_json::to_vec_pretty(&new_state).unwrap();
+        let temporary = temporary_path(&path);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(&payload).unwrap();
+        file.sync_all().unwrap();
+        // Deliberately stop here: no rename, simulating a crash that landed
+        // after the write (and even after its own fsync) but before the
+        // rename that would make it the live state.
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            good_bytes,
+            "the live path must be untouched while the new content sits only in the temp file"
+        );
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(
+            loaded.accounts["acct"].last_target,
+            Some(1),
+            "load must return the last-renamed state, ignoring an orphaned temp file"
+        );
+    }
+
+    #[test]
+    fn crash_mid_write_leaves_a_truncated_temp_file_but_original_state_is_still_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        state_with_target(1).save(&path).unwrap();
+        let good_bytes = fs::read(&path).unwrap();
+
+        let new_state = state_with_target(2);
+        let payload = serde_json::to_vec_pretty(&new_state).unwrap();
+        let truncated = &payload[..payload.len() / 2];
+        let temporary = temporary_path(&path);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(truncated).unwrap();
+        // No sync_all, no rename: this is a crash mid-`write_all`, leaving
+        // an incomplete, unparseable temp file that nothing ever reads.
+
+        assert_eq!(fs::read(&path).unwrap(), good_bytes);
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(
+            quarantined.is_none(),
+            "a truncated temp file must never be mistaken for the live state"
+        );
+        assert_eq!(loaded.accounts["acct"].last_target, Some(1));
+    }
+
+    #[test]
+    fn crash_after_rename_before_directory_fsync_new_state_is_already_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        state_with_target(1).save(&path).unwrap();
+
+        let new_state = state_with_target(2);
+        let payload = serde_json::to_vec_pretty(&new_state).unwrap();
+        let temporary = temporary_path(&path);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(&payload).unwrap();
+        file.sync_all().unwrap();
+        fs::rename(&temporary, &path).unwrap();
+        // Deliberately skip `sync_directory` here: this is the simulated
+        // crash point between the rename and the parent-directory fsync.
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(
+            loaded.accounts["acct"].last_target,
+            Some(2),
+            "rename already made the new state visible to any reader, whether or not \
+             the directory entry's fsync ever completes"
+        );
+    }
+
+    #[test]
+    fn corrupt_file_recovery_quarantines_a_truncated_mid_write_artifact_found_at_the_live_path() {
+        // Distinct from the temp-file scenarios above: here the truncated
+        // bytes have ended up directly at the live `path` (e.g. an older
+        // binary without the temp-file+rename protection, or a filesystem
+        // that reordered writes) rather than at a temp file `load` never
+        // reads. `load` must recognize this as corruption and quarantine
+        // it, not propagate a raw parse error or accept a partial value.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let full = serde_json::to_vec_pretty(&state_with_target(1)).unwrap();
+        fs::write(&path, &full[..full.len() / 2]).unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(loaded.accounts.is_empty());
+        let notice = quarantined.expect("truncated JSON at the live path must be quarantined");
+        assert_eq!(
+            fs::read(&notice.quarantined_path).unwrap(),
+            &full[..full.len() / 2]
+        );
+        assert!(!path.exists());
+    }
 }
