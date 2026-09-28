@@ -5,5 +5,6 @@
 //! Gated on `cfg(test)` so none of it ships in the `subgov` binary.
 
 pub(crate) mod clock;
+pub(crate) mod fake_fleet;
 pub(crate) mod fake_source;
 pub(crate) mod fixture_scan;
