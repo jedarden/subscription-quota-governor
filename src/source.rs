@@ -6,7 +6,7 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -14,12 +14,29 @@ use std::time::Duration;
 
 const REFRESH_THRESHOLD_MILLIS: i64 = 300_000;
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Maximum bytes read from a generic source's command stdout, file, or HTTP
+/// body (plan.md §7.4: "Files and HTTP bodies have explicit maximum sizes in
+/// v1."). A normalized quota snapshot is a small JSON document, so this is
+/// generous headroom rather than a tight budget.
+const MAX_GENERIC_SOURCE_BYTES: u64 = 1024 * 1024;
 
+/// Collects one normalized quota snapshot for an account's configured
+/// source.
+///
+/// This is the failure-isolation boundary described by plan.md §7.4: "a
+/// source error affects only its account and cannot actuate its fleet." Every
+/// branch either returns a validated `QuotaSnapshot` or an `Err` -- there is
+/// no partial-success path -- so a caller that treats `Err` as "skip this
+/// account's evaluation and actuation this cycle" (as `run_cycle` in
+/// `main.rs` does, per-account and before any actuator call) can never end up
+/// actuating a fleet from a failed poll.
 pub fn collect(source: &SourceConfig) -> Result<QuotaSnapshot> {
     let snapshot = match source {
         SourceConfig::NormalizedFile { path } => {
-            let bytes = fs::read(path)
+            let mut file = File::open(path)
                 .with_context(|| format!("failed to read snapshot {}", path.display()))?;
+            let bytes = read_bounded(&mut file, MAX_GENERIC_SOURCE_BYTES)
+                .with_context(|| format!("snapshot {}", path.display()))?;
             serde_json::from_slice(&bytes)
                 .with_context(|| format!("failed to parse snapshot {}", path.display()))?
         }
@@ -43,16 +60,35 @@ pub fn collect(source: &SourceConfig) -> Result<QuotaSnapshot> {
 }
 
 fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
-    let output = Command::new(&argv[0])
+    let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output()
-        .with_context(|| format!("failed to execute quota source {}", argv[0]))?;
-    if !output.status.success() {
-        bail!("quota source {} exited with {}", argv[0], output.status);
+        .spawn()
+        .with_context(|| format!("failed to start quota source {}", argv[0]))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("quota source stdout was not piped")?;
+    let bytes = read_bounded(&mut stdout, MAX_GENERIC_SOURCE_BYTES);
+    drop(stdout);
+    if bytes.is_err() {
+        // The child may still be trying to write past the bound; kill it
+        // rather than risk it blocking forever on a full pipe buffer nobody
+        // is draining.
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    serde_json::from_slice(&output.stdout)
+    let bytes = bytes.with_context(|| format!("quota source {} stdout", argv[0]))?;
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for quota source {}", argv[0]))?;
+    if !status.success() {
+        bail!("quota source {} exited with {}", argv[0], status);
+    }
+    serde_json::from_slice(&bytes)
         .context("quota source did not emit a normalized snapshot")
 }
 
@@ -62,9 +98,27 @@ fn collect_normalized_http(url: &str, timeout_seconds: u64) -> Result<QuotaSnaps
         .get(url)
         .call()
         .map_err(|error| anyhow!("normalized HTTP quota request failed: {error}"))?;
-    response
-        .into_json()
+    let mut reader = response.into_reader();
+    let bytes = read_bounded(&mut reader, MAX_GENERIC_SOURCE_BYTES)
+        .context("normalized HTTP quota response")?;
+    serde_json::from_slice(&bytes)
         .context("normalized HTTP source returned invalid snapshot JSON")
+}
+
+/// Reads at most `limit` bytes from `reader`, failing rather than silently
+/// truncating if more data is available. Used to bound every generic
+/// source's untrusted or unbounded input -- command stdout, a snapshot file,
+/// or an HTTP response body -- per plan.md §7.4.
+fn read_bounded(reader: &mut dyn Read, limit: u64) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut buffer)
+        .context("failed to read source output")?;
+    if buffer.len() as u64 > limit {
+        bail!("source output exceeds the {limit}-byte maximum");
+    }
+    Ok(buffer)
 }
 
 fn collect_anthropic(
@@ -972,5 +1026,104 @@ mod tests {
         // the usage request itself -- this must still surface as Err, not an
         // empty or partial snapshot that could be mistaken for a real one.
         assert!(collect(&source).is_err());
+    }
+
+    #[test]
+    fn read_bounded_accepts_data_at_exactly_the_limit() {
+        let data = vec![7u8; 10];
+        let mut cursor = std::io::Cursor::new(data.clone());
+        let bytes = read_bounded(&mut cursor, 10).unwrap();
+        assert_eq!(bytes, data);
+    }
+
+    #[test]
+    fn read_bounded_rejects_data_over_the_limit() {
+        let mut cursor = std::io::Cursor::new(vec![7u8; 11]);
+        assert!(read_bounded(&mut cursor, 10).is_err());
+    }
+
+    #[test]
+    fn collect_normalized_file_rejects_oversized_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        fs::write(&path, vec![b'0'; (MAX_GENERIC_SOURCE_BYTES + 10) as usize]).unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        assert!(collect(&source).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_command_succeeds_for_small_output() {
+        let source = SourceConfig::Command {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                r#"printf '{"observed_at":"2026-09-12T12:00:00Z","windows":[{"id":"w","used_fraction":0.1,"resets_at":"2026-09-13T00:00:00Z"}]}'"#
+                    .to_string(),
+            ],
+        };
+        let snapshot = collect(&source).unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_command_rejects_oversized_stdout_and_reaps_the_child() {
+        let source = SourceConfig::Command {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "yes | head -c 2000000".to_string(),
+            ],
+        };
+        assert!(collect(&source).is_err());
+    }
+
+    /// Serves `body` once over raw HTTP/1.1 on an ephemeral loopback port,
+    /// with no request-size mocking library required.
+    fn spawn_http_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/"), handle)
+    }
+
+    #[test]
+    fn collect_normalized_http_parses_small_body() {
+        let body = br#"{"observed_at":"2026-09-12T12:00:00Z","windows":[{"id":"w","used_fraction":0.1,"resets_at":"2026-09-13T00:00:00Z"}]}"#.to_vec();
+        let (url, handle) = spawn_http_server(body);
+
+        let source = SourceConfig::NormalizedHttp {
+            url,
+            timeout_seconds: 5,
+        };
+        let snapshot = collect(&source).unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn collect_normalized_http_rejects_oversized_body() {
+        let body = vec![b'a'; (MAX_GENERIC_SOURCE_BYTES + 10) as usize];
+        let (url, handle) = spawn_http_server(body);
+
+        let source = SourceConfig::NormalizedHttp {
+            url,
+            timeout_seconds: 5,
+        };
+        assert!(collect(&source).is_err());
+        handle.join().unwrap();
     }
 }
