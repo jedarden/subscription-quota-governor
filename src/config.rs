@@ -72,6 +72,27 @@ pub struct FleetConfig {
     pub observer: WorkerObserverConfig,
     #[serde(default)]
     pub actuator: ActuatorConfig,
+    /// How to handle an observed worker count outside `[min_workers,
+    /// max_workers]` (plan.md §11.1: "reject counts outside the configured
+    /// fleet range unless a documented reconciliation mode is selected").
+    #[serde(default)]
+    pub observer_reconciliation: ObserverReconciliation,
+}
+
+/// The only two documented reconciliation modes for an observed worker count
+/// outside `[min_workers, max_workers]` (plan.md §11.1).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserverReconciliation {
+    /// Fail the cycle for this account rather than act on an out-of-range
+    /// observation.
+    #[default]
+    Strict,
+    /// Pull the observed count back into range and proceed. For a fleet
+    /// whose real state legitimately drifts outside the configured range
+    /// (e.g. another reconciler is also touching it), this keeps the
+    /// governor's decisions bounded instead of refusing to run.
+    Clamp,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

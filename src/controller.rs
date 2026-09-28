@@ -387,6 +387,7 @@ mod tests {
                 max_scale_down_per_cycle: 10,
                 observer: WorkerObserverConfig::Static { workers: 4 },
                 actuator: ActuatorConfig::None,
+                observer_reconciliation: ObserverReconciliation::default(),
             },
             utilization: UtilizationConfig {
                 target_utilization: Some(0.9),
@@ -1140,6 +1141,7 @@ mod tests {
                     max_scale_down_per_cycle,
                     observer: WorkerObserverConfig::Static { workers: 0 },
                     actuator: ActuatorConfig::None,
+                    observer_reconciliation: ObserverReconciliation::default(),
                 }
             }
         }
