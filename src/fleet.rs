@@ -74,7 +74,11 @@ pub fn actuator_for(config: &ActuatorConfig) -> Box<dyn Actuator> {
 }
 
 pub fn current_workers(config: &FleetConfig) -> Result<u32> {
-    let observed = observer_for(&config.observer).current_workers()?;
+    let observer_config = config
+        .observer
+        .as_ref()
+        .context("fleet.observer is required when fleet.hosts is not configured")?;
+    let observed = observer_for(observer_config).current_workers()?;
     reconcile_observed_range(observed, config)
 }
 
@@ -649,9 +653,10 @@ mod tests {
             bootstrap_workers: min_workers,
             max_scale_up_per_cycle: 1,
             max_scale_down_per_cycle: 1,
-            observer: WorkerObserverConfig::Static { workers },
+            observer: Some(WorkerObserverConfig::Static { workers }),
             actuator: ActuatorConfig::None,
             observer_reconciliation,
+            hosts: None,
         }
     }
 

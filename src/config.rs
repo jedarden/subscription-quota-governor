@@ -69,7 +69,10 @@ pub struct FleetConfig {
     pub max_scale_up_per_cycle: u32,
     #[serde(default = "default_step")]
     pub max_scale_down_per_cycle: u32,
-    pub observer: WorkerObserverConfig,
+    /// Required unless `hosts` is configured (plan.md §22.3: "observer/actuator
+    /// here and hosts below are mutually exclusive").
+    #[serde(default)]
+    pub observer: Option<WorkerObserverConfig>,
     #[serde(default)]
     pub actuator: ActuatorConfig,
     /// How to handle an observed worker count outside `[min_workers,
@@ -77,6 +80,60 @@ pub struct FleetConfig {
     /// fleet range unless a documented reconciliation mode is selected").
     #[serde(default)]
     pub observer_reconciliation: ObserverReconciliation,
+    /// Per-host placement (plan.md §22.2/§22.3). Optional and additive: an
+    /// account with no `hosts` key behaves byte-identically to v0.1, using
+    /// `observer`/`actuator` above directly for the account's single implicit
+    /// host.
+    #[serde(default)]
+    pub hosts: Option<BTreeMap<String, HostConfig>>,
+}
+
+/// One placement target within an account's fleet (plan.md §22.3).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfig {
+    /// Defaults to the account's `max_workers` when absent; validated to
+    /// never exceed it.
+    #[serde(default)]
+    pub max_workers: Option<u32>,
+    /// Required whenever `resource_source` is set (§22.3: "there is no safe
+    /// default reserve").
+    #[serde(default)]
+    pub resource_reserve: Option<ResourceReserveConfig>,
+    #[serde(default)]
+    pub resource_source: Option<ResourceSourceConfig>,
+    pub observer: WorkerObserverConfig,
+    #[serde(default)]
+    pub actuator: ActuatorConfig,
+}
+
+/// Headroom no placement may consume on a host (plan.md §22.3/§22.8).
+/// Neither field has a safe default -- both are required whenever a host
+/// declares a `resource_source` at all.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceReserveConfig {
+    pub cpu_reserve_fraction: f64,
+    pub mem_reserve_mb: u64,
+}
+
+/// Source for a host's §22.4 `ResourceSnapshot`. Reuses the generic
+/// file/http/command transport from §7.4 verbatim -- no new transport type
+/// (§22.5).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResourceSourceConfig {
+    NormalizedFile {
+        path: PathBuf,
+    },
+    NormalizedHttp {
+        url: String,
+        #[serde(default = "default_timeout")]
+        timeout_seconds: u64,
+    },
+    Command {
+        argv: Vec<String>,
+    },
 }
 
 /// The only two documented reconciliation modes for an observed worker count
@@ -273,13 +330,37 @@ impl SourceConfig {
 
 impl FleetConfig {
     fn expand_paths(&mut self) {
-        match &mut self.observer {
-            WorkerObserverConfig::File { path } => *path = expand_tilde(path),
-            WorkerObserverConfig::Static { .. } | WorkerObserverConfig::Command { .. } => {}
+        if let Some(observer) = &mut self.observer {
+            expand_observer_path(observer);
         }
-        if let ActuatorConfig::TargetFile { path } = &mut self.actuator {
+        expand_actuator_path(&mut self.actuator);
+        if let Some(hosts) = &mut self.hosts {
+            for host in hosts.values_mut() {
+                host.expand_paths();
+            }
+        }
+    }
+}
+
+impl HostConfig {
+    fn expand_paths(&mut self) {
+        expand_observer_path(&mut self.observer);
+        expand_actuator_path(&mut self.actuator);
+        if let Some(ResourceSourceConfig::NormalizedFile { path }) = &mut self.resource_source {
             *path = expand_tilde(path);
         }
+    }
+}
+
+fn expand_observer_path(observer: &mut WorkerObserverConfig) {
+    if let WorkerObserverConfig::File { path } = observer {
+        *path = expand_tilde(path);
+    }
+}
+
+fn expand_actuator_path(actuator: &mut ActuatorConfig) {
+    if let ActuatorConfig::TargetFile { path } = actuator {
+        *path = expand_tilde(path);
     }
 }
 
@@ -343,11 +424,76 @@ fn validate_source(source: &SourceConfig, account: &str) -> Result<()> {
 }
 
 fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
-    if let WorkerObserverConfig::Command { argv } = &fleet.observer {
+    match (&fleet.observer, &fleet.hosts) {
+        (None, None) => bail!(
+            "account {account}: fleet.observer is required when fleet.hosts is not configured"
+        ),
+        (Some(_), Some(_)) => {
+            bail!("account {account}: fleet.observer and fleet.hosts are mutually exclusive")
+        }
+        _ => {}
+    }
+    if fleet.hosts.is_some() && !matches!(fleet.actuator, ActuatorConfig::None) {
+        bail!("account {account}: fleet.actuator and fleet.hosts are mutually exclusive");
+    }
+    if let Some(WorkerObserverConfig::Command { argv }) = &fleet.observer {
         validate_argv(argv, &format!("account {account} observer command"), false)?;
     }
     if let ActuatorConfig::Command { argv } = &fleet.actuator {
         validate_argv(argv, &format!("account {account} actuator command"), true)?;
+    }
+    if let Some(hosts) = &fleet.hosts {
+        if hosts.is_empty() {
+            bail!("account {account}: fleet.hosts requires at least one host when present");
+        }
+        for (host_name, host) in hosts {
+            validate_host(host, account, host_name, fleet.max_workers)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_host(
+    host: &HostConfig,
+    account: &str,
+    host_name: &str,
+    account_max_workers: u32,
+) -> Result<()> {
+    if host_name.is_empty() {
+        bail!("account {account}: host keys must be non-empty");
+    }
+    if let Some(host_max_workers) = host.max_workers {
+        if host_max_workers > account_max_workers {
+            bail!(
+                "account {account} host {host_name}: max_workers ({host_max_workers}) must not exceed the account's max_workers ({account_max_workers})"
+            );
+        }
+    }
+    if host.resource_source.is_some() && host.resource_reserve.is_none() {
+        bail!(
+            "account {account} host {host_name}: resource_reserve is required when resource_source is set"
+        );
+    }
+    if let WorkerObserverConfig::Command { argv } = &host.observer {
+        validate_argv(
+            argv,
+            &format!("account {account} host {host_name} observer command"),
+            false,
+        )?;
+    }
+    if let ActuatorConfig::Command { argv } = &host.actuator {
+        validate_argv(
+            argv,
+            &format!("account {account} host {host_name} actuator command"),
+            true,
+        )?;
+    }
+    if let Some(ResourceSourceConfig::Command { argv }) = &host.resource_source {
+        validate_argv(
+            argv,
+            &format!("account {account} host {host_name} resource_source command"),
+            false,
+        )?;
     }
     Ok(())
 }
@@ -452,5 +598,185 @@ mod tests {
         let policy = BankedResetConfig::default();
         assert!(!policy.enabled);
         assert_eq!(policy.minimum_pace_multiplier, 2.0);
+    }
+
+    fn base_config(fleet_yaml: &str) -> String {
+        format!(
+            r#"
+version: 1
+accounts:
+  acct:
+    source:
+      type: normalized_file
+      path: /tmp/subgov-test-source.json
+    utilization:
+      reserve_fraction: 0.1
+    fleet:
+{fleet_yaml}
+"#
+        )
+    }
+
+    fn indent(yaml: &str) -> String {
+        yaml.lines()
+            .map(|line| format!("      {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// plan.md §22.2: an account with no `hosts` key behaves exactly as it
+    /// does in v0.1.
+    #[test]
+    fn implicit_single_host_config_is_unaffected_by_hosts_support() {
+        let yaml = base_config(&indent(
+            "max_workers: 4\nobserver: { type: static, workers: 1 }\nactuator: { type: none }",
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let fleet = &config.accounts["acct"].fleet;
+        assert!(fleet.hosts.is_none());
+        assert!(fleet.observer.is_some());
+    }
+
+    /// plan.md §22.3's two-host example (a local host and an SSH-reached one).
+    #[test]
+    fn fleet_hosts_parses_the_plan_example() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 8
+hosts:
+  codinghome:
+    max_workers: 6
+    resource_reserve:
+      cpu_reserve_fraction: 0.25
+      mem_reserve_mb: 4096
+    resource_source:
+      type: command
+      argv: ["/usr/local/bin/resource-probe"]
+    observer:
+      type: command
+      argv: ["/usr/local/bin/count-ai-workers", "acct"]
+    actuator:
+      type: command
+      argv: ["/usr/local/bin/set-ai-worker-target", "acct", "{desired_workers}"]
+  lab:
+    max_workers: 8
+    resource_reserve:
+      cpu_reserve_fraction: 0.30
+      mem_reserve_mb: 8192
+    resource_source:
+      type: command
+      argv: ["ssh", "lab.tailnet", "resource-probe"]
+    observer:
+      type: command
+      argv: ["ssh", "lab.tailnet", "needle-worker-count", "acct"]
+    actuator:
+      type: command
+      argv: ["ssh", "lab.tailnet", "needle-set-target", "acct", "{desired_workers}"]"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let fleet = &config.accounts["acct"].fleet;
+        assert!(fleet.observer.is_none());
+        let hosts = fleet.hosts.as_ref().unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts["codinghome"].max_workers, Some(6));
+    }
+
+    #[test]
+    fn fleet_observer_and_hosts_are_mutually_exclusive() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 8
+observer: { type: static, workers: 1 }
+hosts:
+  codinghome:
+    max_workers: 8
+    observer: { type: static, workers: 1 }
+    actuator: { type: none }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn fleet_actuator_and_hosts_are_mutually_exclusive() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 8
+actuator: { type: target_file, path: /tmp/subgov-test-target }
+hosts:
+  codinghome:
+    max_workers: 8
+    observer: { type: static, workers: 1 }
+    actuator: { type: none }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn fleet_requires_observer_when_hosts_is_absent() {
+        let yaml = base_config(&indent("max_workers: 8"));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("fleet.observer is required"), "{err}");
+    }
+
+    #[test]
+    fn fleet_hosts_requires_at_least_one_host_when_present() {
+        let yaml = base_config(&indent("max_workers: 8\nhosts: {}"));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one host"), "{err}");
+    }
+
+    #[test]
+    fn host_resource_source_requires_resource_reserve() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 8
+hosts:
+  codinghome:
+    max_workers: 8
+    resource_source:
+      type: command
+      argv: ["/usr/local/bin/resource-probe"]
+    observer: { type: static, workers: 1 }
+    actuator: { type: none }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("resource_reserve is required"), "{err}");
+    }
+
+    #[test]
+    fn host_max_workers_must_not_exceed_account_max_workers() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+hosts:
+  codinghome:
+    max_workers: 6
+    observer: { type: static, workers: 1 }
+    actuator: { type: none }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("must not exceed"), "{err}");
+    }
+
+    #[test]
+    fn host_actuator_command_requires_desired_workers_placeholder() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 8
+hosts:
+  codinghome:
+    max_workers: 8
+    observer: { type: static, workers: 1 }
+    actuator:
+      type: command
+      argv: ["/usr/local/bin/set-target", "acct"]"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("{desired_workers}"), "{err}");
     }
 }

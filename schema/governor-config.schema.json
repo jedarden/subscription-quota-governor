@@ -175,9 +175,9 @@
     },
     "fleet": {
       "type": "object",
-      "required": ["max_workers", "observer"],
+      "required": ["max_workers"],
       "additionalProperties": false,
-      "description": "max_workers >= min_workers and bootstrap_workers <= max_workers are enforced by Config::validate() but not expressible here -- see the top-level description.",
+      "description": "max_workers >= min_workers and bootstrap_workers <= max_workers are enforced by Config::validate() but not expressible here -- see the top-level description. `observer` is required unless `hosts` is configured, and `observer`/a non-none `actuator` are mutually exclusive with `hosts` (plan.md §22.2/§22.3); validate_fleet()/validate_host() enforce both, not expressible here.",
       "properties": {
         "min_workers": { "type": "integer", "minimum": 0, "default": 0 },
         "max_workers": { "type": "integer", "minimum": 0 },
@@ -185,8 +185,70 @@
         "max_scale_up_per_cycle": { "type": "integer", "minimum": 0, "default": 1 },
         "max_scale_down_per_cycle": { "type": "integer", "minimum": 0, "default": 1 },
         "observer": { "$ref": "#/$defs/observer" },
+        "actuator": { "$ref": "#/$defs/actuator", "default": { "type": "none" } },
+        "hosts": {
+          "type": "object",
+          "description": "plan.md §22.2/§22.3: optional and additive. When present, at least one host is required (validate_fleet()); when absent, the account behaves byte-identically to v0.1 via `observer`/`actuator` above.",
+          "propertyNames": { "minLength": 1 },
+          "additionalProperties": { "$ref": "#/$defs/host" }
+        }
+      }
+    },
+    "host": {
+      "type": "object",
+      "required": ["observer"],
+      "additionalProperties": false,
+      "description": "HostConfig (plan.md §22.3). max_workers <= the account's fleet.max_workers, and resource_reserve is required whenever resource_source is set, both enforced by validate_host() and not expressible here.",
+      "properties": {
+        "max_workers": { "type": "integer", "minimum": 0 },
+        "resource_reserve": { "$ref": "#/$defs/resourceReserve" },
+        "resource_source": { "$ref": "#/$defs/resourceSource" },
+        "observer": { "$ref": "#/$defs/observer" },
         "actuator": { "$ref": "#/$defs/actuator", "default": { "type": "none" } }
       }
+    },
+    "resourceReserve": {
+      "type": "object",
+      "required": ["cpu_reserve_fraction", "mem_reserve_mb"],
+      "additionalProperties": false,
+      "description": "plan.md §22.3/§22.8: neither field has a safe default, so both are required whenever a host declares resource_reserve at all.",
+      "properties": {
+        "cpu_reserve_fraction": { "type": "number" },
+        "mem_reserve_mb": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "resourceSource": {
+      "description": "ResourceSourceConfig -- internally tagged on `type`, reusing the generic file/http/command transport from §7.4 verbatim (§22.5).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "path"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "normalized_file" },
+            "path": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "url"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "normalized_http" },
+            "url": { "type": "string" },
+            "timeout_seconds": { "type": "integer", "minimum": 0, "default": 15 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "argv"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "command" },
+            "argv": { "$ref": "#/$defs/argv" }
+          }
+        }
+      ]
     },
     "strategy": {
       "enum": ["linear_to_reset", "ceiling_only"],

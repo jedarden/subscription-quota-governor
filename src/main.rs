@@ -615,9 +615,10 @@ mod shutdown_tests {
                 bootstrap_workers: 1,
                 max_scale_up_per_cycle: 1,
                 max_scale_down_per_cycle: 1,
-                observer: WorkerObserverConfig::Static { workers: 1 },
+                observer: Some(WorkerObserverConfig::Static { workers: 1 }),
                 actuator: ActuatorConfig::None,
                 observer_reconciliation: ObserverReconciliation::default(),
+                hosts: None,
             },
             utilization: UtilizationConfig {
                 target_utilization: Some(0.9),
@@ -731,11 +732,12 @@ mod exit_code_tests {
                 bootstrap_workers: 1,
                 max_scale_up_per_cycle: 10,
                 max_scale_down_per_cycle: 10,
-                observer: WorkerObserverConfig::Static { workers: 0 },
+                observer: Some(WorkerObserverConfig::Static { workers: 0 }),
                 actuator: ActuatorConfig::Command {
                     argv: vec!["/nonexistent/subgov-test-actuator".to_string()],
                 },
                 observer_reconciliation: ObserverReconciliation::default(),
+                hosts: None,
             },
             utilization: UtilizationConfig {
                 target_utilization: Some(0.9),
