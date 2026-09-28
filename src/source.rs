@@ -98,6 +98,7 @@ fn collect_normalized_http(url: &str, timeout_seconds: u64) -> Result<QuotaSnaps
         .get(url)
         .call()
         .map_err(|error| anyhow!("normalized HTTP quota request failed: {error}"))?;
+    let response = reject_redirect(response)?;
     let mut reader = response.into_reader();
     let bytes = read_bounded(&mut reader, MAX_GENERIC_SOURCE_BYTES)
         .context("normalized HTTP quota response")?;
@@ -136,6 +137,7 @@ fn collect_anthropic(
         .set("User-Agent", "claude-code/2.1.114")
         .call()
         .map_err(|error| anyhow!("Anthropic usage request failed: {error}"))?;
+    let response = reject_redirect(response)?;
     let payload: Value = response
         .into_json()
         .context("Anthropic usage endpoint returned invalid JSON")?;
@@ -310,7 +312,7 @@ fn refresh_anthropic(refresh_token: &str, token_url: &str, timeout_seconds: u64)
             "refreshToken": refresh_token
         }))
         .map_err(|error| anyhow!("Anthropic token refresh failed: {error}"))?;
-    response
+    reject_redirect(response)?
         .into_json()
         .context("Anthropic token refresh returned invalid JSON")
 }
@@ -615,13 +617,37 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
 /// (connect through reading the full response body) -- plan.md §7.4: "HTTP
 /// requests have mandatory finite timeouts." `timeout_seconds: 0` is refused
 /// rather than silently producing a request with no effective deadline.
+///
+/// Redirects are always disabled (`.redirects(0)`). Plan.md §7.4 requires
+/// this outright for credential-bearing native (Anthropic) requests, and
+/// permits either "disabled" or "same-origin-only" for `normalized_http`;
+/// this uses the same agent for both and picks the stricter option
+/// uniformly rather than hand-rolling same-origin redirect following. With
+/// `redirects(0)` a 3xx response comes back as `Ok` (per ureq) rather than
+/// an error, so callers must still reject it explicitly via
+/// [`reject_redirect`].
 fn http_agent(timeout_seconds: u64) -> Result<ureq::Agent> {
     if timeout_seconds == 0 {
         bail!("HTTP source timeout_seconds must be greater than zero");
     }
     Ok(ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(timeout_seconds))
+        .redirects(0)
         .build())
+}
+
+/// Turns a 3xx response from a `redirects(0)` agent into an explicit error
+/// instead of letting it fall through to JSON parsing with a confusing
+/// message.
+fn reject_redirect(response: ureq::Response) -> Result<ureq::Response> {
+    if (300..400).contains(&response.status()) {
+        bail!(
+            "refused a {} redirect from {} (redirects are disabled for this source)",
+            response.status(),
+            response.get_url()
+        );
+    }
+    Ok(response)
 }
 
 fn read_json(path: &Path, label: &str) -> Result<Value> {
@@ -1188,6 +1214,45 @@ mod tests {
         assert!(
             listener.accept().is_err(),
             "a zero-timeout source must never attempt a connection"
+        );
+    }
+
+    #[test]
+    fn collect_normalized_http_refuses_a_redirect_instead_of_following_it() {
+        // The redirect target is a second server; if it ever receives a
+        // connection, the client followed the redirect instead of refusing
+        // it as plan.md §7.4 requires.
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_port = target.local_addr().unwrap().port();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let source = SourceConfig::NormalizedHttp {
+            url: format!("http://127.0.0.1:{port}/"),
+            timeout_seconds: 5,
+        };
+        assert!(
+            collect(&source).is_err(),
+            "a redirect response must be refused, not treated as success"
+        );
+        handle.join().unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            target.accept().is_err(),
+            "the redirect target must never be contacted"
         );
     }
 }
