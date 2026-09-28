@@ -4,13 +4,25 @@ use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Maximum bytes read from an observer's file or command stdout (plan.md
 /// §11.1: "bound file and stdout size"). A worker count is a bare integer or
 /// a one-field JSON object, so this is generous headroom rather than a tight
 /// budget.
 const MAX_OBSERVER_BYTES: u64 = 4096;
+
+/// Ceiling on how long an observer or actuator child process (and everything
+/// it spawns) may run before it is killed (plan.md §11.1/§11.2: "apply a
+/// command timeout and kill the complete child process group"). Matches the
+/// default timeout already used for the source adapters' external calls.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often a timed-out-or-not check polls `Child::try_wait`.
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Reports the fleet's current worker count for an account.
 ///
@@ -141,37 +153,70 @@ struct CommandObserver {
 
 impl Observer for CommandObserver {
     fn current_workers(&self) -> Result<u32> {
-        let mut child = Command::new(&self.argv[0])
-            .args(&self.argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to start worker observer {}", self.argv[0]))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .context("worker observer stdout was not piped")?;
-        let bytes = read_bounded(&mut stdout, MAX_OBSERVER_BYTES);
-        drop(stdout);
-        if bytes.is_err() {
-            // The child may still be trying to write past the bound; kill it
-            // rather than risk it blocking forever on a full pipe buffer
-            // nobody is draining.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let bytes = bytes.with_context(|| format!("worker observer {} stdout", self.argv[0]))?;
-
-        let status = child
-            .wait()
-            .with_context(|| format!("failed to wait for worker observer {}", self.argv[0]))?;
-        if !status.success() {
-            bail!("worker observer {} exited with {}", self.argv[0], status);
-        }
-        let text = String::from_utf8(bytes).context("worker count was not UTF-8")?;
-        parse_worker_count(&text)
+        command_observer_current_workers(&self.argv, CHILD_TIMEOUT)
     }
+}
+
+/// The `CommandObserver` implementation, with the timeout as a parameter so
+/// tests can use a short one instead of waiting out `CHILD_TIMEOUT`.
+///
+/// Reads stdout on a background thread so a size-bounded read (which must
+/// keep consuming bytes to notice the bound was exceeded) and a wall-clock
+/// timeout can be enforced at the same time: the main thread blocks on
+/// `recv_timeout` instead of on the read itself, and kills the child's whole
+/// process group if the deadline passes before the reader reports back.
+fn command_observer_current_workers(argv: &[String], timeout: Duration) -> Result<u32> {
+    let mut command = new_process_group_command(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start worker observer {}", argv[0]))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("worker observer stdout was not piped")?;
+
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let _ = sender.send(read_bounded(&mut stdout, MAX_OBSERVER_BYTES));
+    });
+
+    let bytes = match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            kill_child_tree(&mut child);
+            let _ = reader.join();
+            bail!("worker observer {} timed out after {timeout:?}", argv[0]);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!(
+                "worker observer {} reader thread ended unexpectedly",
+                argv[0]
+            );
+        }
+    };
+    let _ = reader.join();
+
+    if bytes.is_err() {
+        // The child may still be trying to write past the bound; kill its
+        // whole process group rather than risk a grandchild blocking
+        // forever on a full pipe buffer nobody is draining.
+        kill_child_tree(&mut child);
+    }
+    let bytes = bytes.with_context(|| format!("worker observer {} stdout", argv[0]))?;
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for worker observer {}", argv[0]))?;
+    if !status.success() {
+        bail!("worker observer {} exited with {}", argv[0], status);
+    }
+    let text = String::from_utf8(bytes).context("worker count was not UTF-8")?;
+    parse_worker_count(&text)
 }
 
 struct NoneActuator;
@@ -198,23 +243,89 @@ struct CommandActuator {
 
 impl Actuator for CommandActuator {
     fn actuate(&self, desired: u32) -> Result<()> {
-        let rendered: Vec<String> = self
-            .argv
-            .iter()
-            .map(|argument| argument.replace("{desired_workers}", &desired.to_string()))
-            .collect();
-        let status = Command::new(&rendered[0])
-            .args(&rendered[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("failed to execute fleet actuator {}", rendered[0]))?;
-        if !status.success() {
-            bail!("fleet actuator {} exited with {status}", rendered[0]);
-        }
-        Ok(())
+        command_actuator_actuate(&self.argv, desired, CHILD_TIMEOUT)
     }
+}
+
+/// The `CommandActuator` implementation, with the timeout as a parameter so
+/// tests can use a short one instead of waiting out `CHILD_TIMEOUT`.
+fn command_actuator_actuate(argv: &[String], desired: u32, timeout: Duration) -> Result<()> {
+    let rendered: Vec<String> = argv
+        .iter()
+        .map(|argument| argument.replace("{desired_workers}", &desired.to_string()))
+        .collect();
+    let mut command = new_process_group_command(&rendered[0]);
+    command
+        .args(&rendered[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to execute fleet actuator {}", rendered[0]))?;
+    let status = wait_with_timeout(&mut child, timeout)
+        .with_context(|| format!("fleet actuator {}", rendered[0]))?;
+    if !status.success() {
+        bail!("fleet actuator {} exited with {status}", rendered[0]);
+    }
+    Ok(())
+}
+
+/// Waits for `child` to exit, polling rather than blocking so a deadline can
+/// be enforced, and kills its whole process group if it doesn't exit in
+/// time (plan.md §11.1/§11.2).
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll child process status")?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            kill_child_tree(child);
+            bail!("timed out after {timeout:?} waiting for the child to exit");
+        }
+        thread::sleep(CHILD_POLL_INTERVAL);
+    }
+}
+
+/// Spawns `program` as the leader of its own new process group, so
+/// [`kill_child_tree`] can terminate it and everything it spawns, not just
+/// the immediate child (plan.md §11.1/§11.2: "kill the complete child
+/// process group").
+#[cfg(unix)]
+fn new_process_group_command(program: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(program);
+    command.process_group(0);
+    command
+}
+
+#[cfg(not(unix))]
+fn new_process_group_command(program: &str) -> Command {
+    Command::new(program)
+}
+
+/// Kills `child`'s whole process group (or just `child` where process groups
+/// aren't available) and reaps it. Best-effort: a child that has already
+/// exited, or a signal that fails to reach every descendant, is not treated
+/// as an error here -- the caller is already on a failure or timeout path.
+#[cfg(unix)]
+fn kill_child_tree(child: &mut Child) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_child_tree(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Parses a `file`/`command` observer's output: one unsigned decimal integer
@@ -418,6 +529,112 @@ mod tests {
             ],
         });
         assert!(observer.current_workers().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_observer_succeeds_well_within_a_short_timeout() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo 4".to_string(),
+        ];
+        assert_eq!(
+            command_observer_current_workers(&argv, Duration::from_millis(500)).unwrap(),
+            4
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_observer_times_out_on_a_hanging_command() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 5".to_string(),
+        ];
+        let start = Instant::now();
+        let result = command_observer_current_workers(&argv, Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "should time out around 100ms, not wait for the 5s sleep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_observer_timeout_kills_the_whole_process_group() {
+        let dir = std::env::temp_dir().join(format!("subgov-fleet-pgroup-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("grandchild-ran");
+        // The direct child backgrounds a grandchild that (if it survives)
+        // writes `marker` after 300ms, then blocks for 5s itself. A 100ms
+        // timeout must kill the *group*: if only the direct child died, the
+        // backgrounded grandchild would still write the marker.
+        let script = format!("(sleep 0.3; touch {}) & sleep 5", marker.display());
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        let result = command_observer_current_workers(&argv, Duration::from_millis(100));
+        assert!(result.is_err());
+        thread::sleep(Duration::from_millis(700));
+        assert!(
+            !marker.exists(),
+            "grandchild should have been killed along with the rest of the process group"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_actuator_succeeds_well_within_a_short_timeout() {
+        let dir =
+            std::env::temp_dir().join(format!("subgov-fleet-actuator-to-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo {{desired_workers}} > {}", path.display()),
+        ];
+        command_actuator_actuate(&argv, 7, Duration::from_millis(500)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "7");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_actuator_times_out_on_a_hanging_command() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 5".to_string(),
+        ];
+        let start = Instant::now();
+        let result = command_actuator_actuate(&argv, 3, Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "should time out around 100ms, not wait for the 5s sleep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_actuator_timeout_kills_the_whole_process_group() {
+        let dir =
+            std::env::temp_dir().join(format!("subgov-fleet-act-pgroup-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("grandchild-ran");
+        let script = format!("(sleep 0.3; touch {}) & sleep 5", marker.display());
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        let result = command_actuator_actuate(&argv, 3, Duration::from_millis(100));
+        assert!(result.is_err());
+        thread::sleep(Duration::from_millis(700));
+        assert!(
+            !marker.exists(),
+            "grandchild should have been killed along with the rest of the process group"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn fleet_config_with(

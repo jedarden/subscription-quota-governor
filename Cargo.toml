@@ -31,6 +31,12 @@ serde_yaml = "0.9"
 thiserror = "2.0"
 ureq = { version = "2.12", features = ["json"] }
 
+# Process-group termination for observer/actuator children (plan.md
+# §11.1/§11.2). Unix-only, matching every other OS-specific dependency and
+# `#[cfg(unix)]` block already in this crate.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
+
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.20"

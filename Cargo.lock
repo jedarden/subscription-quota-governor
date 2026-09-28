@@ -1029,6 +1029,7 @@ dependencies = [
  "ctrlc",
  "dirs",
  "fs2",
+ "nix",
  "proptest",
  "rand 0.8.8",
  "serde",
