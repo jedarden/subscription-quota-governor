@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use rand::Rng;
 use serde_json::json;
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use subscription_governor::config::{ActuatorConfig, Config};
 use subscription_governor::controller::evaluate;
 use subscription_governor::fleet;
@@ -65,6 +66,8 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<()> {
     let state_path = config.state_path();
     let _lock = StateLock::acquire(&state_path)?;
     let mut state = State::load(&state_path)?;
+    let interval = Duration::from_secs(config.poll_interval_seconds);
+    let mut anchor = Instant::now();
     loop {
         let failures = run_cycle(&config, &mut state, observe_only);
         state.save(&state_path)?;
@@ -74,8 +77,40 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<()> {
             }
             return Ok(());
         }
-        thread::sleep(Duration::from_secs(config.poll_interval_seconds));
+        let (next_anchor, sleep_for) = advance_schedule(anchor, interval, Instant::now());
+        anchor = next_anchor;
+        thread::sleep(sleep_for + bounded_jitter(interval));
     }
+}
+
+/// Advances a monotonic-clock schedule by one interval from `anchor`.
+///
+/// Anchoring to the prior anchor plus the interval (rather than to `now`
+/// after each cycle finishes) keeps the long-run cadence at exactly
+/// `interval` regardless of how long each cycle took, so per-cycle work
+/// never accumulates as schedule drift. If a cycle overran the interval,
+/// the anchor resyncs to `now` so a slow cycle doesn't trigger a burst of
+/// back-to-back catch-up cycles trying to make up for lost time.
+fn advance_schedule(anchor: Instant, interval: Duration, now: Instant) -> (Instant, Duration) {
+    let next_anchor = anchor + interval;
+    if next_anchor > now {
+        (next_anchor, next_anchor - now)
+    } else {
+        (now, Duration::ZERO)
+    }
+}
+
+/// A random delay up to 10% of `interval` (capped at 30s) so that many
+/// accounts/instances on the same interval don't all poll their upstream
+/// providers at the same moment. The exact range is a deliberately
+/// conservative placeholder pending observation-mode evidence (plan.md §21).
+fn bounded_jitter(interval: Duration) -> Duration {
+    let max_jitter = interval.mul_f64(0.1).min(Duration::from_secs(30));
+    if max_jitter.is_zero() {
+        return Duration::ZERO;
+    }
+    let millis = rand::thread_rng().gen_range(0..=max_jitter.as_millis() as u64);
+    Duration::from_millis(millis)
 }
 
 fn run_cycle(config: &Config, state: &mut State, observe_only: bool) -> usize {
@@ -124,4 +159,52 @@ fn run_cycle(config: &Config, state: &mut State, observe_only: bool) -> usize {
         }
     }
     failures
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn schedule_does_not_drift_when_a_cycle_is_fast() {
+        let interval = Duration::from_secs(10);
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_millis(50);
+        let (next_anchor, sleep_for) = advance_schedule(anchor, interval, now);
+        assert_eq!(next_anchor, anchor + interval);
+        assert_eq!(sleep_for, interval - Duration::from_millis(50));
+    }
+
+    #[test]
+    fn schedule_resyncs_after_a_slow_cycle_without_bursting() {
+        let interval = Duration::from_secs(10);
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_secs(25);
+        let (next_anchor, sleep_for) = advance_schedule(anchor, interval, now);
+        assert_eq!(next_anchor, now);
+        assert_eq!(sleep_for, Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_never_exceeds_ten_percent_of_interval_or_the_cap() {
+        let interval = Duration::from_secs(300);
+        for _ in 0..1000 {
+            let jitter = bounded_jitter(interval);
+            assert!(jitter <= Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn jitter_is_bounded_for_a_short_interval() {
+        let interval = Duration::from_secs(1);
+        for _ in 0..1000 {
+            let jitter = bounded_jitter(interval);
+            assert!(jitter <= Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn jitter_is_zero_for_a_zero_interval() {
+        assert_eq!(bounded_jitter(Duration::ZERO), Duration::ZERO);
+    }
 }
