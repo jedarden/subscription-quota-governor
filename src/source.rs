@@ -1,5 +1,5 @@
 use crate::config::SourceConfig;
-use crate::model::{QuotaSnapshot, QuotaWindow, ResetCredit, ResetCreditsSnapshot};
+use crate::model::{QuotaSnapshot, QuotaWindow, ResetCredit, ResetCreditsSnapshot, ResourceSnapshot};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use fs2::FileExt;
@@ -120,10 +120,12 @@ pub enum CodexSourceError {
 }
 
 /// Errors from the generic `command`/`normalized_file`/`normalized_http`
-/// sources (plan.md §7.4). Every variant's `Display` is built only from a
-/// path, a command name, a byte-count limit, a status code, or literal
-/// text -- never the source's actual output, which is untrusted and may
-/// carry arbitrary content -- per plan.md §14 requirement 8.
+/// sources (plan.md §7.4). This same transport and error set is shared by
+/// the resource-source collectors (plan.md §22.5), so no variant name
+/// describes a quota-specific concept. Every variant's `Display` is built
+/// only from a path, a command name, a byte-count limit, a status code, or
+/// literal text -- never the source's actual output, which is untrusted and
+/// may carry arbitrary content -- per plan.md §14 requirement 8.
 #[derive(Debug, Error)]
 pub enum GenericSourceError {
     #[error("failed to read snapshot file {path}")]
@@ -134,30 +136,37 @@ pub enum GenericSourceError {
         #[source]
         source: ReadBoundedError,
     },
-    #[error("failed to start quota source command `{command}`")]
+    #[error("failed to start source command `{command}`")]
     CommandSpawnFailed { command: String },
-    #[error("quota source command `{command}` stdout was not piped")]
+    #[error("source command `{command}` stdout was not piped")]
     CommandStdoutMissing { command: String },
-    #[error("failed to read quota source command `{command}` stdout")]
+    #[error("failed to read source command `{command}` stdout")]
     CommandReadFailed {
         command: String,
         #[source]
         source: ReadBoundedError,
     },
-    #[error("failed to wait for quota source command `{command}`")]
+    #[error("failed to wait for source command `{command}`")]
     CommandWaitFailed { command: String },
-    #[error("quota source command `{command}` exited with a failure status")]
+    #[error("source command `{command}` exited with a failure status")]
     CommandFailed { command: String },
     #[error("HTTP source timeout_seconds must be greater than zero")]
     InvalidTimeout,
-    #[error("normalized HTTP quota request failed")]
+    #[error("normalized HTTP source request failed")]
     HttpRequestFailed(#[source] ureq::Error),
-    #[error("normalized HTTP quota response {0}")]
+    #[error("normalized HTTP source response {0}")]
     HttpRedirectRefused(#[source] RedirectRefused),
-    #[error("failed to read normalized HTTP quota response body")]
+    #[error("failed to read normalized HTTP source response body")]
     HttpReadFailed(#[source] ReadBoundedError),
     #[error("source did not emit a valid normalized quota snapshot")]
     MalformedSnapshot,
+    #[error("source did not emit a valid normalized resource snapshot")]
+    MalformedResourceSnapshot,
+    #[error(
+        "resource sources only support command/normalized_file/normalized_http, \
+         not this source type"
+    )]
+    UnsupportedResourceSourceType,
 }
 
 /// Collects one normalized quota snapshot for an account's configured
@@ -192,20 +201,32 @@ pub fn collect(source: &SourceConfig) -> Result<QuotaSnapshot> {
     validate_snapshot(snapshot)
 }
 
-fn collect_normalized_file(path: &Path) -> Result<QuotaSnapshot> {
+/// Reads a generic snapshot file's bytes under the shared §7.4 bound. Used
+/// by both the quota (`normalized_file`) and resource (§22.5) collectors --
+/// the two differ only in what they deserialize the bytes into.
+fn read_generic_file_bytes(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path).map_err(|_| GenericSourceError::FileUnreadable {
         path: path.to_owned(),
     })?;
-    let bytes = read_bounded(&mut file, MAX_GENERIC_SOURCE_BYTES).map_err(|source| {
-        GenericSourceError::FileReadFailed {
-            path: path.to_owned(),
-            source,
-        }
-    })?;
+    read_bounded(&mut file, MAX_GENERIC_SOURCE_BYTES)
+        .map_err(|source| {
+            GenericSourceError::FileReadFailed {
+                path: path.to_owned(),
+                source,
+            }
+        })
+        .map_err(Into::into)
+}
+
+fn collect_normalized_file(path: &Path) -> Result<QuotaSnapshot> {
+    let bytes = read_generic_file_bytes(path)?;
     serde_json::from_slice(&bytes).map_err(|_| GenericSourceError::MalformedSnapshot.into())
 }
 
-fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
+/// Runs a generic source command (argv, never shell-interpreted) and reads
+/// its stdout under the shared §7.4 bound. Used by both the quota
+/// (`command`) and resource (§22.5) collectors.
+fn read_generic_command_bytes(argv: &[String]) -> Result<Vec<u8>> {
     let command = argv[0].clone();
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
@@ -244,10 +265,18 @@ fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
     if !status.success() {
         return Err(GenericSourceError::CommandFailed { command }.into());
     }
+    Ok(bytes)
+}
+
+fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
+    let bytes = read_generic_command_bytes(argv)?;
     serde_json::from_slice(&bytes).map_err(|_| GenericSourceError::MalformedSnapshot.into())
 }
 
-fn collect_normalized_http(url: &str, timeout_seconds: u64) -> Result<QuotaSnapshot> {
+/// Issues a generic, non-redirecting, finite-timeout HTTP GET and reads the
+/// response body under the shared §7.4 bound. Used by both the quota
+/// (`normalized_http`) and resource (§22.5) collectors.
+fn read_generic_http_bytes(url: &str, timeout_seconds: u64) -> Result<Vec<u8>> {
     let agent = http_agent(timeout_seconds).map_err(|_| GenericSourceError::InvalidTimeout)?;
     let response = agent
         .get(url)
@@ -255,9 +284,40 @@ fn collect_normalized_http(url: &str, timeout_seconds: u64) -> Result<QuotaSnaps
         .map_err(GenericSourceError::HttpRequestFailed)?;
     let response = reject_redirect(response).map_err(GenericSourceError::HttpRedirectRefused)?;
     let mut reader = response.into_reader();
-    let bytes = read_bounded(&mut reader, MAX_GENERIC_SOURCE_BYTES)
-        .map_err(GenericSourceError::HttpReadFailed)?;
+    read_bounded(&mut reader, MAX_GENERIC_SOURCE_BYTES)
+        .map_err(GenericSourceError::HttpReadFailed)
+        .map_err(Into::into)
+}
+
+fn collect_normalized_http(url: &str, timeout_seconds: u64) -> Result<QuotaSnapshot> {
+    let bytes = read_generic_http_bytes(url, timeout_seconds)?;
     serde_json::from_slice(&bytes).map_err(|_| GenericSourceError::MalformedSnapshot.into())
+}
+
+/// Collects one normalized resource snapshot for a host's configured
+/// resource source (plan.md §22.5). Reuses the same generic
+/// command/normalized_file/normalized_http transport as [`collect`] --
+/// size-bounded, non-shell, finite-timeout, per plan.md §7.4 -- differing
+/// only in the target type and its own §22.4 validation rules. Resource
+/// sources have no meaningful analog for the account-quota-specific
+/// `anthropic_oauth` and `codex_app_server` source types, so those are
+/// rejected rather than silently ignored.
+pub fn collect_resource(source: &SourceConfig) -> Result<ResourceSnapshot> {
+    let bytes = match source {
+        SourceConfig::NormalizedFile { path } => read_generic_file_bytes(path)?,
+        SourceConfig::NormalizedHttp {
+            url,
+            timeout_seconds,
+        } => read_generic_http_bytes(url, *timeout_seconds)?,
+        SourceConfig::Command { argv } => read_generic_command_bytes(argv)?,
+        SourceConfig::AnthropicOauth { .. } | SourceConfig::CodexAppServer { .. } => {
+            return Err(GenericSourceError::UnsupportedResourceSourceType.into());
+        }
+    };
+    let snapshot: ResourceSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|_| GenericSourceError::MalformedResourceSnapshot)?;
+    snapshot.validate()?;
+    Ok(snapshot)
 }
 
 /// Reads at most `limit` bytes from `reader`, failing rather than silently
@@ -1513,5 +1573,204 @@ mod tests {
 
         let error = CodexSourceError::InitializeRejected { code: None };
         assert!(!error.to_string().is_empty());
+    }
+
+    fn resource_snapshot_json() -> &'static str {
+        r#"{
+            "observed_at": "2026-09-28T12:00:00Z",
+            "fresh": true,
+            "host_id": "lab",
+            "cpu_available_fraction": 0.42,
+            "mem_available_mb": 12288,
+            "mem_total_mb": 65536
+        }"#
+    }
+
+    #[test]
+    fn collect_resource_parses_a_valid_file_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resource.json");
+        fs::write(&path, resource_snapshot_json()).unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        let snapshot = collect_resource(&source).unwrap();
+        assert_eq!(snapshot.host_id, "lab");
+        assert_eq!(snapshot.mem_total_mb, 65536);
+    }
+
+    #[test]
+    fn collect_resource_rejects_oversized_file_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        fs::write(&path, vec![b'0'; (MAX_GENERIC_SOURCE_BYTES + 10) as usize]).unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        assert!(collect_resource(&source).is_err());
+    }
+
+    #[test]
+    fn collect_resource_rejects_a_snapshot_failing_model_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resource.json");
+        // mem_available_mb > mem_total_mb: valid JSON, fails
+        // ResourceSnapshot::validate.
+        fs::write(
+            &path,
+            r#"{
+                "observed_at": "2026-09-28T12:00:00Z",
+                "host_id": "lab",
+                "cpu_available_fraction": 0.42,
+                "mem_available_mb": 100,
+                "mem_total_mb": 50
+            }"#,
+        )
+        .unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        assert!(collect_resource(&source).is_err());
+    }
+
+    #[test]
+    fn collect_resource_rejects_an_out_of_range_cpu_fraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resource.json");
+        fs::write(
+            &path,
+            r#"{
+                "observed_at": "2026-09-28T12:00:00Z",
+                "host_id": "lab",
+                "cpu_available_fraction": 1.5,
+                "mem_available_mb": 100,
+                "mem_total_mb": 200
+            }"#,
+        )
+        .unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        assert!(collect_resource(&source).is_err());
+    }
+
+    #[test]
+    fn collect_resource_rejects_a_missing_required_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resource.json");
+        fs::write(
+            &path,
+            r#"{
+                "observed_at": "2026-09-28T12:00:00Z",
+                "host_id": "lab",
+                "cpu_available_fraction": 0.42,
+                "mem_available_mb": 100
+            }"#,
+        )
+        .unwrap();
+
+        let source = SourceConfig::NormalizedFile { path };
+        assert!(collect_resource(&source).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_resource_succeeds_for_a_command_source() {
+        let source = SourceConfig::Command {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf '%s' '{}'", resource_snapshot_json()),
+            ],
+        };
+        let snapshot = collect_resource(&source).unwrap();
+        assert_eq!(snapshot.host_id, "lab");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_resource_rejects_oversized_command_stdout_and_reaps_the_child() {
+        let source = SourceConfig::Command {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "yes | head -c 2000000".to_string(),
+            ],
+        };
+        assert!(collect_resource(&source).is_err());
+    }
+
+    #[test]
+    fn collect_resource_parses_a_valid_http_snapshot() {
+        let (url, handle) = spawn_http_server(resource_snapshot_json().as_bytes().to_vec());
+
+        let source = SourceConfig::NormalizedHttp {
+            url,
+            timeout_seconds: 5,
+        };
+        let snapshot = collect_resource(&source).unwrap();
+        assert_eq!(snapshot.host_id, "lab");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn collect_resource_refuses_a_redirect_instead_of_following_it() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_port = target.local_addr().unwrap().port();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let source = SourceConfig::NormalizedHttp {
+            url: format!("http://127.0.0.1:{port}/"),
+            timeout_seconds: 5,
+        };
+        assert!(
+            collect_resource(&source).is_err(),
+            "a redirect response must be refused, not treated as success"
+        );
+        handle.join().unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            target.accept().is_err(),
+            "the redirect target must never be contacted"
+        );
+    }
+
+    #[test]
+    fn collect_resource_rejects_anthropic_oauth_source_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: dir.path().join("unused.json"),
+            usage_url: unreachable_url("/usage"),
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 1,
+        };
+        let error = collect_resource(&source).unwrap_err();
+        assert!(
+            error.to_string().contains("resource sources only support"),
+            "expected the unsupported-source-type error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn collect_resource_rejects_codex_app_server_source_type() {
+        let source = SourceConfig::CodexAppServer {
+            executable: PathBuf::from("/does/not/matter"),
+            timeout_seconds: 1,
+        };
+        let error = collect_resource(&source).unwrap_err();
+        assert!(
+            error.to_string().contains("resource sources only support"),
+            "expected the unsupported-source-type error, got: {error}"
+        );
     }
 }
