@@ -720,6 +720,103 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // --- WP4 definition of done: "a hung or failed external helper is
+    // bounded, isolated to its account, and cannot be reported as successful
+    // actuation." ---
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_actuation_is_bounded_and_never_reported_as_successful() {
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "sleep 5".to_string()];
+        let start = Instant::now();
+        let result = command_actuator_actuate(&argv, 4, Duration::from_millis(100));
+        assert!(
+            result.is_err(),
+            "a hung actuation must never be reported as success"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a hung actuation must be bounded by the timeout, not the hang"
+        );
+    }
+
+    // plan.md §11.2: "retain the prior state on actuation failure so the
+    // next cycle reconciles." A hung/failed attempt is retried unchanged
+    // (same rendered command, same desired count) once the prior state is
+    // retained -- this exercises that retry end to end (not just the pure
+    // idempotency_token function) to prove the token wiring survives the
+    // hang-and-kill path, not only the happy path.
+    #[cfg(unix)]
+    #[test]
+    fn retrying_an_unchanged_desired_count_after_a_hung_actuation_reuses_the_same_idempotency_token(
+    ) {
+        let dir =
+            std::env::temp_dir().join(format!("subgov-fleet-idem-retry-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let done_marker = dir.join("attempted");
+        let token_marker = dir.join("token");
+        // Always records the token first. The first invocation then hangs
+        // (nothing has attempted yet); the second -- the identical argv and
+        // desired count a retry after retained state produces -- finds the
+        // marker from the first attempt and exits immediately instead.
+        let script = format!(
+            "echo \"$SUBGOV_IDEMPOTENCY_TOKEN\" > {token}; if [ -f {done} ]; then exit 0; else touch {done}; sleep 5; fi",
+            token = token_marker.display(),
+            done = done_marker.display(),
+        );
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+
+        let first = command_actuator_actuate(&argv, 6, Duration::from_millis(100));
+        assert!(
+            first.is_err(),
+            "the hung first attempt must never be reported as success"
+        );
+        let first_token = fs::read_to_string(&token_marker).unwrap();
+
+        let second = command_actuator_actuate(&argv, 6, Duration::from_millis(500));
+        assert!(
+            second.is_ok(),
+            "the retry must succeed once idempotently completed"
+        );
+        let second_token = fs::read_to_string(&token_marker).unwrap();
+
+        assert_eq!(
+            first_token.trim(),
+            second_token.trim(),
+            "an unchanged retry must see the same idempotency token as the hung attempt"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Exercises isolation at the fleet-primitive level: the actuator
+    // functions carry no shared/global state, so a hung actuation for one
+    // account cannot bleed into another's. (Per-account isolation *within a
+    // cycle* -- one account's failure not aborting the others -- is a
+    // main::run_cycle property and is covered by that module's own tests;
+    // this is the fleet-level guarantee that makes it possible.)
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_actuation_does_not_affect_an_independent_actuation() {
+        let dir =
+            std::env::temp_dir().join(format!("subgov-fleet-isolation-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target_path = dir.join("target");
+
+        let hung_argv = vec!["/bin/sh".to_string(), "-c".to_string(), "sleep 5".to_string()];
+        let hung_result = command_actuator_actuate(&hung_argv, 4, Duration::from_millis(100));
+        assert!(hung_result.is_err());
+
+        let working_config =
+            fleet_config_with_actuator(ActuatorConfig::TargetFile { path: target_path.clone() });
+        let outcome = actuate(&working_config, 3, 8).unwrap();
+        assert!(
+            outcome.actuated,
+            "an independent account's actuation must succeed even after another hung"
+        );
+        assert_eq!(fs::read_to_string(&target_path).unwrap().trim(), "8");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn fleet_config_with(
         min_workers: u32,
         max_workers: u32,
