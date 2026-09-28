@@ -111,7 +111,10 @@ governor. See [ADR-0001](../adr/0001-human-controlled-reset-redemption.md).
 
 Reads the normalized JSON contract directly from an HTTP endpoint. This is
 appropriate for a loopback or otherwise access-controlled site-local collector.
-Provider credentials remain outside the governor.
+Provider credentials remain outside the governor. There is no header, token,
+or credential field in this source's configuration at all, by design -- see
+[secure HTTP deployment for the Z.AI collector](zai-collector-http-deployment.md)
+for how to secure the endpoint itself instead.
 
 ### `normalized_file` and `command`
 
