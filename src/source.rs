@@ -892,4 +892,85 @@ mod tests {
         let after = fs::read(&path).unwrap();
         assert_eq!(before, after, "file must be left untouched on discard");
     }
+
+    /// Binds an ephemeral loopback port and immediately releases it, so a
+    /// request against it fails with connection-refused deterministically
+    /// without a mock server.
+    fn unreachable_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}{path}")
+    }
+
+    #[test]
+    fn collect_anthropic_fails_closed_when_credentials_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: dir.path().join("missing.json"),
+            usage_url: unreachable_url("/usage"),
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 1,
+        };
+        assert!(
+            collect(&source).is_err(),
+            "a missing credentials file must surface as Err, never a fabricated snapshot"
+        );
+    }
+
+    #[test]
+    fn collect_anthropic_fails_closed_when_credentials_are_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        fs::write(&path, b"{\"not\": \"oauth\"}").unwrap();
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: path,
+            usage_url: unreachable_url("/usage"),
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 1,
+        };
+        assert!(collect(&source).is_err());
+    }
+
+    #[test]
+    fn collect_anthropic_fails_closed_and_leaves_credentials_untouched_when_refresh_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        // Already past the refresh threshold, so a refresh is required.
+        write_credentials(&path, "expired-access", "refresh-a", 1_000);
+        let before = fs::read(&path).unwrap();
+
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: path.clone(),
+            usage_url: unreachable_url("/usage"),
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 1,
+        };
+        assert!(collect(&source).is_err());
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "a failed token refresh must not modify the credentials file"
+        );
+    }
+
+    #[test]
+    fn collect_anthropic_fails_closed_when_usage_endpoint_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let far_future = Utc::now().timestamp_millis() + 3_600_000;
+        write_credentials(&path, "still-valid", "unused-refresh", far_future);
+
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: path,
+            usage_url: unreachable_url("/usage"),
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 1,
+        };
+        // The token is fresh (no refresh needed), isolating the failure to
+        // the usage request itself -- this must still surface as Err, not an
+        // empty or partial snapshot that could be mistaken for a real one.
+        assert!(collect(&source).is_err());
+    }
 }
