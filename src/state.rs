@@ -122,6 +122,8 @@ impl State {
                 .write(true)
                 .open(&temporary)
                 .with_context(|| format!("failed to create {}", temporary.display()))?;
+            restrict_permissions(&file)
+                .with_context(|| format!("failed to restrict permissions on {}", temporary.display()))?;
             file.write_all(&payload)?;
             file.sync_all()?;
             fs::rename(&temporary, path)
@@ -158,10 +160,27 @@ impl StateLock {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("failed to open lock {}", lock_path.display()))?;
+        restrict_permissions(&file)
+            .with_context(|| format!("failed to restrict permissions on {}", lock_path.display()))?;
         file.try_lock_exclusive()
             .with_context(|| format!("another governor owns {}", lock_path.display()))?;
         Ok(Self { _file: file })
     }
+}
+
+// Applied unconditionally on every open, not just at creation, so a lock
+// file left over from before this restriction existed gets tightened too,
+// not just newly-created ones.
+#[cfg(unix)]
+fn restrict_permissions(file: &File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_file: &File) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -206,6 +225,44 @@ mod tests {
         State::default().save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
         assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_sets_restrictive_mode_on_the_state_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        State::default().save(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acquire_sets_restrictive_mode_on_the_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let _lock = StateLock::acquire(&path).unwrap();
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acquire_tightens_a_preexisting_lock_file_with_looser_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        fs::write(&lock_path, b"").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _lock = StateLock::acquire(&path).unwrap();
+        let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
