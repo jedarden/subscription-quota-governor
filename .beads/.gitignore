@@ -1,0 +1,24 @@
+# Runtime database artifacts (SQLite files and backups)
+*.db
+*.db-shm
+*.db-wal
+*.db.backup.*
+
+# Lock files
+*.lock
+
+# Temporary files
+*.tmp
+*.temp
+
+# Journals
+*.journal
+
+# Runtime directories (traces, diagnostics, receipts)
+traces/
+diagnostics/
+receipts/
+
+# Runtime event logs (root-level JSONL files)
+events.jsonl
+heartbeats.jsonl
