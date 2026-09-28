@@ -127,7 +127,7 @@ source type:
   self-resolves next cycle without operator action -- it is deliberately
   skipped rather than risking a clobbered refresh. A credential that is
   actually expired or invalid is a different, non-transient condition --
-  see the authentication-expiry runbook (not yet published in this index).
+  see the [authentication-expiry runbook](authentication-expiry.md).
 - **`codex_app_server`**: the configured Codex executable is missing,
   crashed, or failed the app-server handshake within its timeout.
 
