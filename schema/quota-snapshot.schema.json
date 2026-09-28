@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.ardenone.com/jedarden/subscription-quota-governor/raw/branch/main/schema/quota-snapshot.schema.json",
+  "title": "Normalized quota snapshot",
+  "description": "The §6 normalized quota contract every subgov source (native or generic) must emit. Mirrors QuotaSnapshot/QuotaWindow in src/model.rs and the extra checks in validate_snapshot() (src/source.rs). additionalProperties is left open everywhere because the Rust structs do not use #[serde(deny_unknown_fields)] -- an unrecognized field is ignored, not rejected, and this schema must not be stricter than the deserializer it documents. Non-finite numbers (NaN/Infinity) cannot appear here at all: JSON's own number grammar has no token for them, so 'finite' is enforced by using JSON at all, not by a schema keyword.",
+  "type": "object",
+  "required": ["observed_at", "windows"],
+  "additionalProperties": true,
+  "properties": {
+    "observed_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$",
+      "description": "When the provider data was obtained, not when the controller happens to read a cache. RFC 3339. The pattern backstops 'format' for validators that treat format as annotation-only."
+    },
+    "fresh": {
+      "type": "boolean",
+      "default": true,
+      "description": "The source's own freshness judgment. Optional -- missing defaults to true, matching #[serde(default = \"default_true\")] on QuotaSnapshot::fresh. The controller separately enforces its own configured maximum age."
+    },
+    "windows": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Every active consumption limit relevant to the account. An empty array is invalid, not unlimited capacity (§6.1). `id` must be unique within this array (§6.2); JSON Schema has no portable keyword for uniqueness of a single property across array items, so this constraint is documented here but not mechanically enforced by this schema -- verify it separately (subgov-bbe7889c tracks the matching gap in validate_snapshot()).",
+      "items": { "$ref": "#/$defs/window" }
+    },
+    "reset_credits": { "$ref": "#/$defs/resetCreditsSnapshot" }
+  },
+  "$defs": {
+    "window": {
+      "type": "object",
+      "required": ["id", "used_fraction", "resets_at"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable within one source and account; need not be globally unique. Empty string is rejected the same way validate_snapshot() rejects it."
+        },
+        "used_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Finite and inclusive in [0, 1], checked by validate_snapshot()."
+        },
+        "resets_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$",
+          "description": "Absolute UTC timestamp, RFC 3339. Missing or unparsable fails the snapshot."
+        },
+        "duration_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional metadata; pacing depends on resets_at, not this field."
+        },
+        "reached": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit provider signal. The controller also treats used_fraction >= target as binding."
+        }
+      }
+    },
+    "resetCreditsSnapshot": {
+      "type": "object",
+      "required": ["available_count"],
+      "additionalProperties": true,
+      "description": "Earned, one-shot rate-limit resets attached to an account. available_count is authoritative; a caller must not infer the total balance from the number of `credits` detail rows.",
+      "properties": {
+        "available_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "credits": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/resetCredit" }
+        }
+      }
+    },
+    "resetCredit": {
+      "type": "object",
+      "required": ["id", "status"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Rejected when empty after trimming, matching validate_snapshot()'s credit.id.trim().is_empty() check -- the pattern requires at least one non-whitespace character."
+        },
+        "reset_type": { "type": "string" },
+        "status": { "type": "string" },
+        "granted_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+        },
+        "title": { "type": "string" },
+        "description": { "type": "string" }
+      }
+    }
+  },
+  "examples": [
+    {
+      "observed_at": "2026-09-12T12:00:00Z",
+      "fresh": true,
+      "windows": [
+        {
+          "id": "weekly",
+          "used_fraction": 0.42,
+          "resets_at": "2026-09-17T00:00:00Z",
+          "duration_minutes": 10080,
+          "reached": false
+        }
+      ]
+    }
+  ]
+}
