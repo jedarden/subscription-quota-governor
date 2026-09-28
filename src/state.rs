@@ -43,7 +43,7 @@ impl Default for State {
 /// that bounds memory and disk without deciding the final number.
 const MAX_HISTORY_SAMPLES_PER_GENERATION: usize = 16;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct AccountState {
     #[serde(default)]
     pub windows: BTreeMap<String, WindowSample>,
@@ -56,7 +56,7 @@ pub struct AccountState {
     pub history: BTreeMap<String, WindowHistory>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct WindowSample {
     pub observed_at: DateTime<Utc>,
     pub used_fraction: f64,
@@ -65,13 +65,13 @@ pub struct WindowSample {
 }
 
 /// A bounded run of samples sharing one reset generation.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct WindowHistory {
     pub resets_at: DateTime<Utc>,
     pub samples: VecDeque<HistorySample>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct HistorySample {
     pub observed_at: DateTime<Utc>,
     pub used_fraction: f64,

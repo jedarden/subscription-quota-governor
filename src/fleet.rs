@@ -25,9 +25,22 @@ pub trait Observer {
 ///
 /// Implemented by the baseline `none`/`target_file`/`command` adapters and by
 /// in-memory test doubles that stand in for them in controller-cycle and
-/// integration tests.
+/// integration tests. The signature takes only the desired count: plan.md
+/// §11.2's "pass no quota or credential data into actuator arguments" is
+/// enforced structurally here, not by convention -- there is no parameter an
+/// implementation could pass such data through even if it wanted to.
 pub trait Actuator {
     fn actuate(&self, desired: u32) -> Result<()>;
+}
+
+/// The observable outcome of one actuation decision (plan.md §11.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActuationOutcome {
+    /// Whether the actuator was actually invoked. `false` when `desired`
+    /// equals `observed` (nothing to reconcile) or when the configured
+    /// actuator is `none` (mutation is deliberately disabled), even though
+    /// those two cases differ in whether there was something to do.
+    pub actuated: bool,
 }
 
 /// Builds the concrete `Observer` described by an account's fleet config.
@@ -72,8 +85,29 @@ fn reconcile_observed_range(observed: u32, config: &FleetConfig) -> Result<u32> 
     }
 }
 
-pub fn actuate(config: &FleetConfig, desired: u32) -> Result<()> {
-    actuator_for(&config.actuator).actuate(desired)
+/// Actuates a fleet toward `desired`, applying plan.md §11.2's policy:
+///
+/// - skip invocation entirely when `desired == observed` (nothing to do);
+/// - always report `actuated: false` for the `none` actuator, even when
+///   `desired` differs from `observed`.
+///
+/// A caller that only wants to *observe* (e.g. `run --observe-only`) should
+/// not call this function at all rather than rely on it to no-op, since that
+/// is a runtime/CLI policy distinct from the fleet-level rules enforced
+/// here.
+///
+/// On `Err`, no actuation happened (or a partial one failed) and the caller
+/// must not treat this cycle's observation as authoritative -- retaining
+/// whatever state it already holds is what lets the next cycle reconcile.
+pub fn actuate(config: &FleetConfig, observed: u32, desired: u32) -> Result<ActuationOutcome> {
+    if desired == observed {
+        return Ok(ActuationOutcome { actuated: false });
+    }
+    if matches!(config.actuator, ActuatorConfig::None) {
+        return Ok(ActuationOutcome { actuated: false });
+    }
+    actuator_for(&config.actuator).actuate(desired)?;
+    Ok(ActuationOutcome { actuated: true })
 }
 
 struct StaticObserver {
@@ -422,5 +456,51 @@ mod tests {
         assert_eq!(current_workers(&over).unwrap(), 10);
         let under = fleet_config_with(1, 10, ObserverReconciliation::Clamp, 0);
         assert_eq!(current_workers(&under).unwrap(), 1);
+    }
+
+    fn fleet_config_with_actuator(actuator: ActuatorConfig) -> FleetConfig {
+        let mut config = fleet_config_with(1, 10, ObserverReconciliation::Strict, 5);
+        config.actuator = actuator;
+        config
+    }
+
+    #[test]
+    fn actuate_skips_invocation_when_desired_equals_observed() {
+        // A command actuator pointed at a binary that does not exist:
+        // if `actuate` invoked it, this would fail to spawn and return Err.
+        // Returning Ok with actuated:false proves the invocation was
+        // skipped, not merely that it happened to succeed.
+        let config = fleet_config_with_actuator(ActuatorConfig::Command {
+            argv: vec!["/nonexistent/subgov-test-actuator".to_string()],
+        });
+        let outcome = actuate(&config, 5, 5).unwrap();
+        assert!(!outcome.actuated);
+    }
+
+    #[test]
+    fn actuate_reports_not_actuated_for_none_even_when_desired_differs() {
+        let config = fleet_config_with_actuator(ActuatorConfig::None);
+        let outcome = actuate(&config, 3, 8).unwrap();
+        assert!(!outcome.actuated);
+    }
+
+    #[test]
+    fn actuate_invokes_and_reports_actuated_when_desired_differs_and_actuator_is_not_none() {
+        let dir = std::env::temp_dir().join(format!("subgov-fleet-actuate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target");
+        let config = fleet_config_with_actuator(ActuatorConfig::TargetFile { path: path.clone() });
+        let outcome = actuate(&config, 3, 8).unwrap();
+        assert!(outcome.actuated);
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "8");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn actuate_propagates_a_real_actuation_failure() {
+        let config = fleet_config_with_actuator(ActuatorConfig::Command {
+            argv: vec!["/nonexistent/subgov-test-actuator".to_string()],
+        });
+        assert!(actuate(&config, 3, 8).is_err());
     }
 }

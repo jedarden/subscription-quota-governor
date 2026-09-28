@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use subscription_governor::config::{ActuatorConfig, Config};
+use subscription_governor::config::Config;
 use subscription_governor::controller::{evaluate, Decision};
 use subscription_governor::fleet;
 use subscription_governor::source;
@@ -481,13 +481,13 @@ fn run_cycle(
             let decision = evaluate(name, account_config, &snapshot, &prior, workers, Utc::now())
                 .map_err(AccountFailure::Observation)?;
 
-            let changed = decision.desired_workers != workers;
-            let has_actuator = !matches!(&account_config.fleet.actuator, ActuatorConfig::None);
-            let actuated = changed && !observe_only && has_actuator;
-            if actuated {
-                fleet::actuate(&account_config.fleet, decision.desired_workers)
-                    .map_err(AccountFailure::Actuation)?;
-            }
+            let actuated = if observe_only {
+                false
+            } else {
+                fleet::actuate(&account_config.fleet, workers, decision.desired_workers)
+                    .map_err(AccountFailure::Actuation)?
+                    .actuated
+            };
             println!(
                 "{}",
                 serde_json::to_string(&json!({
@@ -590,8 +590,8 @@ mod shutdown_tests {
     use super::*;
     use std::collections::BTreeMap;
     use subscription_governor::config::{
-        AccountConfig, BankedResetConfig, FleetConfig, ObserverReconciliation, SourceConfig,
-        StaleBehavior, Strategy, UtilizationConfig, WorkerObserverConfig,
+        AccountConfig, ActuatorConfig, BankedResetConfig, FleetConfig, ObserverReconciliation,
+        SourceConfig, StaleBehavior, Strategy, UtilizationConfig, WorkerObserverConfig,
     };
 
     fn account_config(path: PathBuf) -> AccountConfig {
@@ -693,8 +693,8 @@ mod exit_code_tests {
     use std::collections::BTreeMap;
     use std::fs;
     use subscription_governor::config::{
-        AccountConfig, BankedResetConfig, FleetConfig, ObserverReconciliation, SourceConfig,
-        StaleBehavior, Strategy, UtilizationConfig, WorkerObserverConfig,
+        AccountConfig, ActuatorConfig, BankedResetConfig, FleetConfig, ObserverReconciliation,
+        SourceConfig, StaleBehavior, Strategy, UtilizationConfig, WorkerObserverConfig,
     };
 
     #[test]
@@ -767,6 +767,44 @@ mod exit_code_tests {
         let outcome = run_cycle(&config, &mut state, false, &shutdown);
         assert_eq!(outcome.actuation_failures, 1);
         assert_eq!(outcome.observation_failures, 0);
+    }
+
+    // plan.md §11.2: "retain the prior state on actuation failure so the
+    // next cycle reconciles." A failed actuation must not let this cycle's
+    // (unactuated) observation overwrite the account's recorded state,
+    // since the next cycle needs the old state to know what actually
+    // happened last time, not what this cycle merely intended.
+    #[test]
+    fn run_cycle_retains_prior_account_state_on_actuation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("snapshot.json");
+        let snapshot = json!({
+            "observed_at": Utc::now(),
+            "fresh": true,
+            "windows": [
+                {"id": "five_hour", "used_fraction": 0.1, "resets_at": Utc::now() + chrono::Duration::hours(2)},
+            ],
+        });
+        fs::write(&snapshot_path, snapshot.to_string()).unwrap();
+
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            "a".to_string(),
+            account_config_with_failing_actuator(snapshot_path),
+        );
+        let config = Config {
+            version: 1,
+            poll_interval_seconds: 300,
+            state_path: None,
+            accounts,
+        };
+        let mut state = State::default();
+        let prior = subscription_governor::state::AccountState::default();
+        state.accounts.insert("a".to_string(), prior.clone());
+        let shutdown = AtomicBool::new(false);
+        let outcome = run_cycle(&config, &mut state, false, &shutdown);
+        assert_eq!(outcome.actuation_failures, 1);
+        assert_eq!(state.accounts.get("a"), Some(&prior));
     }
 }
 
