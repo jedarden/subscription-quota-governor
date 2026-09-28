@@ -10,6 +10,13 @@ repository = "https://git.ardenone.com/jedarden/subscription-quota-governor"
 name = "subgov"
 path = "src/main.rs"
 
+# Scripted stdio JSON-RPC fake for the Codex app-server contract tests
+# (plan.md §7.2). Test-only support, not part of the shipped product --
+# lives under tests/support/ rather than src/bin/ for that reason.
+[[bin]]
+name = "fake_codex_app_server"
+path = "tests/support/fake_codex_app_server.rs"
+
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
