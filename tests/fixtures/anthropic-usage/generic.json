@@ -1,0 +1,16 @@
+{
+  "limits": [
+    {
+      "kind": "five_hour",
+      "percent": 33.5,
+      "resets_at": "2026-09-28T17:00:00Z",
+      "is_active": true
+    },
+    {
+      "kind": "seven_day",
+      "percent": 70.0,
+      "resets_at": "2026-10-03T00:00:00Z",
+      "is_active": true
+    }
+  ]
+}

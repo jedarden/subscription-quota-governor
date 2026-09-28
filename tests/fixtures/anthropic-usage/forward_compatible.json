@@ -1,0 +1,19 @@
+{
+  "five_hour": {
+    "utilization": 18.0,
+    "resets_at": "2026-09-28T17:00:00Z",
+    "is_active": true
+  },
+  "limits": [
+    {
+      "kind": "monthly_bonus_pool",
+      "percent": 40.0,
+      "resets_at": "2026-11-01T00:00:00Z",
+      "is_active": true
+    }
+  ],
+  "account_tier": "unspecified",
+  "future_feature_flags": {
+    "some_new_thing": true
+  }
+}

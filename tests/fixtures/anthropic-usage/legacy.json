@@ -1,0 +1,17 @@
+{
+  "five_hour": {
+    "utilization": 22.5,
+    "resets_at": "2026-09-28T17:00:00Z",
+    "is_active": true
+  },
+  "seven_day": {
+    "utilization": 61.0,
+    "resets_at": "2026-10-03T00:00:00Z",
+    "is_active": true
+  },
+  "weekly_scoped": {
+    "utilization": 8.25,
+    "resets_at": "2026-10-03T00:00:00Z",
+    "is_active": true
+  }
+}

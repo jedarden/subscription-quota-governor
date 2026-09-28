@@ -1,0 +1,15 @@
+{
+  "weekly_scoped": {
+    "utilization": 12.0,
+    "resets_at": "2026-10-03T00:00:00Z",
+    "is_active": true
+  },
+  "limits": [
+    {
+      "kind": "weekly_scoped",
+      "percent": 46.5,
+      "resets_at": "2026-10-03T06:00:00Z",
+      "is_active": true
+    }
+  ]
+}
