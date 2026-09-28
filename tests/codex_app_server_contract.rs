@@ -1,19 +1,27 @@
 //! Contract tests for the Codex app-server source (plan.md §7.2), driven
 //! against the scripted fake in `tests/support/fake_codex_app_server.rs`
 //! instead of a real Codex installation. Exercises the handshake,
-//! interleaved notifications, timeout, child-exit, sparse-window, and
-//! protocol-error cases named in that section's build requirements.
+//! interleaved notifications, timeout, child-exit, sparse-window,
+//! protocol-error, and supervised-session-reuse/respawn cases named in that
+//! section's build requirements.
 //!
 //! Every test goes through the same public entry point production code
 //! uses (`subscription_governor::source::collect`), so this is a true
-//! end-to-end contract test of `collect_codex`/`read_codex_rate_limits`,
-//! not a unit test of an internal helper.
+//! end-to-end contract test of `collect_codex`/`with_codex_session`, not a
+//! unit test of an internal helper.
+//!
+//! Codex sessions are supervised and kept alive across `collect()` calls
+//! (a process-wide cache keyed by executable path), so most tests here call
+//! `shutdown_codex_sessions()` first to guarantee a fresh spawn against
+//! their own script rather than reusing another test's leftover session.
+//! The reuse/respawn tests deliberately skip that reset, since proving
+//! session persistence across calls is their entire point.
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use subscription_governor::config::SourceConfig;
-use subscription_governor::source::collect;
+use subscription_governor::source::{collect, shutdown_codex_sessions};
 
 fn fake_codex_executable() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fake_codex_app_server"))
@@ -66,12 +74,16 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Runs `FAKE_CODEX_SCRIPT=path collect(&source)` with the env var scoped to
 /// this call only, serialized against other tests in this binary via
-/// [`ENV_LOCK`].
+/// [`ENV_LOCK`]. Resets the supervised Codex session cache first, so this
+/// call always spawns a fresh app-server against its own script rather than
+/// reusing a session another test (or an earlier call in this same test)
+/// left alive.
 fn collect_with_script(
     source: &SourceConfig,
     script_path: &std::path::Path,
 ) -> anyhow::Result<subscription_governor::model::QuotaSnapshot> {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    shutdown_codex_sessions();
     std::env::set_var("FAKE_CODEX_SCRIPT", script_path);
     let result = collect(source);
     std::env::remove_var("FAKE_CODEX_SCRIPT");
@@ -248,5 +260,148 @@ fn a_protocol_error_on_rate_limits_read_is_reported_without_leaking_its_message(
     assert!(
         !rendered.contains("hunter2-super-secret"),
         "the provider-controlled error message must never leak into our error text: {rendered}"
+    );
+}
+
+fn single_rate_limits_frame(id: i64, used_percent: f64) -> Value {
+    json!({
+        "id": id,
+        "result": {
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {"usedPercent": used_percent, "windowDurationMins": 300, "resetsAt": 2_000_000_000_i64}
+                }
+            }
+        }
+    })
+}
+
+/// Runs `collect(&source)` `polls` times in a row under one `FAKE_CODEX_SCRIPT`
+/// value, holding [`ENV_LOCK`] for the whole sequence (not just one call) so
+/// no other test's `shutdown_codex_sessions()` can slip in between polls and
+/// evict the session this test is trying to prove gets reused. Starts from
+/// (and leaves behind) a clean session cache.
+fn collect_multiple_times_holding_session(
+    source: &SourceConfig,
+    script_path: &std::path::Path,
+    polls: usize,
+) -> Vec<anyhow::Result<subscription_governor::model::QuotaSnapshot>> {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    shutdown_codex_sessions();
+    std::env::set_var("FAKE_CODEX_SCRIPT", script_path);
+    let results = (0..polls).map(|_| collect(source)).collect();
+    std::env::remove_var("FAKE_CODEX_SCRIPT");
+    shutdown_codex_sessions();
+    results
+}
+
+#[test]
+fn a_second_poll_reuses_the_same_session_instead_of_respawning() {
+    // Exactly one initialize/initialized handshake, followed by two
+    // account/rateLimits/read round trips with distinct responses and
+    // continuing JSON-RPC ids (2, then 3). A client that (incorrectly)
+    // spawned a fresh session for the second poll would either receive
+    // round 1's data again (a fresh session replays the same script from
+    // its own handshake) or fail waiting on id 3, which its own fresh
+    // handshake would never generate (a new session's first request is
+    // id 2) -- either way distinguishable from true reuse.
+    let steps = vec![
+        read_step(),
+        write_step(json!({"id": 1, "result": {}})),
+        read_step(),
+        read_step(),
+        write_step(single_rate_limits_frame(2, 10.0)),
+        read_step(),
+        write_step(single_rate_limits_frame(3, 90.0)),
+    ];
+    let (source, script) = scripted_source(&steps, 5);
+
+    let results = collect_multiple_times_holding_session(&source, &script, 2);
+    assert_eq!(results.len(), 2);
+    let first = results[0].as_ref().expect("first poll should succeed");
+    assert_eq!(first.windows[0].used_fraction, 0.10);
+
+    let second = results[1].as_ref().expect(
+        "second poll should reuse the live session instead of failing while waiting on a \
+         request id a fresh session's own handshake would never generate",
+    );
+    assert_eq!(
+        second.windows[0].used_fraction, 0.90,
+        "the second poll must receive round 2's distinct data, proving the session (and its \
+         continuing JSON-RPC id sequence) was reused rather than a fresh session replaying the \
+         script from its own handshake"
+    );
+}
+
+#[test]
+fn a_dead_session_is_respawned_transparently_for_the_next_poll() {
+    // The first session answers one round, then the app-server process
+    // exits -- simulating a Codex app-server that died between polls.
+    let dies_after_round_one = vec![
+        read_step(),
+        write_step(json!({"id": 1, "result": {}})),
+        read_step(),
+        read_step(),
+        write_step(single_rate_limits_frame(2, 20.0)),
+        json!({"action": "exit", "code": 0}),
+    ];
+    // The respawned session's own fresh handshake and first round.
+    let respawned_session = vec![
+        read_step(),
+        write_step(json!({"id": 1, "result": {}})),
+        read_step(),
+        read_step(),
+        write_step(single_rate_limits_frame(2, 55.0)),
+    ];
+
+    let source = SourceConfig::CodexAppServer {
+        executable: fake_codex_executable(),
+        timeout_seconds: 5,
+    };
+    let mut first_script = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(
+        &mut first_script,
+        &serde_json::to_vec(&dies_after_round_one).unwrap(),
+    )
+    .unwrap();
+    let first_script_path = first_script.into_temp_path();
+
+    let mut second_script = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(
+        &mut second_script,
+        &serde_json::to_vec(&respawned_session).unwrap(),
+    )
+    .unwrap();
+    let second_script_path = second_script.into_temp_path();
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    shutdown_codex_sessions();
+
+    std::env::set_var("FAKE_CODEX_SCRIPT", &first_script_path);
+    let first = collect(&source);
+    assert_eq!(
+        first.expect("first poll should succeed").windows[0].used_fraction,
+        0.20
+    );
+
+    // Give the app-server's `exit` step a moment to actually terminate the
+    // process before the next poll probes the (now-dead) session, so the
+    // test deterministically exercises the failure path instead of racing
+    // the timeout window.
+    std::thread::sleep(Duration::from_millis(200));
+
+    std::env::set_var("FAKE_CODEX_SCRIPT", &second_script_path);
+    let second = collect(&source);
+    std::env::remove_var("FAKE_CODEX_SCRIPT");
+    shutdown_codex_sessions();
+
+    let second = second.expect(
+        "a dead session must be transparently respawned on the next poll, not surfaced as a \
+         permanent failure",
+    );
+    assert_eq!(
+        second.windows[0].used_fraction, 0.55,
+        "the respawned session must run its own fresh handshake against the new script, not \
+         reuse stale state from the dead session"
     );
 }

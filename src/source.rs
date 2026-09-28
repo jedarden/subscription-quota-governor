@@ -4,12 +4,13 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use fs2::FileExt;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -634,11 +635,86 @@ fn parse_anthropic_limit(id: &str, value: &Value) -> Option<QuotaWindow> {
 }
 
 fn collect_codex(executable: &Path, timeout_seconds: u64) -> Result<QuotaSnapshot> {
-    let result = read_codex_rate_limits(executable, timeout_seconds)?;
+    let result = with_codex_session(executable, timeout_seconds)?;
     parse_codex_rate_limits(&result, Utc::now())
 }
 
-fn read_codex_rate_limits(executable: &Path, timeout_seconds: u64) -> Result<Value> {
+/// Every live, handshaked Codex app-server session, keyed by executable
+/// path and kept alive for the lifetime of this process (plan.md §7.2:
+/// "Replace per-poll process startup with a supervised long-lived
+/// session"). A single global map is safe here because `run_cycle` in
+/// `main.rs` polls accounts one at a time on one thread; the `Mutex` exists
+/// for soundness (interior mutability of a `static`) and test-thread
+/// safety, not to guard real contention.
+static CODEX_SESSIONS: OnceLock<Mutex<HashMap<PathBuf, CodexSession>>> = OnceLock::new();
+
+fn codex_sessions() -> &'static Mutex<HashMap<PathBuf, CodexSession>> {
+    CODEX_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Terminates and forgets every live supervised Codex session. Available for
+/// a caller's orderly shutdown path, so a kept-alive app-server child does
+/// not outlive the governor process, and for test isolation, since sessions
+/// are cached process-wide rather than per-call.
+pub fn shutdown_codex_sessions() {
+    if let Some(sessions) = CODEX_SESSIONS.get() {
+        let mut guard = sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clear();
+    }
+}
+
+/// Sends `account/rateLimits/read` on the executable's existing session if
+/// one is live, transparently spawning and handshaking a fresh session
+/// first if there is none yet or the existing one just failed. This is the
+/// "supervised" half of §7.2: one broken session (the app-server exited,
+/// the pipe broke, a request timed out) causes one respawn on the next
+/// poll, not a permanent failure for every poll after it.
+fn with_codex_session(executable: &Path, timeout_seconds: u64) -> Result<Value> {
+    let sessions = codex_sessions();
+    let mut guard = sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(session) = guard.get_mut(executable) {
+        match codex_session_read_rate_limits(session, timeout_seconds) {
+            Ok(value) => return Ok(value),
+            Err(_) => {
+                // The cached session is no longer usable; drop it (its Drop
+                // impl kills the child) and fall through to respawn.
+                guard.remove(executable);
+            }
+        }
+    }
+
+    let mut session = spawn_and_handshake_codex(executable, timeout_seconds)?;
+    let value = codex_session_read_rate_limits(&mut session, timeout_seconds)?;
+    guard.insert(executable.to_owned(), session);
+    Ok(value)
+}
+
+/// A live Codex app-server child past the `initialize`/`initialized`
+/// handshake, ready for repeated `account/rateLimits/read` requests across
+/// polls. `next_id` continues incrementing across calls so JSON-RPC ids stay
+/// unique for the life of the session, not just within one poll.
+struct CodexSession {
+    child: ChildGuard,
+    stdin: ChildStdin,
+    receiver: mpsc::Receiver<Value>,
+    reader: Option<JoinHandle<()>>,
+    next_id: i64,
+}
+
+impl Drop for CodexSession {
+    fn drop(&mut self) {
+        // Explicit kill before joining: this Drop runs before the compiler's
+        // automatic field drops, so without this the reader thread could be
+        // joined while the child (and thus its stdout) is still alive.
+        self.child.terminate();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn spawn_and_handshake_codex(executable: &Path, timeout_seconds: u64) -> Result<CodexSession> {
     let child = Command::new(executable)
         .args(["app-server", "--listen", "stdio://"])
         .stdin(Stdio::piped())
@@ -649,16 +725,8 @@ fn read_codex_rate_limits(executable: &Path, timeout_seconds: u64) -> Result<Val
             path: executable.to_owned(),
         })?;
     let mut child = ChildGuard(child);
-    let mut stdin = child
-        .0
-        .stdin
-        .take()
-        .ok_or(CodexSourceError::NoStdin)?;
-    let stdout = child
-        .0
-        .stdout
-        .take()
-        .ok_or(CodexSourceError::NoStdout)?;
+    let stdin = child.0.stdin.take().ok_or(CodexSourceError::NoStdin)?;
+    let stdout = child.0.stdout.take().ok_or(CodexSourceError::NoStdout)?;
     let (sender, receiver) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -675,36 +743,51 @@ fn read_codex_rate_limits(executable: &Path, timeout_seconds: u64) -> Result<Val
         }
     });
 
+    let mut session = CodexSession {
+        child,
+        stdin,
+        receiver,
+        reader: Some(reader),
+        next_id: 1,
+    };
+
+    let initialize_id = session.next_id;
+    session.next_id += 1;
     let initialize = json!({
-        "id": 1,
+        "id": initialize_id,
         "method": "initialize",
         "params": {"clientInfo": {"name": "subscription-governor", "version": "0.1.0"}}
     });
-    writeln!(stdin, "{initialize}").map_err(CodexSourceError::WriteFailed)?;
-    stdin.flush().map_err(CodexSourceError::WriteFailed)?;
-    let initialized = receive_response(&receiver, 1, timeout_seconds)
+    writeln!(session.stdin, "{initialize}").map_err(CodexSourceError::WriteFailed)?;
+    session.stdin.flush().map_err(CodexSourceError::WriteFailed)?;
+    let initialized = receive_response(&session.receiver, initialize_id, timeout_seconds)
         .map_err(|_| CodexSourceError::InitializeTimedOut)?;
     if let Some(error) = initialized.get("error") {
         let code = error.get("code").and_then(Value::as_i64);
-        child.terminate();
-        let _ = reader.join();
+        // `session` drops here (its own Drop terminates the half-
+        // initialized child and joins the reader).
         return Err(CodexSourceError::InitializeRejected { code }.into());
     }
 
-    writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}))
+    writeln!(session.stdin, "{}", json!({"method": "initialized", "params": {}}))
         .map_err(CodexSourceError::WriteFailed)?;
+    session.stdin.flush().map_err(CodexSourceError::WriteFailed)?;
+
+    Ok(session)
+}
+
+fn codex_session_read_rate_limits(session: &mut CodexSession, timeout_seconds: u64) -> Result<Value> {
+    let id = session.next_id;
+    session.next_id += 1;
     writeln!(
-        stdin,
+        session.stdin,
         "{}",
-        json!({"id": 2, "method": "account/rateLimits/read"})
+        json!({"id": id, "method": "account/rateLimits/read"})
     )
     .map_err(CodexSourceError::WriteFailed)?;
-    stdin.flush().map_err(CodexSourceError::WriteFailed)?;
-    let response = receive_response(&receiver, 2, timeout_seconds);
-    drop(stdin);
-    child.terminate();
-    let _ = reader.join();
-    let response = response.map_err(|_| CodexSourceError::RateLimitsTimedOut)?;
+    session.stdin.flush().map_err(CodexSourceError::WriteFailed)?;
+    let response = receive_response(&session.receiver, id, timeout_seconds)
+        .map_err(|_| CodexSourceError::RateLimitsTimedOut)?;
     if let Some(error) = response.get("error") {
         let code = error.get("code").and_then(Value::as_i64);
         return Err(CodexSourceError::RateLimitsRejected { code }.into());
