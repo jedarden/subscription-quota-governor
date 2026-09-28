@@ -1,16 +1,17 @@
 use crate::config::SourceConfig;
 use crate::model::{QuotaSnapshot, QuotaWindow, ResetCredit, ResetCreditsSnapshot};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+use thiserror::Error;
 
 const REFRESH_THRESHOLD_MILLIS: i64 = 300_000;
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -19,6 +20,145 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// v1."). A normalized quota snapshot is a small JSON document, so this is
 /// generous headroom rather than a tight budget.
 const MAX_GENERIC_SOURCE_BYTES: u64 = 1024 * 1024;
+
+/// A 3xx response encountered where redirects are disabled. `Display`
+/// includes only the response's own status code and the requested URL --
+/// both operator-configured or protocol-level facts, never response
+/// content -- so it is safe to chain into any source family's error.
+#[derive(Debug, Error)]
+#[error("refused a {status} redirect from {url} (redirects are disabled for this source)")]
+pub struct RedirectRefused {
+    status: u16,
+    url: String,
+}
+
+/// A source read (command stdout, a snapshot file, or an HTTP body)
+/// stopped early. `Display` never includes the bytes read -- only the
+/// byte-count limit or a safe I/O error -- per plan.md §14 requirement 8.
+#[derive(Debug, Error)]
+pub enum ReadBoundedError {
+    #[error("failed to read source output")]
+    Io(#[source] std::io::Error),
+    #[error("source output exceeded the {limit}-byte maximum")]
+    TooLarge { limit: u64 },
+}
+
+/// Errors from the Claude Code / Anthropic OAuth native source (plan.md
+/// §7.1). Every variant's `Display` is built only from a path, a field
+/// name, a status code, or literal text -- never a token, credential, or
+/// raw provider response body -- per plan.md §14 requirement 8: "Error
+/// types carry safe classifications; raw response bodies remain local to
+/// parsers and are discarded."
+#[derive(Debug, Error)]
+pub enum AnthropicSourceError {
+    #[error("HTTP source timeout_seconds must be greater than zero")]
+    InvalidTimeout,
+    #[error("failed to open Claude Code credentials {path} for locking")]
+    CredentialsUnopenable { path: PathBuf },
+    #[error(
+        "failed to lock Claude Code credentials {path} (a concurrent writer may be holding it)"
+    )]
+    Locked { path: PathBuf },
+    #[error("failed to read or parse Claude Code credentials {path}")]
+    CredentialsUnreadable { path: PathBuf },
+    #[error("Claude Code credentials {path} are missing required field `{field}`")]
+    MissingField { path: PathBuf, field: &'static str },
+    #[error(
+        "Claude Code credentials {path} were refreshed by another process during this poll; \
+         skipping this cycle rather than overwriting a concurrent refresh"
+    )]
+    ConcurrentRefresh { path: PathBuf },
+    #[error("Anthropic token refresh request failed")]
+    RefreshRequestFailed(#[source] ureq::Error),
+    #[error("Anthropic token refresh {0}")]
+    RefreshRedirectRefused(#[source] RedirectRefused),
+    #[error("Anthropic token refresh response is missing required field `{field}`")]
+    RefreshResponseMissingField { field: &'static str },
+    #[error("Anthropic token refresh response was not valid JSON")]
+    RefreshResponseMalformed,
+    #[error("failed to write refreshed Claude Code credentials {path}")]
+    CredentialsWriteFailed { path: PathBuf },
+    #[error("Anthropic usage request failed")]
+    UsageRequestFailed(#[source] ureq::Error),
+    #[error("Anthropic usage response {0}")]
+    UsageRedirectRefused(#[source] RedirectRefused),
+    #[error("Anthropic usage response was not valid JSON")]
+    UsageResponseMalformed,
+    #[error("Anthropic usage response did not contain a usable quota snapshot")]
+    UsageEmpty,
+}
+
+/// Errors from the Codex app-server native source (plan.md §7.2). A
+/// JSON-RPC error's numeric `code` (a small standard integer) is safe to
+/// surface; its `message`/`data` fields are provider-controlled text and
+/// are deliberately discarded rather than included in `Display`, per
+/// plan.md §14 requirement 8.
+#[derive(Debug, Error)]
+pub enum CodexSourceError {
+    #[error("failed to start {path} app-server")]
+    SpawnFailed { path: PathBuf },
+    #[error("Codex app-server has no stdin")]
+    NoStdin,
+    #[error("Codex app-server has no stdout")]
+    NoStdout,
+    #[error("failed to write to the Codex app-server")]
+    WriteFailed(#[source] std::io::Error),
+    #[error("timed out initializing the Codex app-server")]
+    InitializeTimedOut,
+    #[error("Codex app-server rejected initialization (code {code:?})")]
+    InitializeRejected { code: Option<i64> },
+    #[error("timed out reading Codex rate limits")]
+    RateLimitsTimedOut,
+    #[error("Codex app-server response channel closed unexpectedly")]
+    ChannelClosed,
+    #[error("Codex app-server rejected the rate-limit request (code {code:?})")]
+    RateLimitsRejected { code: Option<i64> },
+    #[error("Codex rate-limit response omitted its result")]
+    ResultMissing,
+    #[error("Codex rate-limit response contained no usable quota windows")]
+    NoUsableWindows,
+}
+
+/// Errors from the generic `command`/`normalized_file`/`normalized_http`
+/// sources (plan.md §7.4). Every variant's `Display` is built only from a
+/// path, a command name, a byte-count limit, a status code, or literal
+/// text -- never the source's actual output, which is untrusted and may
+/// carry arbitrary content -- per plan.md §14 requirement 8.
+#[derive(Debug, Error)]
+pub enum GenericSourceError {
+    #[error("failed to read snapshot file {path}")]
+    FileUnreadable { path: PathBuf },
+    #[error("failed to read snapshot file {path}")]
+    FileReadFailed {
+        path: PathBuf,
+        #[source]
+        source: ReadBoundedError,
+    },
+    #[error("failed to start quota source command `{command}`")]
+    CommandSpawnFailed { command: String },
+    #[error("quota source command `{command}` stdout was not piped")]
+    CommandStdoutMissing { command: String },
+    #[error("failed to read quota source command `{command}` stdout")]
+    CommandReadFailed {
+        command: String,
+        #[source]
+        source: ReadBoundedError,
+    },
+    #[error("failed to wait for quota source command `{command}`")]
+    CommandWaitFailed { command: String },
+    #[error("quota source command `{command}` exited with a failure status")]
+    CommandFailed { command: String },
+    #[error("HTTP source timeout_seconds must be greater than zero")]
+    InvalidTimeout,
+    #[error("normalized HTTP quota request failed")]
+    HttpRequestFailed(#[source] ureq::Error),
+    #[error("normalized HTTP quota response {0}")]
+    HttpRedirectRefused(#[source] RedirectRefused),
+    #[error("failed to read normalized HTTP quota response body")]
+    HttpReadFailed(#[source] ReadBoundedError),
+    #[error("source did not emit a valid normalized quota snapshot")]
+    MalformedSnapshot,
+}
 
 /// Collects one normalized quota snapshot for an account's configured
 /// source.
@@ -32,14 +172,7 @@ const MAX_GENERIC_SOURCE_BYTES: u64 = 1024 * 1024;
 /// actuating a fleet from a failed poll.
 pub fn collect(source: &SourceConfig) -> Result<QuotaSnapshot> {
     let snapshot = match source {
-        SourceConfig::NormalizedFile { path } => {
-            let mut file = File::open(path)
-                .with_context(|| format!("failed to read snapshot {}", path.display()))?;
-            let bytes = read_bounded(&mut file, MAX_GENERIC_SOURCE_BYTES)
-                .with_context(|| format!("snapshot {}", path.display()))?;
-            serde_json::from_slice(&bytes)
-                .with_context(|| format!("failed to parse snapshot {}", path.display()))?
-        }
+        SourceConfig::NormalizedFile { path } => collect_normalized_file(path)?,
         SourceConfig::NormalizedHttp {
             url,
             timeout_seconds,
@@ -59,18 +192,36 @@ pub fn collect(source: &SourceConfig) -> Result<QuotaSnapshot> {
     validate_snapshot(snapshot)
 }
 
+fn collect_normalized_file(path: &Path) -> Result<QuotaSnapshot> {
+    let mut file = File::open(path).map_err(|_| GenericSourceError::FileUnreadable {
+        path: path.to_owned(),
+    })?;
+    let bytes = read_bounded(&mut file, MAX_GENERIC_SOURCE_BYTES).map_err(|source| {
+        GenericSourceError::FileReadFailed {
+            path: path.to_owned(),
+            source,
+        }
+    })?;
+    serde_json::from_slice(&bytes).map_err(|_| GenericSourceError::MalformedSnapshot.into())
+}
+
 fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
+    let command = argv[0].clone();
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("failed to start quota source {}", argv[0]))?;
+        .map_err(|_| GenericSourceError::CommandSpawnFailed {
+            command: command.clone(),
+        })?;
     let mut stdout = child
         .stdout
         .take()
-        .context("quota source stdout was not piped")?;
+        .ok_or_else(|| GenericSourceError::CommandStdoutMissing {
+            command: command.clone(),
+        })?;
     let bytes = read_bounded(&mut stdout, MAX_GENERIC_SOURCE_BYTES);
     drop(stdout);
     if bytes.is_err() {
@@ -80,44 +231,50 @@ fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let bytes = bytes.with_context(|| format!("quota source {} stdout", argv[0]))?;
+    let bytes = bytes.map_err(|source| GenericSourceError::CommandReadFailed {
+        command: command.clone(),
+        source,
+    })?;
 
     let status = child
         .wait()
-        .with_context(|| format!("failed to wait for quota source {}", argv[0]))?;
+        .map_err(|_| GenericSourceError::CommandWaitFailed {
+            command: command.clone(),
+        })?;
     if !status.success() {
-        bail!("quota source {} exited with {}", argv[0], status);
+        return Err(GenericSourceError::CommandFailed { command }.into());
     }
-    serde_json::from_slice(&bytes)
-        .context("quota source did not emit a normalized snapshot")
+    serde_json::from_slice(&bytes).map_err(|_| GenericSourceError::MalformedSnapshot.into())
 }
 
 fn collect_normalized_http(url: &str, timeout_seconds: u64) -> Result<QuotaSnapshot> {
-    let agent = http_agent(timeout_seconds)?;
+    let agent = http_agent(timeout_seconds).map_err(|_| GenericSourceError::InvalidTimeout)?;
     let response = agent
         .get(url)
         .call()
-        .map_err(|error| anyhow!("normalized HTTP quota request failed: {error}"))?;
-    let response = reject_redirect(response)?;
+        .map_err(GenericSourceError::HttpRequestFailed)?;
+    let response = reject_redirect(response).map_err(GenericSourceError::HttpRedirectRefused)?;
     let mut reader = response.into_reader();
     let bytes = read_bounded(&mut reader, MAX_GENERIC_SOURCE_BYTES)
-        .context("normalized HTTP quota response")?;
-    serde_json::from_slice(&bytes)
-        .context("normalized HTTP source returned invalid snapshot JSON")
+        .map_err(GenericSourceError::HttpReadFailed)?;
+    serde_json::from_slice(&bytes).map_err(|_| GenericSourceError::MalformedSnapshot.into())
 }
 
 /// Reads at most `limit` bytes from `reader`, failing rather than silently
 /// truncating if more data is available. Used to bound every generic
 /// source's untrusted or unbounded input -- command stdout, a snapshot file,
 /// or an HTTP response body -- per plan.md §7.4.
-fn read_bounded(reader: &mut dyn Read, limit: u64) -> Result<Vec<u8>> {
+fn read_bounded(
+    reader: &mut dyn Read,
+    limit: u64,
+) -> std::result::Result<Vec<u8>, ReadBoundedError> {
     let mut buffer = Vec::new();
     reader
         .take(limit + 1)
         .read_to_end(&mut buffer)
-        .context("failed to read source output")?;
+        .map_err(ReadBoundedError::Io)?;
     if buffer.len() as u64 > limit {
-        bail!("source output exceeds the {limit}-byte maximum");
+        return Err(ReadBoundedError::TooLarge { limit });
     }
     Ok(buffer)
 }
@@ -130,17 +287,18 @@ fn collect_anthropic(
 ) -> Result<QuotaSnapshot> {
     let access_token = obtain_access_token(credentials_path, token_url, timeout_seconds)?;
 
-    let response = http_agent(timeout_seconds)?
+    let agent = http_agent(timeout_seconds).map_err(|_| AnthropicSourceError::InvalidTimeout)?;
+    let response = agent
         .get(usage_url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
         .set("User-Agent", "claude-code/2.1.114")
         .call()
-        .map_err(|error| anyhow!("Anthropic usage request failed: {error}"))?;
-    let response = reject_redirect(response)?;
+        .map_err(AnthropicSourceError::UsageRequestFailed)?;
+    let response = reject_redirect(response).map_err(AnthropicSourceError::UsageRedirectRefused)?;
     let payload: Value = response
         .into_json()
-        .context("Anthropic usage endpoint returned invalid JSON")?;
+        .map_err(|_| AnthropicSourceError::UsageResponseMalformed)?;
     parse_anthropic_usage(&payload, Utc::now())
 }
 
@@ -168,31 +326,33 @@ fn obtain_access_token(
         .read(true)
         .write(true)
         .open(credentials_path)
-        .with_context(|| {
-            format!(
-                "failed to open Claude Code credentials {} for locking",
-                credentials_path.display()
-            )
+        .map_err(|_| AnthropicSourceError::CredentialsUnopenable {
+            path: credentials_path.to_owned(),
         })?;
-    lock_exclusive_bounded(&lock_file, timeout_seconds).with_context(|| {
-        format!(
-            "failed to lock Claude Code credentials {} (a concurrent writer may be holding it)",
-            credentials_path.display()
-        )
+    lock_exclusive_bounded(&lock_file, timeout_seconds).map_err(|_| AnthropicSourceError::Locked {
+        path: credentials_path.to_owned(),
     })?;
     // Held until this function returns, so the whole read-decide(-refresh)
     // section below is one critical section under the lock.
     let _lock = lock_file;
 
-    let credentials = read_json(credentials_path, "Claude Code credentials")?;
+    let credentials =
+        read_json(credentials_path, "Claude Code credentials").map_err(|_| {
+            AnthropicSourceError::CredentialsUnreadable {
+                path: credentials_path.to_owned(),
+            }
+        })?;
     let oauth = credentials
         .get("claudeAiOauth")
         .and_then(Value::as_object)
-        .context("Claude Code credentials are missing claudeAiOauth")?;
-    if let Some(token) = fresh_access_token(oauth)? {
+        .ok_or_else(|| AnthropicSourceError::MissingField {
+            path: credentials_path.to_owned(),
+            field: "claudeAiOauth",
+        })?;
+    if let Some(token) = fresh_access_token(credentials_path, oauth)? {
         return Ok(token);
     }
-    let refresh_token = required_refresh_token(oauth)?;
+    let refresh_token = required_refresh_token(credentials_path, oauth)?;
     let refreshed = refresh_anthropic(&refresh_token, token_url, timeout_seconds)?;
     apply_refreshed_credentials(credentials_path, &refresh_token, &refreshed)
 }
@@ -215,11 +375,17 @@ fn lock_exclusive_bounded(file: &File, timeout_seconds: u64) -> Result<()> {
 
 /// Returns `Some(accessToken)` if it is not within the refresh threshold of
 /// expiry, `None` if a refresh is needed.
-fn fresh_access_token(oauth: &serde_json::Map<String, Value>) -> Result<Option<String>> {
+fn fresh_access_token(
+    credentials_path: &Path,
+    oauth: &serde_json::Map<String, Value>,
+) -> Result<Option<String>> {
     let expires_at = oauth
         .get("expiresAt")
         .and_then(Value::as_i64)
-        .context("Claude Code credentials are missing expiresAt")?;
+        .ok_or_else(|| AnthropicSourceError::MissingField {
+            path: credentials_path.to_owned(),
+            field: "expiresAt",
+        })?;
     if Utc::now().timestamp_millis() + REFRESH_THRESHOLD_MILLIS >= expires_at {
         return Ok(None);
     }
@@ -227,18 +393,30 @@ fn fresh_access_token(oauth: &serde_json::Map<String, Value>) -> Result<Option<S
         .get("accessToken")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .context("Claude Code credentials are missing accessToken")?
+        .ok_or_else(|| AnthropicSourceError::MissingField {
+            path: credentials_path.to_owned(),
+            field: "accessToken",
+        })?
         .to_owned();
     Ok(Some(token))
 }
 
-fn required_refresh_token(oauth: &serde_json::Map<String, Value>) -> Result<String> {
+fn required_refresh_token(
+    credentials_path: &Path,
+    oauth: &serde_json::Map<String, Value>,
+) -> Result<String> {
     oauth
         .get("refreshToken")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .context("Claude Code credentials are missing refreshToken")
         .map(str::to_owned)
+        .ok_or_else(|| {
+            AnthropicSourceError::MissingField {
+                path: credentials_path.to_owned(),
+                field: "refreshToken",
+            }
+            .into()
+        })
 }
 
 /// Applies a completed Anthropic token refresh to the credentials file,
@@ -255,24 +433,37 @@ fn apply_refreshed_credentials(
         .get("accessToken")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .context("Anthropic token refresh omitted accessToken")?
+        .ok_or(AnthropicSourceError::RefreshResponseMissingField {
+            field: "accessToken",
+        })?
         .to_owned();
     let new_refresh = refreshed
         .get("refreshToken")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .context("Anthropic token refresh omitted refreshToken")?
+        .ok_or(AnthropicSourceError::RefreshResponseMissingField {
+            field: "refreshToken",
+        })?
         .to_owned();
     let new_expiry = refreshed
         .get("expiresAt")
         .and_then(Value::as_i64)
-        .context("Anthropic token refresh omitted expiresAt")?;
+        .ok_or(AnthropicSourceError::RefreshResponseMissingField {
+            field: "expiresAt",
+        })?;
 
-    let mut current = read_json(credentials_path, "Claude Code credentials")?;
+    let mut current = read_json(credentials_path, "Claude Code credentials").map_err(|_| {
+        AnthropicSourceError::CredentialsUnreadable {
+            path: credentials_path.to_owned(),
+        }
+    })?;
     let current_oauth = current
         .get_mut("claudeAiOauth")
         .and_then(Value::as_object_mut)
-        .context("Claude Code credentials are missing claudeAiOauth")?;
+        .ok_or_else(|| AnthropicSourceError::MissingField {
+            path: credentials_path.to_owned(),
+            field: "claudeAiOauth",
+        })?;
     let current_refresh_token = current_oauth.get("refreshToken").and_then(Value::as_str);
     if current_refresh_token != Some(expected_refresh_token) {
         let current_access = current_oauth
@@ -287,23 +478,27 @@ fn apply_refreshed_credentials(
             {
                 Ok(access)
             }
-            _ => bail!(
-                "Claude Code credentials at {} were refreshed by another process during this \
-                 poll; skipping this cycle rather than overwriting a concurrent refresh",
-                credentials_path.display()
-            ),
+            _ => Err(AnthropicSourceError::ConcurrentRefresh {
+                path: credentials_path.to_owned(),
+            }
+            .into()),
         };
     }
 
     current_oauth.insert("accessToken".into(), Value::String(access.clone()));
     current_oauth.insert("refreshToken".into(), Value::String(new_refresh));
     current_oauth.insert("expiresAt".into(), Value::Number(new_expiry.into()));
-    write_json_atomic(credentials_path, &current)?;
+    write_json_atomic(credentials_path, &current).map_err(|_| {
+        AnthropicSourceError::CredentialsWriteFailed {
+            path: credentials_path.to_owned(),
+        }
+    })?;
     Ok(access)
 }
 
 fn refresh_anthropic(refresh_token: &str, token_url: &str, timeout_seconds: u64) -> Result<Value> {
-    let response = http_agent(timeout_seconds)?
+    let agent = http_agent(timeout_seconds).map_err(|_| AnthropicSourceError::InvalidTimeout)?;
+    let response = agent
         .post(token_url)
         .set("Content-Type", "application/json")
         .set("User-Agent", "claude-code/2.1.114")
@@ -311,10 +506,11 @@ fn refresh_anthropic(refresh_token: &str, token_url: &str, timeout_seconds: u64)
             "grantType": "refresh_token",
             "refreshToken": refresh_token
         }))
-        .map_err(|error| anyhow!("Anthropic token refresh failed: {error}"))?;
-    reject_redirect(response)?
+        .map_err(AnthropicSourceError::RefreshRequestFailed)?;
+    reject_redirect(response)
+        .map_err(AnthropicSourceError::RefreshRedirectRefused)?
         .into_json()
-        .context("Anthropic token refresh returned invalid JSON")
+        .map_err(|_| AnthropicSourceError::RefreshResponseMalformed.into())
 }
 
 pub fn parse_anthropic_usage(payload: &Value, observed_at: DateTime<Utc>) -> Result<QuotaSnapshot> {
@@ -389,18 +585,20 @@ fn read_codex_rate_limits(executable: &Path, timeout_seconds: u64) -> Result<Val
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("failed to start {} app-server", executable.display()))?;
+        .map_err(|_| CodexSourceError::SpawnFailed {
+            path: executable.to_owned(),
+        })?;
     let mut child = ChildGuard(child);
     let mut stdin = child
         .0
         .stdin
         .take()
-        .context("Codex app-server has no stdin")?;
+        .ok_or(CodexSourceError::NoStdin)?;
     let stdout = child
         .0
         .stdout
         .take()
-        .context("Codex app-server has no stdout")?;
+        .ok_or(CodexSourceError::NoStdout)?;
     let (sender, receiver) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -422,35 +620,39 @@ fn read_codex_rate_limits(executable: &Path, timeout_seconds: u64) -> Result<Val
         "method": "initialize",
         "params": {"clientInfo": {"name": "subscription-governor", "version": "0.1.0"}}
     });
-    writeln!(stdin, "{initialize}").context("failed to initialize Codex app-server")?;
-    stdin.flush()?;
+    writeln!(stdin, "{initialize}").map_err(CodexSourceError::WriteFailed)?;
+    stdin.flush().map_err(CodexSourceError::WriteFailed)?;
     let initialized = receive_response(&receiver, 1, timeout_seconds)
-        .context("timed out initializing Codex app-server")?;
+        .map_err(|_| CodexSourceError::InitializeTimedOut)?;
     if let Some(error) = initialized.get("error") {
+        let code = error.get("code").and_then(Value::as_i64);
         child.terminate();
         let _ = reader.join();
-        bail!("Codex app-server rejected initialization: {error}");
+        return Err(CodexSourceError::InitializeRejected { code }.into());
     }
 
-    writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}))?;
+    writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}))
+        .map_err(CodexSourceError::WriteFailed)?;
     writeln!(
         stdin,
         "{}",
         json!({"id": 2, "method": "account/rateLimits/read"})
-    )?;
-    stdin.flush()?;
+    )
+    .map_err(CodexSourceError::WriteFailed)?;
+    stdin.flush().map_err(CodexSourceError::WriteFailed)?;
     let response = receive_response(&receiver, 2, timeout_seconds);
     drop(stdin);
     child.terminate();
     let _ = reader.join();
-    let response = response.context("timed out reading Codex rate limits")?;
+    let response = response.map_err(|_| CodexSourceError::RateLimitsTimedOut)?;
     if let Some(error) = response.get("error") {
-        bail!("Codex app-server rejected the rate-limit request: {error}");
+        let code = error.get("code").and_then(Value::as_i64);
+        return Err(CodexSourceError::RateLimitsRejected { code }.into());
     }
     response
         .get("result")
         .cloned()
-        .context("Codex rate-limit response omitted result")
+        .ok_or_else(|| CodexSourceError::ResultMissing.into())
 }
 
 struct ChildGuard(Child);
@@ -504,7 +706,7 @@ pub fn parse_codex_rate_limits(
         parse_codex_bucket(limit_id, limit, &mut windows);
     }
     if windows.is_empty() {
-        bail!("Codex rate-limit response contained no usable quota windows");
+        return Err(CodexSourceError::NoUsableWindows.into());
     }
     Ok(QuotaSnapshot {
         observed_at,
@@ -589,12 +791,16 @@ fn validate_snapshot(snapshot: QuotaSnapshot) -> Result<QuotaSnapshot> {
     if snapshot.windows.is_empty() {
         bail!("quota snapshot has no windows");
     }
-    for window in &snapshot.windows {
+    for (index, window) in snapshot.windows.iter().enumerate() {
+        // window.id is source-supplied content (arbitrary for a generic
+        // command/file/http source) and is deliberately never echoed into
+        // an error message -- per plan.md §14 requirement 8, an index is
+        // used instead of the untrusted id text.
         if window.id.is_empty() {
-            bail!("quota snapshot has an empty window id");
+            bail!("quota snapshot window {index} has an empty id");
         }
         if !window.used_fraction.is_finite() || !(0.0..=1.0).contains(&window.used_fraction) {
-            bail!("quota window {} used_fraction must be in [0, 1]", window.id);
+            bail!("quota snapshot window {index} used_fraction must be in [0, 1]");
         }
     }
     if let Some(reset_credits) = &snapshot.reset_credits {
@@ -639,13 +845,14 @@ fn http_agent(timeout_seconds: u64) -> Result<ureq::Agent> {
 /// Turns a 3xx response from a `redirects(0)` agent into an explicit error
 /// instead of letting it fall through to JSON parsing with a confusing
 /// message.
-fn reject_redirect(response: ureq::Response) -> Result<ureq::Response> {
+fn reject_redirect(
+    response: ureq::Response,
+) -> std::result::Result<ureq::Response, RedirectRefused> {
     if (300..400).contains(&response.status()) {
-        bail!(
-            "refused a {} redirect from {} (redirects are disabled for this source)",
-            response.status(),
-            response.get_url()
-        );
+        return Err(RedirectRefused {
+            status: response.status(),
+            url: response.get_url().to_owned(),
+        });
     }
     Ok(response)
 }
@@ -1254,5 +1461,57 @@ mod tests {
             target.accept().is_err(),
             "the redirect target must never be contacted"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_command_error_never_leaks_a_malformed_field_value() {
+        // used_fraction is typed f64; a string here forces serde's
+        // invalid-type path, which (unless discarded) would otherwise echo
+        // the offending value straight into the error text.
+        let source = SourceConfig::Command {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                r#"printf '{"observed_at":"2026-09-12T12:00:00Z","windows":[{"id":"w","used_fraction":"sk-super-secret-token","resets_at":"2026-09-13T00:00:00Z"}]}'"#
+                    .to_string(),
+            ],
+        };
+        let error = collect(&source).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("sk-super-secret-token"),
+            "a malformed field value must never leak into the error text: {rendered}"
+        );
+    }
+
+    #[test]
+    fn collect_normalized_http_error_never_leaks_a_malformed_field_value() {
+        let body = br#"{"observed_at":"2026-09-12T12:00:00Z","windows":[{"id":"w","used_fraction":"sk-super-secret-token","resets_at":"2026-09-13T00:00:00Z"}]}"#.to_vec();
+        let (url, handle) = spawn_http_server(body);
+
+        let source = SourceConfig::NormalizedHttp {
+            url,
+            timeout_seconds: 5,
+        };
+        let error = collect(&source).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("sk-super-secret-token"),
+            "a malformed field value must never leak into the error text: {rendered}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn codex_source_error_display_carries_only_a_safe_code() {
+        let error = CodexSourceError::RateLimitsRejected {
+            code: Some(-32000),
+        };
+        let text = error.to_string();
+        assert!(text.contains("-32000"));
+
+        let error = CodexSourceError::InitializeRejected { code: None };
+        assert!(!error.to_string().is_empty());
     }
 }
