@@ -1,0 +1,8 @@
+{
+  "observed_at": "2026-09-28T12:00:00Z",
+  "fresh": true,
+  "host_id": "lab",
+  "cpu_available_fraction": 1.5,
+  "mem_available_mb": 12288,
+  "mem_total_mb": 65536
+}
