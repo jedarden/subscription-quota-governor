@@ -13,6 +13,7 @@ below, not governor CLI features.
 | `<state_path>` (default `${XDG_STATE_HOME:-~/.local/state}/subscription-governor/state.json`, or `./subscription-governor/state.json` if the platform has no state-dir concept) | Per-account learned state: latest window samples, last desired target, bounded burn-rate history | No -- losing it resets learning |
 | `<state_path>.lock` | Advisory exclusive lock (`flock`) that stops a second governor from opening the same state path | Yes -- safe to delete whenever no governor holds it |
 | `<state_path>` sibling `status.json` (same directory, `status.json` filename) | Last cycle's readiness snapshot, written after each cycle | Yes -- recreated on the next completed cycle |
+| `<state_path>` sibling `<name>.corrupt-<UTC timestamp>-<pid>` | A quarantined copy of a `state.json` that failed to parse (see below) | No -- it's the only surviving copy of whatever was in the corrupt file |
 
 Only `state.json` needs backing up. Per §10, it contains no credentials, raw
 provider response bodies, prompts, or account tokens -- only the account name
@@ -62,13 +63,30 @@ are readable by any binary that still implements version 1. Restoring a
 backup taken from a *newer* binary onto an *older* one fails closed with a
 "newer than the ... this binary supports" error -- if that happens, restore
 that account's history by upgrading the binary first, not by editing the
-file. Note that §10's separate "quarantine malformed state rather than
-silently starting empty" item covers *unparseable* JSON, not a version
-mismatch, and is still open as of this writing: a corrupt (not merely
-newer-versioned) `state.json` today makes `run`/`run --once` fail with a
-parse error rather than being moved aside automatically. A restore from a
-known-good backup is the operator recovery path for that case until that
-item lands.
+file.
+
+### Recovering from a corrupt (unparseable) state.json
+
+This is a distinct failure mode from a schema-version mismatch above: the
+file exists but is not valid JSON, or does not match `State`'s shape at all
+(truncated write recovered from a crash before this repo's fsync-then-rename
+hardening, hand-editing gone wrong, disk corruption). `State::load` does not
+error out on this and does not silently start empty either -- it renames the
+offending file aside to `<name>.corrupt-<UTC timestamp>-<pid>` in the same
+directory, preserving its bytes for forensics, and proceeds with a fresh
+default state (`src/state.rs`). `run`/`run --once` logs this to stderr as a
+`state_quarantined` JSON Lines event (`event`, `time`, `state_path`,
+`quarantined_path`, `error`) before continuing the cycle -- watch for that
+event rather than expecting the process to exit.
+
+Because quarantine already discards the corrupt file's learned history (the
+process moves on with an empty state, exactly as if the file were missing),
+recovery here means restoring a *backup* over the now-fresh `state.json`,
+following the same stop-governor / copy / restart steps above, not
+recovering the quarantined file itself -- there is no tooling to repair a
+malformed state file in place. Keep the quarantined copy only long enough to
+diagnose how it got corrupted; it is not consumed by anything and is safe to
+delete once you're done, the same as any other backup-shaped file.
 
 ## Removing state.json
 
