@@ -33,6 +33,11 @@ Status notation:
 7. Support multiple fleet managers through small observer and actuator
    boundaries instead of embedding scheduler-specific behavior.
 8. Be safe to run first in observation mode and straightforward to roll back.
+9. Extend governed capacity beyond subscription quota to per-host machine
+   resources (CPU, RAM), and distribute each account's quota-safe worker
+   total across that account's configured hosts by available headroom —
+   bin-packing workers onto hosts with room rather than ever scaling the
+   account total past what quota already allows. See §22.
 
 ## 3. Non-goals
 
@@ -47,6 +52,15 @@ Status notation:
 - Mutating a Kubernetes fleet directly. A Kubernetes installation should write
   desired state through its normal GitOps or controller boundary.
 - Treating a successful poll as proof that actuation is safe.
+- Auto-discovering hosts or measuring a host's total capacity. Hosts and their
+  resource ceilings are configured explicitly, the same as accounts and their
+  windows.
+- Coordinating NEEDLE bead claims or repository work across hosts. Placement
+  sets a worker *count* per host; avoiding duplicate claims on a repository
+  worked from more than one host remains an operational NEEDLE practice
+  outside this project (see §22.9).
+- Cost- or task-aware placement optimization beyond proportional headroom
+  distribution in the initial release (see §22.7 future hardening).
 
 ## 4. Vocabulary and ownership boundaries
 
@@ -60,6 +74,10 @@ Status notation:
 | Actuator | Adapter that publishes or applies a desired worker count. |
 | Decision | Immutable explanation of one account's computed target. |
 | Cycle | One collect, observe, evaluate, optionally actuate, and persist pass. |
+| Host | One machine (or other reachable target) where an account's workers may run. Configured explicitly per account, never auto-discovered. |
+| Resource snapshot | A host's observed CPU/RAM headroom, normalized like a quota snapshot but with no reset time. |
+| Placement | The pure function that distributes an account's quota-safe total across its hosts by resource headroom. Runs strictly after the controller and never raises its total. |
+| Binding resource | The scarcer of a host's CPU or RAM headroom for one placement cycle — mirrors "binding window." |
 
 Account identity is configured explicitly. A worker can speak an Anthropic
 compatible protocol while consuming a non-Anthropic subscription; protocol
@@ -94,6 +112,11 @@ Required separation:
 
 Provider branches are allowed in `source`; they are prohibited in the
 controller and fleet modules.
+
+Resource-aware multi-host placement extends this same pipeline with a second,
+strictly downstream pure stage (`placement`) that runs after the controller
+and before the fleet actuators; it never feeds back into the controller. See
+§22.
 
 ## 6. Normalized quota contract
 
@@ -594,8 +617,9 @@ provider payloads, model prompts, raw errors, or unbounded provider labels.
 | `src/config.rs` | Versioned YAML types, defaults, strict validation, path expansion. |
 | `src/source.rs` | Native and generic quota transports and normalization. |
 | `src/controller.rs` | Pure pacing, reset, staleness, and arbitration decisions. |
+| `src/placement.rs` | Pure multi-host bin-packing of one account's controller total by resource headroom (§22.7). |
 | `src/state.rs` | Durable samples, atomic persistence, and exclusive ownership. |
-| `src/fleet.rs` | Worker observers and target actuators. |
+| `src/fleet.rs` | Worker observers and target actuators, including the NEEDLE-native pair (`src/fleet/needle.rs`, §22.9). |
 | `src/main.rs` | CLI, cycles, error isolation, and process lifecycle. |
 | `examples/` | Safe configurations and synthetic normalized data. |
 | `docs/notes/` | Operator-facing configuration and future design decisions. |
@@ -858,6 +882,12 @@ WP1 through WP4 can proceed independently after the contracts and test doubles
 are fixed. Controller correctness and crash-safe state are release blockers;
 metrics or service packaging must not be used to mask gaps in either.
 
+Resource-aware placement (WP9 through WP14, §22.13) depends on WP2 and WP4
+being stable — placement consumes the controller's account total and reuses
+the fleet observer/actuator contract — and must land before WP8, since WP8's
+staged rollout has to exercise both the single-host and multi-host paths
+(§22.14).
+
 ## 21. Decisions intentionally deferred
 
 These require evidence from observation-mode traces:
@@ -873,3 +903,429 @@ These require evidence from observation-mode traces:
 Record architectural decisions in `docs/adr/` and operational evidence in
 `docs/notes/`. Changes to the normalized contract or safety invariants require
 an explicit plan revision.
+
+## 22. Resource-Aware Multi-Host Placement
+
+Status notation matches §1: `[x]` exists, `[ ]` remains to build, `[~]` exists
+but needs hardening. Everything in this section is currently `[ ]` — it is a
+plan addendum, not yet implemented.
+
+### 22.1 Purpose
+
+An account's workers do not have to run on one machine. Today a single
+`fleet.observer`/`fleet.actuator` pair implicitly assumes one target. This
+section extends the governor so one account can be configured with several
+hosts, each with its own worker observer, actuator, and machine-resource
+headroom, and adds a second pure decision stage — placement — that
+distributes the controller's already-safe account total across those hosts
+by available CPU/RAM rather than by quota. Quota answers "how many workers
+total can this account safely run"; placement answers "which of this
+account's hosts should run them." Placement can never increase the total the
+controller already decided; it can only decide where.
+
+This directly targets bin-packing NEEDLE workers across machines (e.g.
+codinghome and lab) by both subscription headroom (existing controller) and
+machine resource headroom (new), while preserving every existing safety
+invariant in §2 goal 5 and §9.
+
+### 22.2 Backward compatibility
+
+An account with no `fleet.hosts` key behaves exactly as it does in v0.1: the
+existing top-level `fleet.observer`/`fleet.actuator` are used directly and the
+entire controller total is sent to that one implicit target. This is
+mechanically identical to declaring a single host with no `resource_source`
+(see §22.4) — an unconstrained host always has full headroom, so placement
+degenerates to "one host gets everything," which is today's behavior. No
+config version bump is required (§8's "adding an optional field with a safe
+default is backward-compatible" applies); `fleet.hosts` is optional and
+additive.
+
+### 22.3 Configuration shape
+
+```yaml
+accounts:
+  claude-anthropic:
+    source: { ... }          # unchanged — account-level quota source
+    utilization: { ... }     # unchanged — windows still govern the total
+    fleet:
+      min_workers: 0
+      max_workers: 8
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 2
+      # `observer`/`actuator` here and `hosts` below are mutually exclusive.
+      # Setting both is a validation error at `subgov check`.
+      hosts:
+        codinghome:
+          max_workers: 6                     # optional; defaults to account max_workers
+          resource_reserve:
+            cpu_reserve_fraction: 0.25
+            mem_reserve_mb: 4096              # headroom no placement may consume
+          resource_source:
+            type: command
+            argv: [/usr/local/bin/resource-probe]
+          observer:
+            type: command
+            argv: [/usr/local/bin/count-ai-workers, claude-anthropic]
+          actuator:
+            type: command
+            argv: [/usr/local/bin/set-ai-worker-target, claude-anthropic, "{desired_workers}"]
+        lab:
+          max_workers: 8
+          resource_reserve:
+            cpu_reserve_fraction: 0.30
+            mem_reserve_mb: 8192
+          resource_source:
+            type: command
+            argv: [ssh, lab.tailnet, resource-probe]
+          observer:
+            type: command
+            argv: [ssh, lab.tailnet, needle-worker-count, claude-anthropic]
+          actuator:
+            type: command
+            argv: [ssh, lab.tailnet, needle-set-target, claude-anthropic, "{desired_workers}"]
+```
+
+Validation rules (extend §8):
+
+- A host key is non-empty and unique within its account, same rule as account
+  keys.
+- `resource_reserve` is required whenever `resource_source` is present; a
+  host with a `resource_source` but no reserve is a validation error (there
+  is no safe default reserve — see §22.8's OOM note).
+- A host's `max_workers` must not exceed the account's `max_workers`.
+- At least one host is required whenever `hosts` is present at all.
+
+### 22.4 Normalized resource contract
+
+Every resource source returns exactly one snapshot, structurally parallel to
+§6 but without reset semantics:
+
+```json
+{
+  "observed_at": "2026-09-28T12:00:00Z",
+  "fresh": true,
+  "host_id": "lab",
+  "cpu_available_fraction": 0.42,
+  "mem_available_mb": 12288,
+  "mem_total_mb": 65536
+}
+```
+
+- `cpu_available_fraction` is finite and inclusive in `[0, 1]` — the fraction
+  of the host's total CPU currently free, however the site-local probe
+  chooses to measure it (load-average-derived, cgroup-quota-derived, or
+  otherwise); the governor does not prescribe the method, only the
+  normalized output, mirroring the Z.AI boundary in §7.3.
+- `mem_available_mb` and `mem_total_mb` are finite, non-negative integers;
+  `mem_available_mb <= mem_total_mb`.
+- `fresh` and `observed_at` follow the same semantics as §6.1.
+- A missing or malformed field fails the snapshot, same as §6.2.
+
+### 22.5 Resource source requirements
+
+Reuses the generic `command`/`file`/`normalized_http` transport already
+specified in §7.4 verbatim — no new transport type. Build requirements:
+
+- [ ] Add `ResourceSnapshot` alongside the existing quota `Snapshot` type in
+  `src/model.rs`.
+- [ ] Extend `src/source.rs`'s generic collectors to also parse
+  `ResourceSnapshot`, sharing the same size-bounded, non-shell,
+  finite-timeout rules as §7.4.
+- [ ] Add a `resource-probe` example script under `examples/` that reports
+  local CPU/RAM from `/proc/loadavg` and `/proc/meminfo` (or the host's
+  cgroup limits where narrower), documented as a starting point, not a
+  shipped daemon.
+- [ ] Contract tests for missing fields, out-of-range fractions, and
+  `mem_available_mb > mem_total_mb`.
+
+### 22.6 Architecture
+
+```mermaid
+flowchart LR
+    C[Controller decision: account total] --> PL[Placement]
+    R1[Host resource source] --> PL
+    R2[Host resource source] --> PL
+    OB1[Host observer] --> PL
+    OB2[Host observer] --> PL
+    PL --> D1[Per-host decision record]
+    D1 --> ACT1[Host actuator]
+    D1 --> ACT2[Host actuator]
+    D1 --> L[Structured event, per host]
+```
+
+`placement` is a pure function of: the controller's account total, the set of
+configured hosts, each host's latest resource snapshot, each host's current
+observed worker count, and each host's `max_workers`/`resource_reserve`. It
+performs no I/O, exactly like `controller` (§9's opening constraint extends
+here verbatim).
+
+### 22.7 Placement algorithm
+
+```text
+Given account_target (from §9 controller output, unchanged) and, for each
+configured host h:
+  current[h]        = host's observed worker count
+  ceiling[h]         = host max_workers, default account max_workers
+  headroom[h]        = min(cpu_available_fraction[h],
+                            (mem_available_mb[h] - mem_reserve_mb[h]) / mem_total_mb[h])
+                        clamped to [0, 1]; a host with no resource_source has
+                        headroom[h] = 1 always (see §22.2)
+  fresh[h]           = resource snapshot passes the §22.8 freshness gate
+
+eligible = { h : fresh[h] and headroom[h] > 0 }
+
+if eligible is empty:
+    target[h] = current[h] for every host        # hold, never scale up blind
+
+else:
+    weight[h]     = headroom[h] / sum(headroom[h'] for h' in eligible)
+    raw[h]        = round(account_target * weight[h])   for h in eligible
+    raw[h]        = 0                                     for h not in eligible
+    clamped[h]    = clamp(raw[h], 0, ceiling[h])
+
+    # Remainder redistribution: any shortfall from clamping is handed to the
+    # eligible host with the most *unused* headroom, one worker at a time,
+    # until account_target is met or every eligible host is at its ceiling.
+    while sum(clamped) < account_target and some eligible h has clamped[h] < ceiling[h]:
+        h* = argmax_{h in eligible, clamped[h] < ceiling[h]} (headroom[h] - clamped[h]/ceiling[h])
+        clamped[h*] += 1
+
+    target[h] = clamped[h]
+
+# Per-cycle step limits (§9.6) apply per host using the account's
+# max_scale_up_per_cycle / max_scale_down_per_cycle unless a host overrides
+# them explicitly (host-level override deferred — §22.7 future hardening).
+```
+
+Invariants, mirroring §9.6/§17.2's property-test style:
+
+- `sum(target[h] for all h) <= account_target`, always — placement never
+  raises the total the controller already decided.
+- A host absent from `eligible` never receives more workers than it already
+  has; it can still be scaled *down* toward the account's step limits if the
+  controller's account total itself dropped.
+- Placement is deterministic given identical inputs (no random tie-breaking
+  — ties in `argmax` break by host key, ascending).
+
+Future placement hardening (parity with §9.8, not blocking v1.1):
+
+- [ ] Replace proportional-by-headroom with a cost-aware objective (per-host
+  $-cost, mirroring cgov's `distribute_workers_by_cost_priority`) once v1.1
+  ships and real placement traces exist.
+- [ ] Per-host step-limit overrides.
+- [ ] Bounded placement history for oscillation detection, parity with §9.8's
+  bursty/idle trace simulation.
+
+### 22.8 Freshness and safety for resources
+
+- Staleness gate: a host's resource snapshot is stale when
+  `now - observed_at > stale_after_seconds` (defaults to the account's
+  `utilization.stale_after_seconds`, overridable per host) or `fresh == false`.
+- A stale host is *frozen*, not drained: it is excluded from `eligible` (so it
+  can never gain workers) but existing workers on it are not force-killed by
+  staleness alone — mirrors the existing `stale_behavior: hold` default and
+  non-goal "treating a successful poll as proof that actuation is safe."
+  Draining a stale host only happens if the controller's account total itself
+  drops and step limits reach that host through the normal scale-down path.
+- If every host is stale or absent a `resource_source`-based read for an
+  account that declares `hosts`, placement holds every host at `current[h]`
+  — same shape as the controller's own stale-data rule in §9.1.
+- `mem_reserve_mb` has **no safe default** and must be configured explicitly
+  per host (§22.3). This is a direct lesson from a real lab incident: a
+  systemd unit's cgroup `MemoryMax` sized without headroom for the
+  supervising process tree caused repeated OOM kills that took down the
+  entire worker session server at once (not merely one worker). The operator
+  is responsible for setting `mem_reserve_mb` at least as large as the
+  largest observed single-worker footprint on that host; the governor does
+  not attempt to auto-detect it in v1.1.
+
+### 22.9 NEEDLE-native fleet adapter
+
+The generic `command`/`file` observer and actuator (§11) remain sufficient
+for any orchestrator. For NEEDLE specifically, add a first-party pair so a
+site-local wrapper script is not required for the common case:
+
+- [ ] `observer: { type: needle_status }` — runs `needle status --json` (or
+  reads the heartbeat directory directly, matching the pattern already
+  proven in `claude-governor`) and returns the current worker count for the
+  account's configured NEEDLE agent/adapter name on that host.
+- [ ] `actuator: { type: needle_run }` — launches or stops workers via
+  `needle run -w <repo> -a <adapter>` / session-pattern-matched stop, the
+  same shell-out boundary `claude-governor`'s plan already documents and
+  justifies (`docs/plan/plan.md` §"Separation of concerns" in that repo):
+  subgov decides a number, NEEDLE still owns worker lifecycle, bead
+  claiming, and prompt templating entirely.
+- [ ] A `needle_adapter_parity` check (mirroring `cgov doctor`'s
+  `claude_print_parity`) that fails closed when a host's configured NEEDLE
+  adapter is missing or unreachable, rather than actuating blind.
+- Explicitly out of scope here (§3 non-goal): coordinating NEEDLE bead claims
+  across hosts. This adapter only ever sets a target *count* per host: it
+  does not choose which repository a host's workers roam into, and it does
+  not solve NEEDLE's documented lack of cross-host claim coordination.
+  Placing a resource-governed account's hosts safely still requires the
+  existing operational practice of partitioning which repos each host's
+  NEEDLE fleet is allowed to roam into.
+
+### 22.10 Remote transport
+
+Cross-host `command` sources/observers/actuators (the `lab` example in
+§22.3) run over SSH using the existing generic `command` primitive — no new
+transport type or credential model is introduced. Requirements:
+
+- [ ] Document that `argv: [ssh, <host>, <remote-argv...>]` is the sanctioned
+  shape; `ssh` itself is exec'd directly (never through a local shell, per
+  §7.4), but note explicitly that SSH re-joins and re-parses its remote
+  command server-side through the remote user's shell — so, unlike a local
+  `command` source, argv-level injection safety is the *remote script's*
+  responsibility, not subgov's. Fixed, non-interpolated remote scripts only;
+  never build remote argv from live provider data.
+- [ ] SSH invocations use key-based auth already present on the host
+  (matches this environment's existing Tailscale SSH model) and a bounded
+  `ConnectTimeout`; subgov never manages or stores an SSH credential itself.
+- [ ] The command timeout in §7.4/§11.1 applies to the whole SSH round trip,
+  not just local execution.
+
+### 22.11 State and observability extensions
+
+- [ ] State is keyed by `(account, host)` for per-host samples in addition to
+  the existing per-account key (§10); the account-level "last desired total"
+  is unchanged and remains the controller's, not placement's, output.
+- [ ] Decision events (§13) gain a per-host placement record alongside the
+  existing per-account decision: resource snapshot, headroom, eligibility,
+  and the placed target, keyed by account and host.
+- [ ] Metrics (§13) add per-host resource utilization and placed-worker count
+  alongside the existing per-account/per-window metrics.
+
+### 22.12 CLI extensions
+
+- [ ] `subgov snapshot ACCOUNT --host HOST` prints only that host's resource
+  snapshot, same non-actuating contract as plain `snapshot` (§12).
+- [ ] `run`/`run --once` decision output includes a per-host breakdown when
+  `hosts` is configured; unchanged single-line output when it is not.
+
+### 22.13 Work packages
+
+#### WP9: resource contract and sources
+
+Dependencies: WP0, WP2.
+
+- [ ] `ResourceSnapshot` type and validation (§22.4).
+- [ ] Generic resource source support in `src/source.rs` (§22.5).
+- [ ] `fleet.hosts` config parsing, validation, and the backward-compatible
+  single-implicit-host default (§22.2, §22.3).
+
+Definition of done: an account can declare `hosts` with only
+`resource_source`/`observer`/`actuator` per host, `subgov check` validates
+it, and an account with no `hosts` key is provably unaffected (existing WP0
+test doubles pass unchanged).
+
+#### WP10: placement algorithm
+
+Dependencies: WP9.
+
+- [ ] `src/placement.rs` pure function implementing §22.7.
+- [ ] Unit tests for the boundary cases in §22.7/§22.8 (no eligible host,
+  single host, ceiling-clamped host, remainder redistribution, stale host
+  frozen not drained).
+- [ ] Property tests: placed total never exceeds `account_target`; disabling
+  one host never increases another host's headroom-derived weight beyond its
+  own; identical inputs are deterministic.
+
+Definition of done: property tests prove placement can never raise the
+controller's total, and a host that goes stale mid-run only ever holds or
+loses share, never gains it.
+
+#### WP11: multi-host fleet integration
+
+Dependencies: WP4, WP10.
+
+- [ ] Per-host observer/actuator wiring in `src/fleet.rs`.
+- [ ] Per-`(account, host)` state (§22.11).
+- [ ] Per-host decision events and metrics (§22.11).
+- [ ] Integration test: one account, two hosts, one host stale — the healthy
+  host absorbs the account total up to its ceiling and the stale host holds.
+
+Definition of done: a full observe-only cycle across a two-host account
+produces one decision record per host, and killing one host's resource
+source mid-run degrades to holding that host without affecting the other.
+
+#### WP12: NEEDLE-native fleet adapter
+
+Dependencies: WP11.
+
+- [ ] `needle_status` observer and `needle_run` actuator (§22.9).
+- [ ] `needle_adapter_parity` doctor-style check.
+- [ ] Example config wiring an account across two real hosts.
+
+Definition of done: `subgov run --once --observe-only` against a live
+two-host NEEDLE fleet produces a correct per-host observed count with no
+actuation, verified against `needle status` on each host directly.
+
+#### WP13: remote transport hardening
+
+Dependencies: WP9.
+
+- [ ] SSH command timeout, key-auth-only, and the argv-safety documentation
+  in §22.10.
+- [ ] Contract tests for a slow/hanging/unreachable SSH target (bounded,
+  isolates to that host only, per §22.8).
+
+Definition of done: an unreachable remote host degrades exactly like a stale
+local one — held, not drained, isolated to that host.
+
+#### WP14: staged multi-host rollout
+
+Dependencies: WP8, WP12, WP13.
+
+Extends §16 WP8's staged rollout: run placement in observe-only mode for at
+least one full account cycle across every configured host before enabling
+any host's actuator; enable one host's actuator before the second; keep a
+one-command rollback to a single-implicit-host config (§22.2) throughout.
+
+Definition of done: a resource-governed, multi-host account runs for seven
+consecutive days, including at least one quota reset, without a host being
+over-placed relative to its configured reserve.
+
+### 22.14 V1.1 acceptance criteria
+
+Additive to, and dependent on, the §18 v1 criteria for every account/host
+this applies to:
+
+- [ ] An account with no `hosts` key behaves byte-for-byte as it does today
+  (regression-tested against the v1 test suite).
+- [ ] Property tests prove placement never exceeds the controller's total.
+- [ ] A stale or unreachable host is provably held, never drained, by
+  staleness alone.
+- [ ] `mem_reserve_mb` is required (not defaulted) wherever a
+  `resource_source` is configured.
+- [ ] The NEEDLE-native adapter passes parity checks on both configured
+  hosts before its actuator is enabled.
+- [ ] The WP14 seven-day multi-host observation window passes with no
+  over-placement incident.
+
+### 22.15 Decisions locked by this addendum
+
+Recorded here, not as open forks, per this project's convention that a plan
+decides every fork it raises rather than deferring it to an ADR written
+mid-build:
+
+1. One governor process still owns an entire account (§10's existing rule
+   extends across hosts) — never one process per host for the same account.
+   A shared subscription used from multiple hosts must be governed
+   centrally or it double-books, the same failure shape §10 already
+   forbids.
+2. Placement is strictly subordinate to the controller: it distributes, it
+   never authorizes more workers than the controller already decided.
+3. Cross-host SSH reuses the existing generic `command` primitive rather
+   than adding a native transport type, at the cost of pushing argv-safety
+   responsibility onto the remote script (documented, not hidden).
+4. Cross-host NEEDLE bead-claim coordination is explicitly not solved here —
+   it is called out as a non-goal (§3) and left to NEEDLE's own per-host
+   repo-partitioning practice.
+5. `mem_reserve_mb` has no auto-detected default; under-provisioning it is
+   an operator error the governor refuses to paper over, given the real
+   cgroup OOM precedent in §22.8.
+6. v1 (quota-only) and v1.1 (resource-aware placement) are separate
+   acceptance gates (§22.14); v1.1 for a given account depends on that
+   account already meeting the relevant v1 criteria.
