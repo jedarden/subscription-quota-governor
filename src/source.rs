@@ -1,5 +1,7 @@
 use crate::config::SourceConfig;
-use crate::model::{QuotaSnapshot, QuotaWindow, ResetCredit, ResetCreditsSnapshot, ResourceSnapshot};
+use crate::model::{
+    QuotaSnapshot, QuotaWindow, ResetCredit, ResetCreditsSnapshot, ResourceSnapshot,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use fs2::FileExt;
@@ -16,6 +18,15 @@ use thiserror::Error;
 
 const REFRESH_THRESHOLD_MILLIS: i64 = 300_000;
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Ceiling on how long a `command` source's child process -- and everything
+/// it spawns, notably an SSH remote command per plan.md §22.10 -- may run
+/// before it is killed. Mirrors `src/fleet.rs`'s `CHILD_TIMEOUT`: "The
+/// command timeout in §7.4/§11.1 applies to the whole SSH round trip, not
+/// just local execution." There is no separate, larger budget for the
+/// network hop -- `ssh`'s own connection attempt, authentication, and the
+/// remote command's runtime all come out of this one budget, same as local
+/// execution.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum bytes read from a generic source's command stdout, file, or HTTP
 /// body (plan.md §7.4: "Files and HTTP bodies have explicit maximum sizes in
 /// v1."). A normalized quota snapshot is a small JSON document, so this is
@@ -157,6 +168,10 @@ pub enum GenericSourceError {
     CommandWaitFailed { command: String },
     #[error("source command `{command}` exited with a failure status")]
     CommandFailed { command: String },
+    #[error("source command `{command}` timed out after {timeout:?} (plan.md §22.10: this bounds the whole SSH round trip too, not just local execution)")]
+    CommandTimedOut { command: String, timeout: Duration },
+    #[error("source command `{command}`'s output reader ended unexpectedly")]
+    CommandReaderEnded { command: String },
     #[error("HTTP source timeout_seconds must be greater than zero")]
     InvalidTimeout,
     #[error("normalized HTTP source request failed")]
@@ -216,11 +231,9 @@ fn read_generic_file_bytes(path: &Path) -> Result<Vec<u8>> {
         path: path.to_owned(),
     })?;
     read_bounded(&mut file, MAX_GENERIC_SOURCE_BYTES)
-        .map_err(|source| {
-            GenericSourceError::FileReadFailed {
-                path: path.to_owned(),
-                source,
-            }
+        .map_err(|source| GenericSourceError::FileReadFailed {
+            path: path.to_owned(),
+            source,
         })
         .map_err(Into::into)
 }
@@ -231,11 +244,23 @@ fn collect_normalized_file(path: &Path) -> Result<QuotaSnapshot> {
 }
 
 /// Runs a generic source command (argv, never shell-interpreted) and reads
-/// its stdout under the shared §7.4 bound. Used by both the quota
-/// (`command`) and resource (§22.5) collectors.
-fn read_generic_command_bytes(argv: &[String]) -> Result<Vec<u8>> {
+/// its stdout under the shared §7.4 bound, within `timeout`. Used by both
+/// the quota (`command`) and resource (§22.5) collectors -- including a
+/// cross-host `command` source whose `argv[0]` is `ssh` (§22.10): the child
+/// is spawned as the leader of its own process group precisely so an SSH
+/// invocation (and whatever it runs remotely) can be killed completely on
+/// timeout, not just the local `ssh` process, and `timeout` bounds the
+/// whole round trip -- connection, authentication, and the remote
+/// command's runtime -- not just local startup.
+///
+/// Reads stdout on a background thread so the size bound (which must keep
+/// consuming bytes to notice it was exceeded) and the wall-clock timeout
+/// can be enforced at the same time: the main thread blocks on
+/// `recv_timeout` instead of on the read itself. Mirrors
+/// `src/fleet.rs`'s `command_observer_current_workers`.
+fn read_generic_command_bytes(argv: &[String], timeout: Duration) -> Result<Vec<u8>> {
     let command = argv[0].clone();
-    let mut child = Command::new(&argv[0])
+    let mut child = new_process_group_command(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -244,20 +269,39 @@ fn read_generic_command_bytes(argv: &[String]) -> Result<Vec<u8>> {
         .map_err(|_| GenericSourceError::CommandSpawnFailed {
             command: command.clone(),
         })?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GenericSourceError::CommandStdoutMissing {
-            command: command.clone(),
-        })?;
-    let bytes = read_bounded(&mut stdout, MAX_GENERIC_SOURCE_BYTES);
-    drop(stdout);
+    let mut stdout =
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| GenericSourceError::CommandStdoutMissing {
+                command: command.clone(),
+            })?;
+
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _ = sender.send(read_bounded(&mut stdout, MAX_GENERIC_SOURCE_BYTES));
+    });
+
+    let bytes = match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            kill_child_tree(&mut child);
+            let _ = reader.join();
+            return Err(GenericSourceError::CommandTimedOut { command, timeout }.into());
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = reader.join();
+            return Err(GenericSourceError::CommandReaderEnded { command }.into());
+        }
+    };
+    let _ = reader.join();
+
     if bytes.is_err() {
-        // The child may still be trying to write past the bound; kill it
-        // rather than risk it blocking forever on a full pipe buffer nobody
-        // is draining.
-        let _ = child.kill();
-        let _ = child.wait();
+        // The child may still be trying to write past the bound; kill its
+        // whole process group rather than risk a grandchild (e.g. an SSH
+        // remote command) blocking forever on a full pipe buffer nobody is
+        // draining.
+        kill_child_tree(&mut child);
     }
     let bytes = bytes.map_err(|source| GenericSourceError::CommandReadFailed {
         command: command.clone(),
@@ -275,8 +319,49 @@ fn read_generic_command_bytes(argv: &[String]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Spawns `program` as the leader of its own new process group, so
+/// [`kill_child_tree`] can terminate it and everything it spawns -- an SSH
+/// remote command in particular (plan.md §22.10) -- not just the immediate
+/// child. Mirrors `src/fleet.rs`'s helper of the same name; kept as its own
+/// copy here rather than a cross-module import so the account-source and
+/// fleet-actuation code paths stay independent.
+#[cfg(unix)]
+fn new_process_group_command(program: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(program);
+    command.process_group(0);
+    command
+}
+
+#[cfg(not(unix))]
+fn new_process_group_command(program: &str) -> Command {
+    Command::new(program)
+}
+
+/// Kills `child`'s whole process group (or just `child` where process
+/// groups aren't available) and reaps it. Best-effort, matching
+/// `src/fleet.rs`'s helper of the same name: a child that has already
+/// exited, or a signal that fails to reach every descendant, is not
+/// treated as an error here -- the caller is already on a failure or
+/// timeout path.
+#[cfg(unix)]
+fn kill_child_tree(child: &mut Child) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_child_tree(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn collect_command(argv: &[String]) -> Result<QuotaSnapshot> {
-    let bytes = read_generic_command_bytes(argv)?;
+    let bytes = read_generic_command_bytes(argv, COMMAND_TIMEOUT)?;
     serde_json::from_slice(&bytes).map_err(|_| GenericSourceError::MalformedSnapshot.into())
 }
 
@@ -316,7 +401,7 @@ pub fn collect_resource(source: &SourceConfig) -> Result<ResourceSnapshot> {
             url,
             timeout_seconds,
         } => read_generic_http_bytes(url, *timeout_seconds)?,
-        SourceConfig::Command { argv } => read_generic_command_bytes(argv)?,
+        SourceConfig::Command { argv } => read_generic_command_bytes(argv, COMMAND_TIMEOUT)?,
         SourceConfig::AnthropicOauth { .. } | SourceConfig::CodexAppServer { .. } => {
             return Err(GenericSourceError::UnsupportedResourceSourceType.into());
         }
@@ -396,19 +481,20 @@ fn obtain_access_token(
         .map_err(|_| AnthropicSourceError::CredentialsUnopenable {
             path: credentials_path.to_owned(),
         })?;
-    lock_exclusive_bounded(&lock_file, timeout_seconds).map_err(|_| AnthropicSourceError::Locked {
-        path: credentials_path.to_owned(),
+    lock_exclusive_bounded(&lock_file, timeout_seconds).map_err(|_| {
+        AnthropicSourceError::Locked {
+            path: credentials_path.to_owned(),
+        }
     })?;
     // Held until this function returns, so the whole read-decide(-refresh)
     // section below is one critical section under the lock.
     let _lock = lock_file;
 
-    let credentials =
-        read_json(credentials_path, "Claude Code credentials").map_err(|_| {
-            AnthropicSourceError::CredentialsUnreadable {
-                path: credentials_path.to_owned(),
-            }
-        })?;
+    let credentials = read_json(credentials_path, "Claude Code credentials").map_err(|_| {
+        AnthropicSourceError::CredentialsUnreadable {
+            path: credentials_path.to_owned(),
+        }
+    })?;
     let oauth = credentials
         .get("claudeAiOauth")
         .and_then(Value::as_object)
@@ -515,9 +601,7 @@ fn apply_refreshed_credentials(
     let new_expiry = refreshed
         .get("expiresAt")
         .and_then(Value::as_i64)
-        .ok_or(AnthropicSourceError::RefreshResponseMissingField {
-            field: "expiresAt",
-        })?;
+        .ok_or(AnthropicSourceError::RefreshResponseMissingField { field: "expiresAt" })?;
 
     let mut current = read_json(credentials_path, "Claude Code credentials").map_err(|_| {
         AnthropicSourceError::CredentialsUnreadable {
@@ -664,7 +748,9 @@ fn codex_sessions() -> &'static Mutex<HashMap<PathBuf, CodexSession>> {
 /// are cached process-wide rather than per-call.
 pub fn shutdown_codex_sessions() {
     if let Some(sessions) = CODEX_SESSIONS.get() {
-        let mut guard = sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.clear();
     }
 }
@@ -677,7 +763,9 @@ pub fn shutdown_codex_sessions() {
 /// poll, not a permanent failure for every poll after it.
 fn with_codex_session(executable: &Path, timeout_seconds: u64) -> Result<Value> {
     let sessions = codex_sessions();
-    let mut guard = sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     if let Some(session) = guard.get_mut(executable) {
         match codex_session_read_rate_limits(session, timeout_seconds) {
@@ -775,7 +863,10 @@ fn spawn_and_handshake_codex(executable: &Path, timeout_seconds: u64) -> Result<
         "params": {"clientInfo": {"name": "subscription-governor", "version": "0.1.0"}}
     });
     writeln!(session.stdin, "{initialize}").map_err(CodexSourceError::WriteFailed)?;
-    session.stdin.flush().map_err(CodexSourceError::WriteFailed)?;
+    session
+        .stdin
+        .flush()
+        .map_err(CodexSourceError::WriteFailed)?;
     let initialized = receive_response(&session.receiver, initialize_id, timeout_seconds)
         .map_err(|_| CodexSourceError::InitializeTimedOut)?;
     if let Some(error) = initialized.get("error") {
@@ -785,14 +876,24 @@ fn spawn_and_handshake_codex(executable: &Path, timeout_seconds: u64) -> Result<
         return Err(CodexSourceError::InitializeRejected { code }.into());
     }
 
-    writeln!(session.stdin, "{}", json!({"method": "initialized", "params": {}}))
+    writeln!(
+        session.stdin,
+        "{}",
+        json!({"method": "initialized", "params": {}})
+    )
+    .map_err(CodexSourceError::WriteFailed)?;
+    session
+        .stdin
+        .flush()
         .map_err(CodexSourceError::WriteFailed)?;
-    session.stdin.flush().map_err(CodexSourceError::WriteFailed)?;
 
     Ok(session)
 }
 
-fn codex_session_read_rate_limits(session: &mut CodexSession, timeout_seconds: u64) -> Result<Value> {
+fn codex_session_read_rate_limits(
+    session: &mut CodexSession,
+    timeout_seconds: u64,
+) -> Result<Value> {
     let id = session.next_id;
     session.next_id += 1;
     writeln!(
@@ -801,7 +902,10 @@ fn codex_session_read_rate_limits(session: &mut CodexSession, timeout_seconds: u
         json!({"id": id, "method": "account/rateLimits/read"})
     )
     .map_err(CodexSourceError::WriteFailed)?;
-    session.stdin.flush().map_err(CodexSourceError::WriteFailed)?;
+    session
+        .stdin
+        .flush()
+        .map_err(CodexSourceError::WriteFailed)?;
     let response = receive_response(&session.receiver, id, timeout_seconds)
         .map_err(|_| CodexSourceError::RateLimitsTimedOut)?;
     if let Some(error) = response.get("error") {
@@ -850,13 +954,18 @@ fn read_bounded_codex_frame(
     limit: usize,
 ) -> std::io::Result<Option<CodexFrame>> {
     let mut buffer = Vec::new();
-    let read = reader.by_ref().take(limit as u64).read_until(b'\n', &mut buffer)?;
+    let read = reader
+        .by_ref()
+        .take(limit as u64)
+        .read_until(b'\n', &mut buffer)?;
     if read == 0 {
         return Ok(None);
     }
     if buffer.last() == Some(&b'\n') {
         buffer.pop();
-        return Ok(Some(CodexFrame::Line(String::from_utf8_lossy(&buffer).into_owned())));
+        return Ok(Some(CodexFrame::Line(
+            String::from_utf8_lossy(&buffer).into_owned(),
+        )));
     }
     // `limit` bytes were consumed without finding a newline: either a
     // too-long frame or the stream ended mid-line (e.g. the process died
@@ -1142,7 +1251,10 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
                 )
             })?;
             parent_dir.sync_all().with_context(|| {
-                format!("failed to fsync {} after credentials rename", parent.display())
+                format!(
+                    "failed to fsync {} after credentials rename",
+                    parent.display()
+                )
             })?;
         }
 
@@ -1289,8 +1401,14 @@ mod tests {
 
         let on_disk = read_json(&path, "test credentials").unwrap();
         let oauth = on_disk.get("claudeAiOauth").unwrap();
-        assert_eq!(oauth.get("accessToken").unwrap().as_str(), Some("new-access"));
-        assert_eq!(oauth.get("refreshToken").unwrap().as_str(), Some("refresh-b"));
+        assert_eq!(
+            oauth.get("accessToken").unwrap().as_str(),
+            Some("new-access")
+        );
+        assert_eq!(
+            oauth.get("refreshToken").unwrap().as_str(),
+            Some("refresh-b")
+        );
         // Unknown fields survive the refresh write.
         assert_eq!(
             oauth.get("unrelatedField").unwrap().as_str(),
@@ -1611,6 +1729,88 @@ mod tests {
         assert!(collect(&source).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_generic_command_bytes_succeeds_well_within_a_short_timeout() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo hi".to_string(),
+        ];
+        let bytes = read_generic_command_bytes(&argv, Duration::from_millis(500)).unwrap();
+        assert_eq!(bytes, b"hi\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_generic_command_bytes_times_out_on_a_hanging_command() {
+        // Plan.md §22.10: this is the exact class of hang an unreachable
+        // SSH host (or one stuck at a password prompt, since only key-based
+        // auth is sanctioned) would produce -- the command timeout must
+        // bound it rather than waiting forever.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 5".to_string(),
+        ];
+        let start = std::time::Instant::now();
+        let result = read_generic_command_bytes(&argv, Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "should time out around 100ms, not wait for the 5s sleep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_generic_command_bytes_timeout_kills_the_whole_process_group() {
+        // Mirrors src/fleet.rs's command_observer_timeout_kills_the_whole_process_group:
+        // an SSH invocation's remote session is a grandchild of the local
+        // `ssh` process (and may itself fork further), so killing only the
+        // direct child on timeout would leak it -- plan.md §22.10 requires
+        // the whole round trip to be bounded, not just the local exec step.
+        let dir = std::env::temp_dir().join(format!("subgov-source-pgroup-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("grandchild-ran");
+        let script = format!("(sleep 0.3; touch {}) & sleep 5", marker.display());
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+
+        let result = read_generic_command_bytes(&argv, Duration::from_millis(100));
+        assert!(result.is_err());
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            !marker.exists(),
+            "the grandchild should have been killed along with the rest of the process group"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_timeout_error_names_the_command_but_not_a_secret_argument() {
+        // `sleep 5` alone genuinely hangs for the full duration (unlike
+        // `sleep 5 <non-numeric>`, which GNU sleep rejects and exits
+        // immediately, defeating the point of this test); the secret-shaped
+        // value sits in the script text without affecting sleep's timing,
+        // so this actually exercises the CommandTimedOut path.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "SECRET=sk-super-secret-token; sleep 5".to_string(),
+        ];
+        let error = read_generic_command_bytes(&argv, Duration::from_millis(100)).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("/bin/sh"),
+            "expected the command name to survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-super-secret-token"),
+            "an argv element must never leak into the timeout error text: {rendered}"
+        );
+    }
+
     /// Serves `body` once over raw HTTP/1.1 on an ephemeral loopback port,
     /// with no request-size mocking library required, and returns the raw
     /// request bytes the client sent so tests can inspect exactly what went
@@ -1796,9 +1996,7 @@ mod tests {
 
     #[test]
     fn codex_source_error_display_carries_only_a_safe_code() {
-        let error = CodexSourceError::RateLimitsRejected {
-            code: Some(-32000),
-        };
+        let error = CodexSourceError::RateLimitsRejected { code: Some(-32000) };
         let text = error.to_string();
         assert!(text.contains("-32000"));
 
@@ -1809,11 +2007,14 @@ mod tests {
     fn frame_line(value: Option<CodexFrame>) -> String {
         match value {
             Some(CodexFrame::Line(line)) => line,
-            other => panic!("expected CodexFrame::Line, got {}", match other {
-                Some(CodexFrame::Oversized) => "Oversized",
-                None => "None (EOF)",
-                _ => unreachable!(),
-            }),
+            other => panic!(
+                "expected CodexFrame::Line, got {}",
+                match other {
+                    Some(CodexFrame::Oversized) => "Oversized",
+                    None => "None (EOF)",
+                    _ => unreachable!(),
+                }
+            ),
         }
     }
 
@@ -1886,7 +2087,9 @@ mod tests {
         let frame = read_bounded_codex_frame(&mut cursor, 1024).unwrap();
         assert!(matches!(frame, Some(CodexFrame::Oversized)));
         // Nothing left to read afterward.
-        assert!(read_bounded_codex_frame(&mut cursor, 1024).unwrap().is_none());
+        assert!(read_bounded_codex_frame(&mut cursor, 1024)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
