@@ -62,11 +62,17 @@ pub fn evaluate(
             StaleBehavior::Hold => current_workers,
             StaleBehavior::MinWorkers => fleet.min_workers,
         };
+        // §9.1: neither stale behavior may increase workers. apply_step_limits alone is
+        // not enough here -- MinWorkers can raise `raw` above `current_workers` when the
+        // fleet's configured floor exceeds the observed count, and its own upward step
+        // allowance would then climb toward that floor. Capping at current_workers keeps
+        // the downward step limit (still applied inside apply_step_limits) while making
+        // the "never increase while stale" invariant hold unconditionally.
         return Ok(Decision {
             account: account_name.to_owned(),
             observed_at: snapshot.observed_at,
             current_workers,
-            desired_workers: apply_step_limits(raw, current_workers, config),
+            desired_workers: apply_step_limits(raw, current_workers, config).min(current_workers),
             stale: true,
             windows: Vec::new(),
             banked_resets: None,
@@ -306,11 +312,19 @@ fn workers_for_rate(required_rate: f64, per_worker_rate: f64) -> u32 {
 fn apply_step_limits(desired: u32, current: u32, config: &AccountConfig) -> u32 {
     let fleet = &config.fleet;
     let bounded = desired.clamp(fleet.min_workers, fleet.max_workers);
-    if bounded > current {
+    let stepped = if bounded > current {
         bounded.min(current.saturating_add(fleet.max_scale_up_per_cycle))
     } else {
         bounded.max(current.saturating_sub(fleet.max_scale_down_per_cycle))
-    }
+    };
+    // A zero-sized step cap combined with `current` already sitting outside
+    // [min_workers, max_workers] (e.g. after a fleet reconfiguration lowered
+    // max_workers or raised min_workers below/above the live worker count)
+    // would otherwise leave `stepped` outside the fleet bounds indefinitely.
+    // The bounds invariant is unconditional (§17.2); re-clamping here is what
+    // makes it hold even in that edge case, without weakening the step cap in
+    // the ordinary case where `current` is already within bounds.
+    stepped.clamp(fleet.min_workers, fleet.max_workers)
 }
 
 #[cfg(test)]
@@ -879,5 +893,230 @@ mod tests {
         let error =
             evaluate("test", &config, &snapshot, &AccountState::default(), 2, now).unwrap_err();
         assert!(error.to_string().contains("no enabled quota windows"));
+    }
+
+    // --- §17.2 property tests: clamping and monotonic safety ---
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        prop_compose! {
+            fn arb_fleet()(
+                min_workers in 0u32..6,
+                extra_for_max in 0u32..10,
+                bootstrap_extra in 0u32..6,
+                max_scale_up_per_cycle in 0u32..6,
+                max_scale_down_per_cycle in 0u32..6,
+            ) -> FleetConfig {
+                let max_workers = min_workers + extra_for_max;
+                FleetConfig {
+                    min_workers,
+                    max_workers,
+                    bootstrap_workers: bootstrap_extra.min(max_workers),
+                    max_scale_up_per_cycle,
+                    max_scale_down_per_cycle,
+                    observer: WorkerObserverConfig::Static { workers: 0 },
+                    actuator: ActuatorConfig::None,
+                }
+            }
+        }
+
+        prop_compose! {
+            fn arb_account()(
+                fleet in arb_fleet(),
+                target in 0.01f64..=1.0,
+                ceiling_only in any::<bool>(),
+                stale_after_seconds in 1u64..3600,
+                minimum_sample_seconds in 1u64..600,
+            ) -> AccountConfig {
+                AccountConfig {
+                    source: SourceConfig::NormalizedFile { path: "x".into() },
+                    fleet,
+                    utilization: UtilizationConfig {
+                        target_utilization: Some(target),
+                        reserve_fraction: None,
+                        strategy: if ceiling_only {
+                            crate::config::Strategy::CeilingOnly
+                        } else {
+                            crate::config::Strategy::LinearToReset
+                        },
+                        stale_after_seconds,
+                        stale_behavior: StaleBehavior::Hold,
+                        minimum_sample_seconds,
+                        windows: BTreeMap::new(),
+                    },
+                    banked_resets: BankedResetConfig::default(),
+                }
+            }
+        }
+
+        fn single_window_snapshot(
+            now: DateTime<Utc>,
+            id: &str,
+            used_fraction: f64,
+            resets_in_hours: i64,
+            reached: bool,
+        ) -> QuotaSnapshot {
+            QuotaSnapshot {
+                observed_at: now,
+                fresh: true,
+                windows: vec![QuotaWindow {
+                    id: id.into(),
+                    used_fraction,
+                    resets_at: now + Duration::hours(resets_in_hours),
+                    duration_minutes: Some(300),
+                    reached,
+                }],
+                reset_credits: None,
+            }
+        }
+
+        proptest! {
+            /// §17.2: "desired count is always within fleet bounds."
+            #[test]
+            fn desired_workers_always_within_fleet_bounds(
+                config in arb_account(),
+                used_fraction in 0.0f64..=1.0,
+                current_workers in 0u32..20,
+                reached in any::<bool>(),
+                resets_in_hours in 1i64..200,
+            ) {
+                let now = Utc::now();
+                let snapshot = single_window_snapshot(now, "weekly", used_fraction, resets_in_hours, reached);
+                let decision = evaluate(
+                    "prop",
+                    &config,
+                    &snapshot,
+                    &AccountState::default(),
+                    current_workers,
+                    now,
+                )
+                .unwrap();
+                prop_assert!(decision.desired_workers >= config.fleet.min_workers);
+                prop_assert!(decision.desired_workers <= config.fleet.max_workers);
+                for window in &decision.windows {
+                    prop_assert!(window.desired_workers >= config.fleet.min_workers);
+                    prop_assert!(window.desired_workers <= config.fleet.max_workers);
+                }
+            }
+
+            /// §9.1 / §17.2: "stale decisions never exceed current workers" -- true for
+            /// both StaleBehavior variants, regardless of how the fleet's min_workers
+            /// floor relates to the currently observed worker count.
+            #[test]
+            fn stale_decision_never_exceeds_current_workers(
+                mut config in arb_account(),
+                current_workers in 0u32..20,
+                stale_via_fresh_flag in any::<bool>(),
+                extra_staleness_seconds in 0u64..10_000,
+                use_min_workers_behavior in any::<bool>(),
+                used_fraction in 0.0f64..=1.0,
+            ) {
+                config.utilization.stale_behavior = if use_min_workers_behavior {
+                    StaleBehavior::MinWorkers
+                } else {
+                    StaleBehavior::Hold
+                };
+                let now = Utc::now();
+                let observed_at = if stale_via_fresh_flag {
+                    now
+                } else {
+                    now - Duration::seconds(
+                        (config.utilization.stale_after_seconds + extra_staleness_seconds + 1) as i64,
+                    )
+                };
+                let snapshot = QuotaSnapshot {
+                    observed_at,
+                    fresh: !stale_via_fresh_flag,
+                    windows: vec![QuotaWindow {
+                        id: "weekly".into(),
+                        used_fraction,
+                        resets_at: now + Duration::hours(4),
+                        duration_minutes: Some(10_080),
+                        reached: false,
+                    }],
+                    reset_credits: None,
+                };
+                let decision = evaluate(
+                    "prop",
+                    &config,
+                    &snapshot,
+                    &AccountState::default(),
+                    current_workers,
+                    now,
+                )
+                .unwrap();
+                prop_assert!(decision.stale);
+                prop_assert!(decision.desired_workers <= current_workers);
+            }
+
+            /// §17.2: "adding another enabled window cannot increase the raw account
+            /// target." Compares the same account/current_workers against a snapshot
+            /// with one window vs. the same snapshot plus a second enabled window;
+            /// apply_step_limits is monotonic non-decreasing in its raw input for a
+            /// fixed (current_workers, config), so this holds at the emitted
+            /// desired_workers level too. banked_resets stays disabled (the default)
+            /// so it cannot confound which window is binding.
+            #[test]
+            fn adding_an_enabled_window_never_raises_the_desired_workers(
+                config in arb_account(),
+                current_workers in 0u32..20,
+                used_fraction_a in 0.0f64..=1.0,
+                reached_a in any::<bool>(),
+                resets_in_hours_a in 1i64..200,
+                used_fraction_b in 0.0f64..=1.0,
+                reached_b in any::<bool>(),
+                resets_in_hours_b in 1i64..200,
+            ) {
+                prop_assert!(!config.banked_resets.enabled);
+                let now = Utc::now();
+                let window_a = QuotaWindow {
+                    id: "w0".into(),
+                    used_fraction: used_fraction_a,
+                    resets_at: now + Duration::hours(resets_in_hours_a),
+                    duration_minutes: Some(300),
+                    reached: reached_a,
+                };
+                let window_b = QuotaWindow {
+                    id: "w1".into(),
+                    used_fraction: used_fraction_b,
+                    resets_at: now + Duration::hours(resets_in_hours_b),
+                    duration_minutes: Some(300),
+                    reached: reached_b,
+                };
+                let snapshot_one = QuotaSnapshot {
+                    observed_at: now,
+                    fresh: true,
+                    windows: vec![window_a.clone()],
+                    reset_credits: None,
+                };
+                let snapshot_two = QuotaSnapshot {
+                    observed_at: now,
+                    fresh: true,
+                    windows: vec![window_a, window_b],
+                    reset_credits: None,
+                };
+                let decision_one = evaluate(
+                    "prop",
+                    &config,
+                    &snapshot_one,
+                    &AccountState::default(),
+                    current_workers,
+                    now,
+                )
+                .unwrap();
+                let decision_two = evaluate(
+                    "prop",
+                    &config,
+                    &snapshot_two,
+                    &AccountState::default(),
+                    current_workers,
+                    now,
+                )
+                .unwrap();
+                prop_assert!(decision_two.desired_workers <= decision_one.desired_workers);
+            }
+        }
     }
 }
