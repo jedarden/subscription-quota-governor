@@ -1,6 +1,6 @@
 use crate::config::{AccountConfig, StaleBehavior, Strategy};
-use crate::model::QuotaSnapshot;
-use crate::state::AccountState;
+use crate::model::{QuotaSnapshot, QuotaWindow};
+use crate::state::{AccountState, WindowSample};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -127,29 +127,21 @@ pub fn evaluate(
                             && sample.workers > 0
                     }) {
                         Some(sample) => {
-                            let elapsed_hours = snapshot
-                                .observed_at
-                                .signed_duration_since(sample.observed_at)
-                                .num_milliseconds()
-                                as f64
-                                / 3_600_000.0;
-                            let per_worker = (window.used_fraction - sample.used_fraction)
-                                / elapsed_hours
-                                / f64::from(sample.workers);
-                            if per_worker > 0.0 && per_worker.is_finite() {
-                                burn_per_worker = Some(per_worker);
-                                let remaining_hours = window
-                                    .resets_at
-                                    .signed_duration_since(now)
-                                    .num_milliseconds()
-                                    as f64
-                                    / 3_600_000.0;
-                                let required_rate =
-                                    (target - window.used_fraction) / remaining_hours;
-                                let workers = workers_for_rate(required_rate, per_worker);
-                                (workers, "paced_to_reset")
-                            } else {
-                                (current_workers, "no_observed_burn")
+                            match estimate_burn_per_worker(sample, window, snapshot.observed_at) {
+                                Some(per_worker) => {
+                                    burn_per_worker = Some(per_worker);
+                                    let remaining_hours = window
+                                        .resets_at
+                                        .signed_duration_since(now)
+                                        .num_milliseconds()
+                                        as f64
+                                        / 3_600_000.0;
+                                    let required_rate =
+                                        (target - window.used_fraction) / remaining_hours;
+                                    let workers = workers_for_rate(required_rate, per_worker);
+                                    (workers, "paced_to_reset")
+                                }
+                                None => (current_workers, "no_observed_burn"),
                             }
                         }
                         None if current_workers == 0 => {
@@ -304,6 +296,43 @@ fn banked_reset_decision(
 
 fn is_weekly_window(duration_minutes: Option<u64>) -> bool {
     duration_minutes.is_some_and(|minutes| minutes >= 6 * 24 * 60)
+}
+
+/// §9.4/§9.8 two-point burn-rate estimator: the change in `used_fraction`
+/// per worker per hour between two same-generation samples.
+///
+/// Callers must only invoke this with a `sample` that already passed the
+/// same-generation, minimum-sample-age, non-negative-delta, and
+/// `workers > 0` checks (see the `prior.windows.get(...).filter(...)` call
+/// site) -- those preconditions are asserted in debug builds, not
+/// re-validated here.
+///
+/// The v0.1 baseline is this plain two-point ratio; the exact statistical
+/// upgrade (robust regression, an explicit quantization-interval model, ...)
+/// is deferred pending observation-mode evidence (§21). What this function
+/// guarantees unconditionally, per §9.8, is the one property that does not
+/// need that evidence: provider utilization is reported as a quantized
+/// percentage, so two samples reporting an equal value are *censored* --
+/// consistent with any true delta in `[0, one_quantization_step)`, never
+/// proof of exactly zero consumption -- and must never be reported as a
+/// learned rate of zero. Returning `None` ("no usable rate") rather than
+/// `Some(0.0)` makes that a structural guarantee: a caller cannot mistake
+/// censored data for confirmed idleness, because a confirmed rate of
+/// precisely zero is not a value this function can ever produce.
+fn estimate_burn_per_worker(
+    sample: &WindowSample,
+    window: &QuotaWindow,
+    observed_at: DateTime<Utc>,
+) -> Option<f64> {
+    debug_assert!(window.used_fraction >= sample.used_fraction);
+    debug_assert!(sample.workers > 0);
+    let elapsed_hours = observed_at
+        .signed_duration_since(sample.observed_at)
+        .num_milliseconds() as f64
+        / 3_600_000.0;
+    let per_worker =
+        (window.used_fraction - sample.used_fraction) / elapsed_hours / f64::from(sample.workers);
+    (per_worker.is_finite() && per_worker > 0.0).then_some(per_worker)
 }
 
 fn workers_for_rate(required_rate: f64, per_worker_rate: f64) -> u32 {
@@ -563,6 +592,118 @@ mod tests {
         .unwrap();
         assert_eq!(decision.desired_workers, 1);
         assert_eq!(decision.windows[0].reason, "bootstrap_burn_rate");
+    }
+
+    // --- §9.8: estimate_burn_per_worker cannot learn a zero rate from
+    // censored (quantized) data ---
+
+    #[test]
+    fn estimate_burn_per_worker_never_reports_a_learned_zero_rate_for_a_censored_delta() {
+        let now = Utc::now();
+        let resets_at = now + Duration::hours(4);
+        let sample = WindowSample {
+            observed_at: now - Duration::hours(1),
+            used_fraction: 0.42,
+            resets_at,
+            workers: 3,
+        };
+        // Identical to the prior sample: consistent with any true delta in
+        // [0, one_quantization_step), not proof of exactly zero consumption.
+        let window = QuotaWindow {
+            id: "weekly".into(),
+            used_fraction: 0.42,
+            resets_at,
+            duration_minutes: Some(10_080),
+            reached: false,
+        };
+        assert_eq!(estimate_burn_per_worker(&sample, &window, now), None);
+    }
+
+    #[test]
+    fn estimate_burn_per_worker_reports_the_expected_rate_for_a_real_delta() {
+        let now = Utc::now();
+        let resets_at = now + Duration::hours(4);
+        let sample = WindowSample {
+            observed_at: now - Duration::hours(2),
+            used_fraction: 0.25,
+            resets_at,
+            workers: 2,
+        };
+        let window = QuotaWindow {
+            id: "weekly".into(),
+            used_fraction: 0.75,
+            resets_at,
+            duration_minutes: Some(10_080),
+            reached: false,
+        };
+        // (0.75 - 0.25) / 2h / 2 workers = 0.125 per worker per hour.
+        assert_eq!(estimate_burn_per_worker(&sample, &window, now), Some(0.125));
+    }
+
+    #[test]
+    fn censored_zero_delta_holds_without_learning_a_zero_rate() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(8);
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.5,
+                resets_at: reset,
+                duration_minutes: None,
+                reached: false,
+            }],
+            reset_credits: None,
+        };
+        let mut prior = AccountState::default();
+        prior.windows.insert(
+            "weekly".into(),
+            WindowSample {
+                observed_at: now - Duration::hours(1),
+                used_fraction: 0.5,
+                resets_at: reset,
+                workers: 2,
+            },
+        );
+        let decision = evaluate("test", &account(), &snapshot, &prior, 2, now).unwrap();
+        assert_eq!(decision.windows[0].reason, "no_observed_burn");
+        assert_eq!(decision.windows[0].observed_burn_per_worker_hour, None);
+        assert_eq!(decision.desired_workers, 2);
+    }
+
+    #[test]
+    fn censored_zero_delta_at_zero_workers_holds_at_zero_per_plan_9_4() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(8);
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.5,
+                resets_at: reset,
+                duration_minutes: None,
+                reached: false,
+            }],
+            reset_credits: None,
+        };
+        let mut prior = AccountState::default();
+        prior.windows.insert(
+            "weekly".into(),
+            WindowSample {
+                observed_at: now - Duration::hours(1),
+                used_fraction: 0.5,
+                resets_at: reset,
+                workers: 2,
+            },
+        );
+        // §9.4: "a zero observed delta holds because quantized percentages
+        // do not prove zero consumption" -- unconditionally, even though a
+        // *missing* sample at zero workers would instead bootstrap.
+        let decision = evaluate("test", &account(), &snapshot, &prior, 0, now).unwrap();
+        assert_eq!(decision.windows[0].reason, "no_observed_burn");
+        assert_eq!(decision.desired_workers, 0);
     }
 
     #[test]
