@@ -820,6 +820,65 @@ mod exit_code_tests {
         assert_eq!(outcome.actuation_failures, 1);
         assert_eq!(state.accounts.get("a"), Some(&prior));
     }
+
+    // The test above uses AccountState::default() as the "prior" it expects
+    // back, which can't distinguish "genuinely left untouched" from "reset to
+    // something that happens to look like default" -- a real regression
+    // (e.g. record() running before the actuate() error is checked) could
+    // slip through if the incoming snapshot/decision ever produced a
+    // default-shaped AccountState by coincidence. Use a prior with concrete,
+    // non-default history/windows/last_target -- values a buggy cycle would
+    // visibly clobber with this cycle's own (unactuated) observation -- so
+    // an equality failure here can only mean the state was actually mutated.
+    #[test]
+    fn run_cycle_does_not_advance_a_richly_populated_prior_state_on_actuation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("snapshot.json");
+        let snapshot = json!({
+            "observed_at": Utc::now(),
+            "fresh": true,
+            "windows": [
+                {"id": "five_hour", "used_fraction": 0.1, "resets_at": Utc::now() + chrono::Duration::hours(2)},
+            ],
+        });
+        fs::write(&snapshot_path, snapshot.to_string()).unwrap();
+
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            "a".to_string(),
+            account_config_with_failing_actuator(snapshot_path),
+        );
+        let config = Config {
+            version: 1,
+            poll_interval_seconds: 300,
+            state_path: None,
+            accounts,
+        };
+
+        let mut prior = subscription_governor::state::AccountState::default();
+        prior.last_target = Some(7);
+        prior.windows.insert(
+            "five_hour".to_string(),
+            subscription_governor::state::WindowSample {
+                observed_at: Utc::now() - chrono::Duration::hours(1),
+                used_fraction: 0.42,
+                resets_at: Utc::now() + chrono::Duration::hours(1),
+                workers: 2,
+            },
+        );
+
+        let mut state = State::default();
+        state.accounts.insert("a".to_string(), prior.clone());
+        let shutdown = AtomicBool::new(false);
+        let outcome = run_cycle(&config, &mut state, false, &shutdown);
+
+        assert_eq!(outcome.actuation_failures, 1);
+        assert_eq!(
+            state.accounts.get("a"),
+            Some(&prior),
+            "a failed actuation must never overwrite the account's prior recorded state"
+        );
+    }
 }
 
 #[cfg(test)]
