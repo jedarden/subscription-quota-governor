@@ -149,6 +149,7 @@ See [architecture decisions](docs/adr/README.md),
 [configuration compatibility policy](docs/notes/compatibility.md),
 [state backup and removal](docs/notes/state-backup-and-removal.md),
 [secure HTTP deployment for the Z.AI collector](docs/notes/zai-collector-http-deployment.md),
+[operator runbooks](docs/notes/runbooks/README.md),
 the [implementation plan](docs/plan/plan.md), the [changelog](CHANGELOG.md), a
 [hardened systemd service example](deploy/systemd/), and the ready-to-edit
 [Claude Code](examples/claude-code.yaml), [Codex](examples/codex.yaml), and
