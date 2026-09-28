@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://git.ardenone.com/jedarden/subscription-quota-governor/raw/branch/main/schema/governor-config.schema.json",
   "title": "Governor configuration (version 1)",
-  "description": "The §8 versioned config contract, hand-written against the actual Deserialize/validate() behavior of Config and its nested types in src/config.rs, and checked against every real fixture under examples/*.yaml. version is pinned to the literal 1 because Config::validate() rejects anything else outright ('unsupported config version'); a future version 2 gets its own schema file rather than a union here, matching the plan's 'new top-level version' compatibility rule. Every object here mirrors a #[serde(deny_unknown_fields)] struct, so additionalProperties is false throughout (unlike quota-snapshot.schema.json, which mirrors permissive structs). Two classes of Config::validate() rule are documented but NOT enforced by this schema, because vanilla JSON Schema has no portable way to express them: (1) cross-field numeric comparisons on sibling properties -- max_workers >= min_workers, bootstrap_workers <= max_workers -- there is no standard keyword to compare two named properties against each other; (2) positivity/boundedness of stale_after_seconds, minimum_sample_seconds, and every timeout_seconds, which src/config.rs actually does not check either today despite §8 saying 'Poll, staleness, sample, and transport durations are positive and bounded' -- filed as subgov-634ba279 alongside this schema. Where JSON Schema can express a Config::validate() rule (target/reserve exclusivity and ranges, non-empty argv, the {desired_workers} placeholder, non-empty accounts map), it does.",
+  "description": "The §8 versioned config contract, hand-written against the actual Deserialize/validate() behavior of Config and its nested types in src/config.rs, and checked against every real fixture under examples/*.yaml. version is pinned to the literal 1 because Config::validate() rejects anything else outright ('unsupported config version'); a future version 2 gets its own schema file rather than a union here, matching the plan's 'new top-level version' compatibility rule. Every object here mirrors a #[serde(deny_unknown_fields)] struct, so additionalProperties is false throughout (unlike quota-snapshot.schema.json, which mirrors permissive structs). One class of Config::validate() rule is documented but NOT enforced by this schema, because vanilla JSON Schema has no portable way to express it: cross-field numeric comparisons on sibling properties -- max_workers >= min_workers, bootstrap_workers <= max_workers, host max_workers <= the account's max_workers -- there is no standard keyword to compare two named properties against each other. §8's 'Poll, staleness, sample, and transport durations are positive and bounded' IS enforced (validate_duration() in src/config.rs, subgov-634ba279): every duration field below has minimum 1 and maximum i64::MAX, the same overflow-guard bound already used for banked_resets.deadline_safety_seconds. Where JSON Schema can express a Config::validate() rule (target/reserve exclusivity and ranges, non-empty argv, the {desired_workers} placeholder, non-empty accounts map), it does.",
   "type": "object",
   "required": ["version", "accounts"],
   "additionalProperties": false,
@@ -14,8 +14,9 @@
     "poll_interval_seconds": {
       "type": "integer",
       "minimum": 1,
+      "maximum": 9223372036854775807,
       "default": 300,
-      "description": "Config::validate() rejects 0; there is no documented upper bound."
+      "description": "Config::validate() rejects 0 or a value above i64::MAX."
     },
     "state_path": {
       "type": "string",
@@ -66,7 +67,13 @@
           "properties": {
             "type": { "const": "normalized_http" },
             "url": { "type": "string" },
-            "timeout_seconds": { "type": "integer", "minimum": 0, "default": 15 }
+            "timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807,
+              "default": 15,
+              "description": "Config::validate() rejects 0 or a value above i64::MAX."
+            }
           }
         },
         {
@@ -87,7 +94,13 @@
             "credentials_path": { "type": "string", "default": "~/.claude/.credentials.json" },
             "usage_url": { "type": "string", "default": "https://api.anthropic.com/api/oauth/usage" },
             "token_url": { "type": "string", "default": "https://platform.claude.com/v1/oauth/token" },
-            "timeout_seconds": { "type": "integer", "minimum": 0, "default": 15 }
+            "timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807,
+              "default": 15,
+              "description": "Config::validate() rejects 0 or a value above i64::MAX."
+            }
           }
         },
         {
@@ -97,7 +110,13 @@
           "properties": {
             "type": { "const": "codex_app_server" },
             "executable": { "type": "string", "default": "codex" },
-            "timeout_seconds": { "type": "integer", "minimum": 0, "default": 15 }
+            "timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807,
+              "default": 15,
+              "description": "Config::validate() rejects 0 or a value above i64::MAX."
+            }
           }
         }
       ]
@@ -236,7 +255,13 @@
           "properties": {
             "type": { "const": "normalized_http" },
             "url": { "type": "string" },
-            "timeout_seconds": { "type": "integer", "minimum": 0, "default": 15 }
+            "timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807,
+              "default": 15,
+              "description": "Config::validate() rejects 0 or a value above i64::MAX."
+            }
           }
         },
         {
@@ -272,12 +297,24 @@
         "target_utilization": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
         "reserve_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
         "strategy": { "$ref": "#/$defs/strategy" },
-        "stale_after_seconds": { "type": "integer", "minimum": 0, "default": 900 },
+        "stale_after_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 900,
+          "description": "Config::validate() rejects 0 or a value above i64::MAX. A deliberately huge value (e.g. 315360000, 10 years) is a valid way to effectively disable staleness -- see examples/all-three.yaml."
+        },
         "stale_behavior": {
           "enum": ["hold", "min_workers"],
           "default": "hold"
         },
-        "minimum_sample_seconds": { "type": "integer", "minimum": 0, "default": 300 },
+        "minimum_sample_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 300,
+          "description": "Config::validate() rejects 0 or a value above i64::MAX."
+        },
         "windows": {
           "type": "object",
           "default": {},

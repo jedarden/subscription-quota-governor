@@ -275,9 +275,7 @@ impl Config {
         if self.accounts.is_empty() {
             bail!("at least one account is required");
         }
-        if self.poll_interval_seconds == 0 {
-            bail!("poll_interval_seconds must be positive");
-        }
+        validate_duration(self.poll_interval_seconds, "poll_interval_seconds")?;
         for (name, account) in &self.accounts {
             if account.fleet.max_workers < account.fleet.min_workers {
                 bail!("account {name}: max_workers must be >= min_workers");
@@ -285,6 +283,14 @@ impl Config {
             if account.fleet.bootstrap_workers > account.fleet.max_workers {
                 bail!("account {name}: bootstrap_workers must be <= max_workers");
             }
+            validate_duration(
+                account.utilization.stale_after_seconds,
+                &format!("account {name}: utilization.stale_after_seconds"),
+            )?;
+            validate_duration(
+                account.utilization.minimum_sample_seconds,
+                &format!("account {name}: utilization.minimum_sample_seconds"),
+            )?;
             validate_target(
                 account.utilization.target_utilization,
                 account.utilization.reserve_fraction,
@@ -417,8 +423,25 @@ fn validate_target(
 }
 
 fn validate_source(source: &SourceConfig, account: &str) -> Result<()> {
-    if let SourceConfig::Command { argv } = source {
-        validate_argv(argv, &format!("account {account} source command"), false)?;
+    match source {
+        SourceConfig::Command { argv } => {
+            validate_argv(argv, &format!("account {account} source command"), false)?;
+        }
+        SourceConfig::NormalizedHttp {
+            timeout_seconds, ..
+        }
+        | SourceConfig::AnthropicOauth {
+            timeout_seconds, ..
+        }
+        | SourceConfig::CodexAppServer {
+            timeout_seconds, ..
+        } => {
+            validate_duration(
+                *timeout_seconds,
+                &format!("account {account} source timeout_seconds"),
+            )?;
+        }
+        SourceConfig::NormalizedFile { .. } => {}
     }
     Ok(())
 }
@@ -488,12 +511,23 @@ fn validate_host(
             true,
         )?;
     }
-    if let Some(ResourceSourceConfig::Command { argv }) = &host.resource_source {
-        validate_argv(
-            argv,
-            &format!("account {account} host {host_name} resource_source command"),
-            false,
-        )?;
+    match &host.resource_source {
+        Some(ResourceSourceConfig::Command { argv }) => {
+            validate_argv(
+                argv,
+                &format!("account {account} host {host_name} resource_source command"),
+                false,
+            )?;
+        }
+        Some(ResourceSourceConfig::NormalizedHttp {
+            timeout_seconds, ..
+        }) => {
+            validate_duration(
+                *timeout_seconds,
+                &format!("account {account} host {host_name} resource_source timeout_seconds"),
+            )?;
+        }
+        Some(ResourceSourceConfig::NormalizedFile { .. }) | None => {}
     }
     Ok(())
 }
@@ -511,6 +545,22 @@ fn validate_banked_resets(account: &AccountConfig, name: &str) -> Result<()> {
     }
     if policy.deadline_safety_seconds > i64::MAX as u64 {
         bail!("account {name}: banked_resets.deadline_safety_seconds is too large");
+    }
+    Ok(())
+}
+
+/// plan.md §8: "Poll, staleness, sample, and transport durations are positive
+/// and bounded." The upper bound only guards against a value that would
+/// overflow once treated as an `i64` (chrono durations, deadline arithmetic)
+/// -- it is not a guess at a realistic operational ceiling, so a
+/// deliberately huge value like examples/all-three.yaml's 10-year
+/// `stale_after_seconds` (used to effectively disable staleness) stays valid.
+fn validate_duration(value: u64, context: &str) -> Result<()> {
+    if value == 0 {
+        bail!("{context} must be positive");
+    }
+    if value > i64::MAX as u64 {
+        bail!("{context} is too large");
     }
     Ok(())
 }
@@ -778,5 +828,155 @@ hosts:
         let config: Config = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("{desired_workers}"), "{err}");
+    }
+
+    #[test]
+    fn validate_duration_rejects_zero() {
+        let err = validate_duration(0, "some_duration")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("some_duration must be positive"), "{err}");
+    }
+
+    #[test]
+    fn validate_duration_rejects_values_that_overflow_i64() {
+        let err = validate_duration(i64::MAX as u64 + 1, "some_duration")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("some_duration is too large"), "{err}");
+    }
+
+    #[test]
+    fn validate_duration_accepts_a_deliberately_huge_but_i64_safe_value() {
+        // examples/all-three.yaml's stale_after_seconds: 315360000 (10 years),
+        // used to effectively disable staleness -- must stay valid.
+        validate_duration(315_360_000, "some_duration").unwrap();
+        validate_duration(i64::MAX as u64, "some_duration").unwrap();
+    }
+
+    #[test]
+    fn poll_interval_seconds_zero_is_rejected() {
+        let mut yaml = base_config(&indent(
+            "max_workers: 4\nobserver: { type: static, workers: 1 }\nactuator: { type: none }",
+        ));
+        yaml = yaml.replacen("version: 1", "version: 1\npoll_interval_seconds: 0", 1);
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("poll_interval_seconds must be positive"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn poll_interval_seconds_above_i64_max_is_rejected() {
+        let mut yaml = base_config(&indent(
+            "max_workers: 4\nobserver: { type: static, workers: 1 }\nactuator: { type: none }",
+        ));
+        yaml = yaml.replacen(
+            "version: 1",
+            &format!("version: 1\npoll_interval_seconds: {}", i64::MAX as u64 + 1),
+            1,
+        );
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("poll_interval_seconds is too large"), "{err}");
+    }
+
+    fn config_with_utilization(utilization_yaml: &str) -> String {
+        format!(
+            r#"
+version: 1
+accounts:
+  acct:
+    source:
+      type: normalized_file
+      path: /tmp/subgov-test-source.json
+    fleet:
+      max_workers: 4
+      observer: {{ type: static, workers: 1 }}
+      actuator: {{ type: none }}
+    utilization:
+{utilization_yaml}
+"#
+        )
+    }
+
+    #[test]
+    fn stale_after_seconds_zero_is_rejected() {
+        let yaml =
+            config_with_utilization(&indent("reserve_fraction: 0.1\nstale_after_seconds: 0"));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("utilization.stale_after_seconds must be positive"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn minimum_sample_seconds_zero_is_rejected() {
+        let yaml =
+            config_with_utilization(&indent("reserve_fraction: 0.1\nminimum_sample_seconds: 0"));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("utilization.minimum_sample_seconds must be positive"),
+            "{err}"
+        );
+    }
+
+    /// examples/all-three.yaml relies on a deliberately huge stale_after_seconds
+    /// (10 years) to effectively disable staleness -- tightening the bound must
+    /// not break that documented pattern.
+    #[test]
+    fn a_deliberately_huge_stale_after_seconds_still_validates() {
+        let yaml = config_with_utilization(&indent(
+            "reserve_fraction: 0.1\nstale_after_seconds: 315360000",
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn source_timeout_seconds_zero_is_rejected() {
+        let yaml = base_config(&indent(
+            "max_workers: 4\nobserver: { type: static, workers: 1 }\nactuator: { type: none }",
+        ))
+        .replace(
+            "type: normalized_file\n      path: /tmp/subgov-test-source.json",
+            "type: normalized_http\n      url: https://example.invalid/usage\n      timeout_seconds: 0",
+        );
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("source timeout_seconds must be positive"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn host_resource_source_timeout_seconds_zero_is_rejected() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 8
+hosts:
+  codinghome:
+    max_workers: 8
+    resource_reserve:
+      cpu_reserve_fraction: 0.25
+      mem_reserve_mb: 4096
+    resource_source:
+      type: normalized_http
+      url: https://example.invalid/resources
+      timeout_seconds: 0
+    observer: { type: static, workers: 1 }
+    actuator: { type: none }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("resource_source timeout_seconds must be positive"),
+            "{err}"
+        );
     }
 }
