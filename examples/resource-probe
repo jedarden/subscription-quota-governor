@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Example host resource_source for plan.md §22.5. Reports this machine's
+# current CPU/RAM headroom as a single §22.4 ResourceSnapshot JSON object on
+# stdout, e.g.:
+#
+#   {"observed_at":"2026-09-28T12:00:00Z","fresh":true,"host_id":"lab",
+#    "cpu_available_fraction":0.42,"mem_available_mb":12288,"mem_total_mb":65536}
+#
+# Wire it into a host's config as:
+#
+#   resource_source:
+#     type: command
+#     argv: [/usr/local/bin/resource-probe]
+#
+# This is a documented starting point for a site-local probe, not a shipped
+# daemon (§22.5): install your own copy, adjust the cgroup paths below for
+# your init system, and review before running against anything that governs
+# real capacity. It reads only /proc/loadavg, /proc/meminfo, and (when
+# present) this process's own cgroup v2 limits under /sys/fs/cgroup -- no
+# network access, no external commands, no state kept between runs.
+#
+# Every value is read live at invocation time, so `fresh` is always true --
+# there is no cache for this script to serve a stale read from (plan.md
+# §6.1: "fresh represents the source's own freshness judgment").
+#
+# Usage: resource-probe [host_id]
+#   host_id defaults to this machine's hostname. Pass it explicitly when the
+#   governor's configured host key differs from the system hostname (e.g. a
+#   short label like "codinghome"); per plan.md §22.10 this must be a fixed
+#   argument written into the config, never built from live data.
+
+set -euo pipefail
+
+host_id="${1:-$(hostname)}"
+# Minimal JSON-string escaping for a config-supplied or system hostname
+# value -- defensive, not a general-purpose escaper.
+host_id="${host_id//\\/\\\\}"
+host_id="${host_id//\"/\\\"}"
+
+if [[ ! -r /proc/loadavg ]]; then
+    echo "resource-probe: /proc/loadavg not readable (this probe is Linux-only)" >&2
+    exit 1
+fi
+if [[ ! -r /proc/meminfo ]]; then
+    echo "resource-probe: /proc/meminfo not readable (this probe is Linux-only)" >&2
+    exit 1
+fi
+
+# --- CPU: 1-minute load average against the available CPU budget ---
+load1="$(awk '{ print $1 }' /proc/loadavg)"
+cpu_budget="$(nproc)"
+
+# A cgroup v2 CPU quota (cpu.max: "<quota-us> <period-us>", or "max <period>"
+# for no limit) narrows the effective CPU budget when this process runs
+# inside a capped slice -- e.g. a systemd unit or NEEDLE worker session
+# confined below the host's full core count.
+if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r quota_us period_us < /sys/fs/cgroup/cpu.max
+    if [[ "$quota_us" != "max" && "$period_us" -gt 0 ]]; then
+        cpu_budget="$(awk -v q="$quota_us" -v p="$period_us" -v full="$cpu_budget" \
+            'BEGIN { cgroup = q / p; print (cgroup < full) ? cgroup : full }')"
+    fi
+fi
+
+cpu_available_fraction="$(awk -v load1min="$load1" -v budget="$cpu_budget" 'BEGIN {
+    if (budget <= 0) { print 0; exit }
+    frac = 1 - (load1min / budget)
+    if (frac < 0) frac = 0
+    if (frac > 1) frac = 1
+    printf "%.4f", frac
+}')"
+
+# --- RAM: MemAvailable/MemTotal from /proc/meminfo (kB -> MB) ---
+mem_available_mb=$(($(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo) / 1024))
+mem_total_mb=$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 1024))
+
+# A cgroup v2 memory ceiling (memory.max, "max" for no limit) narrows the
+# reported total/available when this process runs inside a capped slice.
+# This is the exact kind of headroom §22.8's mem_reserve_mb protects against
+# under-provisioning -- report it accurately rather than the host-wide
+# figure when it's the tighter constraint.
+if [[ -r /sys/fs/cgroup/memory.max && -r /sys/fs/cgroup/memory.current ]]; then
+    memory_max="$(cat /sys/fs/cgroup/memory.max)"
+    if [[ "$memory_max" != "max" ]]; then
+        memory_current="$(cat /sys/fs/cgroup/memory.current)"
+        cgroup_total_mb=$((memory_max / 1024 / 1024))
+        cgroup_available_mb=$(((memory_max - memory_current) / 1024 / 1024))
+        if ((cgroup_available_mb < 0)); then
+            cgroup_available_mb=0
+        fi
+        if ((cgroup_total_mb < mem_total_mb)); then
+            mem_total_mb="$cgroup_total_mb"
+        fi
+        if ((cgroup_available_mb < mem_available_mb)); then
+            mem_available_mb="$cgroup_available_mb"
+        fi
+    fi
+fi
+
+observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+printf '{"observed_at":"%s","fresh":true,"host_id":"%s","cpu_available_fraction":%s,"mem_available_mb":%s,"mem_total_mb":%s}\n' \
+    "$observed_at" "$host_id" "$cpu_available_fraction" "$mem_available_mb" "$mem_total_mb"

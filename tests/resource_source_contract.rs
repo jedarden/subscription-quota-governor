@@ -63,3 +63,23 @@ fn mem_available_exceeding_mem_total_fails_the_snapshot() {
         "mem_available_mb (100000) > mem_total_mb (65536) must be rejected"
     );
 }
+
+/// §22.5's example script, not a synthetic fixture: proves
+/// `examples/resource-probe`'s real output is accepted by the same
+/// `collect_resource` entry point a configured host's `command` source
+/// would use. Linux-only, matching the script's own `/proc` dependency.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_example_resource_probe_script_produces_a_collectible_snapshot() {
+    let script = format!("{}/examples/resource-probe", env!("CARGO_MANIFEST_DIR"));
+    let source = SourceConfig::Command {
+        argv: vec![script, "test-host".to_string()],
+    };
+    let snapshot = collect_resource(&source)
+        .expect("the example probe's own output must pass collect_resource");
+    assert_eq!(snapshot.host_id, "test-host");
+    assert!(snapshot.fresh);
+    assert!(snapshot.mem_total_mb > 0);
+    assert!(snapshot.mem_available_mb <= snapshot.mem_total_mb);
+    assert!((0.0..=1.0).contains(&snapshot.cpu_available_fraction));
+}
