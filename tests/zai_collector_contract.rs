@@ -25,10 +25,17 @@
 //! fixture-safety scanner (`src/testsupport/fixture_scan.rs`) alongside
 //! every other file under `tests/fixtures/`.
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
-use subscription_governor::config::SourceConfig;
+use std::collections::BTreeMap;
+use subscription_governor::config::{
+    AccountConfig, ActuatorConfig, BankedResetConfig, FleetConfig, ObserverReconciliation,
+    SourceConfig, StaleBehavior, Strategy, UtilizationConfig,
+};
+use subscription_governor::controller::evaluate;
 use subscription_governor::model::QuotaSnapshot;
 use subscription_governor::source::collect;
+use subscription_governor::state::AccountState;
 
 fn load_fixture(name: &str) -> Value {
     let path = format!(
@@ -163,6 +170,201 @@ fn a_fixture_with_duplicate_window_ids_is_rejected() {
     assert!(
         collect_via_command(&invalid).is_err(),
         "an empty window id must be rejected exactly like a native source"
+    );
+}
+
+/// A `linear_to_reset` account config with a generous staleness window (this
+/// suite drives `evaluate` with each snapshot's own `observed_at` as "now",
+/// so no cycle is ever stale regardless of the wall-clock gap between the
+/// synthetic cycles below) and the default `minimum_sample_seconds` (300s),
+/// matching plan.md §7.3's requirement that a Z.AI-sourced snapshot gets
+/// "exactly the same freshness and window validation as native sources."
+fn zai_linear_to_reset_account(target_utilization: f64) -> AccountConfig {
+    AccountConfig {
+        source: SourceConfig::NormalizedFile {
+            path: "unused".into(),
+        },
+        fleet: FleetConfig {
+            min_workers: 0,
+            max_workers: 10,
+            bootstrap_workers: 1,
+            max_scale_up_per_cycle: 10,
+            max_scale_down_per_cycle: 10,
+            observer: None,
+            actuator: ActuatorConfig::None,
+            observer_reconciliation: ObserverReconciliation::default(),
+            hosts: None,
+        },
+        utilization: UtilizationConfig {
+            target_utilization: Some(target_utilization),
+            reserve_fraction: None,
+            strategy: Strategy::LinearToReset,
+            stale_after_seconds: 315_360_000,
+            stale_behavior: StaleBehavior::Hold,
+            minimum_sample_seconds: 300,
+            windows: BTreeMap::new(),
+        },
+        banked_resets: BankedResetConfig::default(),
+    }
+}
+
+/// End-to-end verification of plan.md §7.3's last unchecked build
+/// requirement -- "Verify reset-generation transitions ... in the site-local
+/// collector before production rollout" -- driven through the real `command`
+/// transport (not hand-built `QuotaWindow`/`WindowSample` literals the way
+/// `controller.rs`'s `reset_heavy_trace_restarts_learning_each_generation...`
+/// already proves the *controller* alone handles correctly). Three
+/// sequential Z.AI-shaped collections feed `evaluate` with the real
+/// cross-cycle `AccountState` `main::run_cycle` builds up, exactly the way
+/// production polls an account:
+///
+/// 1. First-ever sample of a generation: nothing to pace against yet.
+/// 2. A second, later sample of the SAME generation (same `resets_at`, past
+///    `minimum_sample_seconds`): a real burn rate is learned.
+/// 3. A sample from a NEW generation (`resets_at` advanced, usage back near
+///    zero -- the same shape as the committed `reset_generation_rollover`
+///    fixture): the prior generation's learned rate must not be
+///    extrapolated across the boundary.
+#[cfg(unix)]
+#[test]
+fn a_reset_generation_transition_through_the_real_command_transport_never_extrapolates_the_prior_generations_rate(
+) {
+    let config = zai_linear_to_reset_account(0.9);
+    let mut prior = AccountState::default();
+    let workers = 2u32;
+
+    let generation_one_reset = "2026-09-28T17:00:00Z";
+    let cycle1 = serde_json::json!({
+        "observed_at": "2026-09-28T12:00:00Z",
+        "fresh": true,
+        "windows": [
+            {"id": "five_hour", "used_fraction": 0.10, "resets_at": generation_one_reset, "duration_minutes": 300}
+        ]
+    });
+    let snapshot1 = collect_via_command(&cycle1).expect("cycle 1 must collect cleanly");
+    let now1: DateTime<Utc> = snapshot1.observed_at;
+    let decision1 = evaluate("zai", &config, &snapshot1, &prior, workers, now1).unwrap();
+    assert_eq!(
+        decision1.windows[0].reason, "learning_burn_rate",
+        "the very first sample of a generation has nothing to pace against yet"
+    );
+    prior.record(&snapshot1, workers, decision1.desired_workers);
+
+    let cycle2 = serde_json::json!({
+        "observed_at": "2026-09-28T13:00:00Z",
+        "fresh": true,
+        "windows": [
+            {"id": "five_hour", "used_fraction": 0.30, "resets_at": generation_one_reset, "duration_minutes": 300}
+        ]
+    });
+    let snapshot2 = collect_via_command(&cycle2).expect("cycle 2 must collect cleanly");
+    let now2: DateTime<Utc> = snapshot2.observed_at;
+    let decision2 = evaluate("zai", &config, &snapshot2, &prior, workers, now2).unwrap();
+    assert_eq!(
+        decision2.windows[0].reason, "paced_to_reset",
+        "a second same-generation sample far enough apart must learn a real burn rate"
+    );
+    assert!(
+        decision2.windows[0].observed_burn_per_worker_hour.unwrap() > 0.0,
+        "the learned rate must be a real positive value, not censored/zero"
+    );
+    prior.record(&snapshot2, workers, decision2.desired_workers);
+
+    let generation_two_reset = "2026-09-28T22:00:00Z";
+    let cycle3 = serde_json::json!({
+        "observed_at": "2026-09-28T17:00:05Z",
+        "fresh": true,
+        "windows": [
+            {"id": "five_hour", "used_fraction": 0.02, "resets_at": generation_two_reset, "duration_minutes": 300}
+        ]
+    });
+    let snapshot3 = collect_via_command(&cycle3).expect("cycle 3 must collect cleanly");
+    let now3: DateTime<Utc> = snapshot3.observed_at;
+    let decision3 = evaluate("zai", &config, &snapshot3, &prior, workers, now3).unwrap();
+    assert_eq!(
+        decision3.windows[0].reason, "learning_burn_rate",
+        "a new generation (resets_at changed) must restart learning, not extrapolate \
+         generation one's rate across the reset boundary"
+    );
+}
+
+/// End-to-end verification of plan.md §7.3's "percentage/absolute-usage
+/// normalization" concern. No private endpoint or raw provider shape is
+/// part of this repository (§7.3), so subgov never sees a percentage or an
+/// absolute token count directly -- a real collector computes `used_fraction`
+/// itself and emits only that. What this proves is that subgov's behavior is
+/// completely insensitive to which raw shape a collector derived it from:
+/// two collector-shaped documents representing the same real quota state,
+/// one as if derived from a percentage reading and one as if derived from an
+/// absolute used/quota token count, normalize to bit-identical
+/// `used_fraction` values (IEEE 754 division is correctly rounded, so two
+/// divisions of the same exact ratio agree exactly regardless of which
+/// numerator/denominator pair produced it) and drive the controller to
+/// byte-identical decisions.
+#[cfg(unix)]
+#[test]
+fn percentage_derived_and_absolute_derived_usage_normalize_to_identical_governor_behavior() {
+    let percentage_used: f64 = 33.0;
+    let percentage_derived_fraction = percentage_used / 100.0;
+
+    let used_tokens: f64 = 330_000.0;
+    let quota_tokens: f64 = 1_000_000.0;
+    let absolute_derived_fraction = used_tokens / quota_tokens;
+
+    assert_eq!(
+        percentage_derived_fraction, absolute_derived_fraction,
+        "both derivations of the same real state must agree bit-for-bit"
+    );
+
+    let observed_at = "2026-09-28T12:00:00Z";
+    let resets_at = "2026-09-28T17:00:00Z";
+    let percentage_fixture = serde_json::json!({
+        "observed_at": observed_at,
+        "fresh": true,
+        "windows": [{"id": "five_hour", "used_fraction": percentage_derived_fraction, "resets_at": resets_at, "duration_minutes": 300}]
+    });
+    let absolute_fixture = serde_json::json!({
+        "observed_at": observed_at,
+        "fresh": true,
+        "windows": [{"id": "five_hour", "used_fraction": absolute_derived_fraction, "resets_at": resets_at, "duration_minutes": 300}]
+    });
+
+    let snapshot_from_percentage =
+        collect_via_command(&percentage_fixture).expect("percentage-derived fixture must collect");
+    let snapshot_from_absolute =
+        collect_via_command(&absolute_fixture).expect("absolute-derived fixture must collect");
+    assert_eq!(
+        snapshot_from_percentage.windows[0].used_fraction,
+        snapshot_from_absolute.windows[0].used_fraction,
+        "both raw derivations must normalize to the identical used_fraction"
+    );
+
+    let config = zai_linear_to_reset_account(0.9);
+    let now: DateTime<Utc> = snapshot_from_percentage.observed_at;
+    let decision_from_percentage = evaluate(
+        "zai",
+        &config,
+        &snapshot_from_percentage,
+        &AccountState::default(),
+        2,
+        now,
+    )
+    .unwrap();
+    let decision_from_absolute = evaluate(
+        "zai",
+        &config,
+        &snapshot_from_absolute,
+        &AccountState::default(),
+        2,
+        now,
+    )
+    .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&decision_from_percentage).unwrap(),
+        serde_json::to_value(&decision_from_absolute).unwrap(),
+        "governor behavior must be identical regardless of which raw provider shape the \
+         collector normalized used_fraction from"
     );
 }
 
