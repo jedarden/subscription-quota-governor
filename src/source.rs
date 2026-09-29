@@ -1608,6 +1608,207 @@ mod tests {
         assert!(collect(&source).is_err());
     }
 
+    /// Serves one HTTP/1.1 response over an ephemeral loopback port, with a
+    /// caller-chosen status line and body, optionally delayed before being
+    /// written. Used by the Anthropic mock-HTTP tests below (plan.md §7.1)
+    /// to exercise `collect_anthropic`'s success, refresh, timeout,
+    /// status-failure, and malformed-JSON paths against a live endpoint
+    /// rather than only a connection-refused failure.
+    fn spawn_anthropic_mock(
+        status_line: &str,
+        body: Vec<u8>,
+        delay: Duration,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status_line = status_line.to_owned();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let header = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/"), handle)
+    }
+
+    fn valid_anthropic_usage_body() -> Vec<u8> {
+        json!({
+            "five_hour": {"utilization": 42, "resets_at": "2026-09-13T00:00:00Z"},
+            "seven_day": {"utilization": 55, "resets_at": "2026-09-19T00:00:00Z"}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn collect_anthropic_succeeds_against_a_mock_usage_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let far_future = Utc::now().timestamp_millis() + 3_600_000;
+        write_credentials(&path, "still-valid", "unused-refresh", far_future);
+
+        let (usage_url, handle) = spawn_anthropic_mock(
+            "HTTP/1.1 200 OK",
+            valid_anthropic_usage_body(),
+            Duration::ZERO,
+        );
+
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: path,
+            usage_url,
+            // Intentionally unreachable: a fresh token must never trigger a
+            // network refresh.
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 5,
+        };
+        let snapshot = collect(&source).unwrap();
+        assert_eq!(snapshot.windows.len(), 2);
+        let by_id = |id: &str| {
+            snapshot
+                .windows
+                .iter()
+                .find(|window| window.id == id)
+                .unwrap()
+        };
+        assert_eq!(by_id("five_hour").used_fraction, 0.42);
+        assert_eq!(by_id("seven_day").used_fraction, 0.55);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn collect_anthropic_refreshes_against_a_mock_token_endpoint_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        // Already past the refresh threshold, so a refresh is required
+        // before the usage request can be made.
+        write_credentials(&path, "expired-access", "refresh-a", 1_000);
+
+        let new_expiry = Utc::now().timestamp_millis() + 3_600_000;
+        let refresh_body = json!({
+            "accessToken": "refreshed-access",
+            "refreshToken": "refreshed-refresh",
+            "expiresAt": new_expiry,
+        })
+        .to_string()
+        .into_bytes();
+        let (token_url, token_handle) =
+            spawn_anthropic_mock("HTTP/1.1 200 OK", refresh_body, Duration::ZERO);
+        let (usage_url, usage_handle) = spawn_anthropic_mock(
+            "HTTP/1.1 200 OK",
+            valid_anthropic_usage_body(),
+            Duration::ZERO,
+        );
+
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: path.clone(),
+            usage_url,
+            token_url,
+            timeout_seconds: 5,
+        };
+        let snapshot = collect(&source).unwrap();
+        assert_eq!(snapshot.windows.len(), 2);
+        token_handle.join().unwrap();
+        usage_handle.join().unwrap();
+
+        let on_disk = read_json(&path, "test credentials").unwrap();
+        let oauth = on_disk.get("claudeAiOauth").unwrap();
+        assert_eq!(
+            oauth.get("accessToken").unwrap().as_str(),
+            Some("refreshed-access"),
+            "the refreshed token from the mock token endpoint must be persisted"
+        );
+    }
+
+    #[test]
+    fn collect_anthropic_fails_closed_when_the_usage_endpoint_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let far_future = Utc::now().timestamp_millis() + 3_600_000;
+        write_credentials(&path, "still-valid", "unused-refresh", far_future);
+
+        // The mock delays its response well past the agent's own timeout, so
+        // this exercises a genuine timeout rather than connection-refused.
+        let (usage_url, handle) = spawn_anthropic_mock(
+            "HTTP/1.1 200 OK",
+            valid_anthropic_usage_body(),
+            Duration::from_millis(1_500),
+        );
+
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: path,
+            usage_url,
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 1,
+        };
+        let started = std::time::Instant::now();
+        let result = collect(&source);
+        assert!(result.is_err(), "a hung usage endpoint must surface as Err");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the agent's own timeout must bound the wait, not the server's delay"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn collect_anthropic_fails_closed_when_the_usage_endpoint_returns_a_failure_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let far_future = Utc::now().timestamp_millis() + 3_600_000;
+        write_credentials(&path, "still-valid", "unused-refresh", far_future);
+
+        let (usage_url, handle) = spawn_anthropic_mock(
+            "HTTP/1.1 401 Unauthorized",
+            br#"{"error":"invalid_token"}"#.to_vec(),
+            Duration::ZERO,
+        );
+
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: path,
+            usage_url,
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 5,
+        };
+        assert!(collect(&source).is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn collect_anthropic_fails_closed_when_the_usage_endpoint_returns_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let far_future = Utc::now().timestamp_millis() + 3_600_000;
+        write_credentials(&path, "still-valid", "unused-refresh", far_future);
+
+        let (usage_url, handle) = spawn_anthropic_mock(
+            "HTTP/1.1 200 OK",
+            b"not valid json {".to_vec(),
+            Duration::ZERO,
+        );
+
+        let source = SourceConfig::AnthropicOauth {
+            credentials_path: path,
+            usage_url,
+            token_url: unreachable_url("/token"),
+            timeout_seconds: 5,
+        };
+        let error = collect(&source).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Anthropic usage response was not valid JSON"),
+            "expected the malformed-JSON error variant: {error:#}"
+        );
+        handle.join().unwrap();
+    }
+
     #[test]
     fn read_bounded_accepts_data_at_exactly_the_limit() {
         let data = vec![7u8; 10];
