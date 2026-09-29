@@ -7,3 +7,6 @@ pub mod state;
 
 #[cfg(test)]
 pub(crate) mod testsupport;
+
+#[cfg(test)]
+mod cycle_tests;
