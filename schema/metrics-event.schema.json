@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.ardenone.com/jedarden/subscription-quota-governor/raw/branch/main/schema/metrics-event.schema.json",
+  "title": "Metrics events (JSONL, stdout)",
+  "description": "The §13 'Planned metrics' surface: two JSONL event shapes `main::run_cycle`/`main::run` print to stdout, both distinct from the richer `decision` event covered by decision-event.schema.json. `metrics` is printed exactly once per account per cycle, regardless of success or failure, so a metrics consumer never has to correlate the success-only `decision` event with the failure-only `account_error` event just to count source/actuation success and failure. `cycle_metrics` is printed exactly once per full run_cycle invocation (not per account), carrying the loop-level timing and scheduling-drift metrics that have no per-account meaning. additionalProperties is left open everywhere because the underlying Rust structs (AccountMetrics/WindowMetrics in src/main.rs) do not use #[serde(deny_unknown_fields)].",
+  "oneOf": [
+    { "$ref": "#/$defs/metrics" },
+    { "$ref": "#/$defs/cycleMetrics" }
+  ],
+  "$defs": {
+    "metrics": {
+      "type": "object",
+      "required": [
+        "event",
+        "time",
+        "account",
+        "source_success",
+        "windows",
+        "actuation_attempted"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "event": { "const": "metrics" },
+        "time": { "$ref": "#/$defs/timestamp" },
+        "account": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The configured account name (a `config.accounts` map key), matching the `decision` event's `decision.account`."
+        },
+        "source_success": {
+          "type": "boolean",
+          "description": "Whether the quota source (`source::collect`) returned a snapshot this cycle. False means every other field below `windows`/`actuation_attempted` is absent -- the cycle failed before a worker count or decision could be observed, and the corresponding detail is in a separate `account_error` event with `category: \"observation\"`."
+        },
+        "sample_age_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Present iff source_success. now - snapshot.observed_at at the moment this cycle observed it, clamped to zero the same way the controller's own staleness check is (a clock skew or future-dated sample is never reported as a negative age)."
+        },
+        "current_workers": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Present iff the fleet worker observer succeeded this cycle (requires source_success, but may be present even when the controller's own evaluation subsequently failed)."
+        },
+        "desired_workers": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Present iff a decision was computed this cycle. Echoes decision.desired_workers from the corresponding `decision` event."
+        },
+        "decision_reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Present iff a decision was computed. The account-level reason: the same derivation the status surface (readiness_for_decision, src/main.rs) uses -- \"stale_data_holding\" for a stale decision, \"target_reached\" for an intentional hold (including banked-reset manual-redemption holds), otherwise the binding window's own reason (or \"healthy\" if no window is binding)."
+        },
+        "binding_window": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Present iff a decision was computed and a window won the §9.6 arbitration. Echoes decision.binding_window."
+        },
+        "windows": {
+          "type": "array",
+          "description": "One entry per observed, enabled window, in snapshot order. Empty when no decision was computed (source or worker-observer failure) or the decision was stale.",
+          "items": { "$ref": "#/$defs/windowMetrics" }
+        },
+        "actuation_attempted": {
+          "type": "boolean",
+          "description": "True iff a decision was computed and the cycle was not observe-only -- i.e. the fleet actuator was invoked this cycle. False whenever no decision was reached, or the cycle ran with --observe-only."
+        },
+        "actuation_succeeded": {
+          "type": "boolean",
+          "description": "Present iff actuation_attempted. True when the actuator call returned Ok (whether or not it actually changed anything -- see the `decision` event's `actuated` field for that distinction). False when the actuator call itself failed, in which case a separate `account_error` event with `category: \"actuation\"` carries the error detail."
+        }
+      }
+    },
+    "windowMetrics": {
+      "type": "object",
+      "required": ["id", "used_fraction", "target_utilization", "seconds_until_reset"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Echoes the corresponding windowDecision.id from the `decision` event."
+        },
+        "used_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "target_utilization": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "seconds_until_reset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "window.resets_at - decision time, clamped to zero -- a reset the clock has passed but the provider has not yet rolled over (§9.3 \"reset_due\") is reported as zero seconds away, never negative."
+        }
+      }
+    },
+    "cycleMetrics": {
+      "type": "object",
+      "required": [
+        "event",
+        "time",
+        "duration_ms",
+        "late",
+        "skipped_cycles",
+        "accounts_total",
+        "observation_failures",
+        "actuation_failures"
+      ],
+      "additionalProperties": true,
+      "description": "Printed once per run_cycle invocation (main::run), immediately after that cycle's per-account decision/metrics/account_error events. Absent in a process that never reaches the run loop (check/snapshot commands emit no JSONL events at all).",
+      "properties": {
+        "event": { "const": "cycle_metrics" },
+        "time": { "$ref": "#/$defs/timestamp" },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock time spent inside this cycle's run_cycle call (iterating every account), not including the inter-cycle sleep."
+        },
+        "late": {
+          "type": "boolean",
+          "description": "True when this cycle's actual start lagged its scheduled anchor by more than the maximum jitter `bounded_jitter` could have added for the configured poll_interval_seconds -- i.e. delayed by something other than the deliberate startup jitter, typically the previous cycle overrunning its interval. Always false for the first cycle of a run, which has no schedule to be late against."
+        },
+        "skipped_cycles": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Whole additional poll intervals that elapsed on top of `late`'s drift before this cycle started (0 in the ordinary case). Non-zero only after a cycle overran the interval badly enough that one or more entire scheduled slots were skipped rather than merely delayed."
+        },
+        "accounts_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "config.accounts.len() at the start of this cycle -- the number of accounts this cycle attempted to process (fewer may have actually been reached if shutdown was requested mid-cycle)."
+        },
+        "observation_failures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Echoes CycleOutcome.observation_failures: accounts whose source, worker observer, or controller evaluation failed this cycle."
+        },
+        "actuation_failures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Echoes CycleOutcome.actuation_failures: accounts whose fleet actuator call failed this cycle."
+        }
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    }
+  },
+  "examples": [
+    {
+      "event": "metrics",
+      "time": "2026-09-29T03:08:08.036281549Z",
+      "account": "claude-anthropic",
+      "source_success": true,
+      "sample_age_seconds": 1436888,
+      "current_workers": 2,
+      "desired_workers": 2,
+      "decision_reason": "learning_burn_rate",
+      "binding_window": "five_hour",
+      "windows": [
+        {
+          "id": "five_hour",
+          "used_fraction": 0.35,
+          "target_utilization": 0.85,
+          "seconds_until_reset": 124811511
+        }
+      ],
+      "actuation_attempted": false
+    },
+    {
+      "event": "metrics",
+      "time": "2026-09-29T03:08:41.488739636Z",
+      "account": "broken-source",
+      "source_success": false,
+      "windows": [],
+      "actuation_attempted": false
+    },
+    {
+      "event": "cycle_metrics",
+      "time": "2026-09-29T03:08:41.488803863Z",
+      "duration_ms": 25,
+      "late": false,
+      "skipped_cycles": 0,
+      "accounts_total": 2,
+      "observation_failures": 1,
+      "actuation_failures": 1
+    }
+  ]
+}

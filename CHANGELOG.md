@@ -40,8 +40,16 @@ what `main` actually does today, not a diff against a prior tag.
 - Exact-pinned dependency versions and a `scripts/audit.sh` RustSec
   security-advisory check (`cargo audit`); see
   [docs/notes/dependency-policy.md](docs/notes/dependency-policy.md).
+- A §13 "planned metrics" JSONL surface: a `metrics` event emitted once per
+  account per cycle (source success/failure and sample age, used/target
+  fraction and seconds to reset per window, current/desired workers, the
+  decision reason and binding window, and whether actuation was attempted
+  and succeeded) regardless of that cycle's success or failure, plus a
+  `cycle_metrics` event emitted once per cycle with loop duration and
+  scheduling drift (late/skipped cycles). See
+  [schema/metrics-event.schema.json](schema/metrics-event.schema.json).
 
 This is pre-release software. See [the implementation plan](docs/plan/plan.md)
 §16 for what remains open in WP5 through WP7 -- signal-aware shutdown,
-per-source contract-test fixtures, a metrics/readiness surface, operational
-runbooks, and the release pipeline itself.
+per-source contract-test fixtures, operational runbooks, and the release
+pipeline itself.

@@ -192,9 +192,26 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
     let shutdown = install_shutdown_flag().map_err(GovernorError::State)?;
     let interval = Duration::from_secs(config.poll_interval_seconds);
     let mut anchor = Instant::now();
+    let mut scheduled_at: Option<Instant> = None;
     let status_path = status_path(&state_path);
     loop {
+        let cycle_started_at = Instant::now();
+        let (late, skipped_cycles) = schedule_drift(scheduled_at, cycle_started_at, interval);
         let outcome = run_cycle(&config, &mut state, observe_only, &shutdown);
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "event": "cycle_metrics",
+                "time": Utc::now(),
+                "duration_ms": cycle_started_at.elapsed().as_millis() as u64,
+                "late": late,
+                "skipped_cycles": skipped_cycles,
+                "accounts_total": config.accounts.len(),
+                "observation_failures": outcome.observation_failures,
+                "actuation_failures": outcome.actuation_failures,
+            }))
+            .expect("cycle_metrics always serializes")
+        );
         state.save(&state_path).map_err(GovernorError::State)?;
         if let Err(error) = merge_status_report(&status_path, &outcome.statuses) {
             eprintln!(
@@ -223,6 +240,7 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
         }
         let (next_anchor, sleep_for) = advance_schedule(anchor, interval, Instant::now());
         anchor = next_anchor;
+        scheduled_at = Some(next_anchor);
         interruptible_sleep(sleep_for + bounded_jitter(interval), &shutdown);
         if shutdown.load(Ordering::SeqCst) {
             shutdown_complete();
@@ -425,17 +443,52 @@ fn advance_schedule(anchor: Instant, interval: Duration, now: Instant) -> (Insta
     }
 }
 
+/// The maximum delay `bounded_jitter` can add for `interval` -- 10%, capped
+/// at 30s. Factored out so `schedule_drift`'s late threshold matches
+/// `bounded_jitter`'s actual ceiling exactly, without depending on which
+/// random value a given call produced.
+fn max_bounded_jitter(interval: Duration) -> Duration {
+    interval.mul_f64(0.1).min(Duration::from_secs(30))
+}
+
 /// A random delay up to 10% of `interval` (capped at 30s) so that many
 /// accounts/instances on the same interval don't all poll their upstream
 /// providers at the same moment. The exact range is a deliberately
 /// conservative placeholder pending observation-mode evidence (plan.md §21).
 fn bounded_jitter(interval: Duration) -> Duration {
-    let max_jitter = interval.mul_f64(0.1).min(Duration::from_secs(30));
+    let max_jitter = max_bounded_jitter(interval);
     if max_jitter.is_zero() {
         return Duration::ZERO;
     }
     let millis = rand::thread_rng().gen_range(0..=max_jitter.as_millis() as u64);
     Duration::from_millis(millis)
+}
+
+/// How far a cycle's actual start lagged the schedule, for the §13 "loop
+/// duration and skipped/late cycles" metric. `scheduled_at` is `None` for
+/// the very first cycle, which has no schedule to be late against, and
+/// whenever `interval` is zero (nothing to be late relative to). A cycle
+/// counts as "late" only once the drift exceeds the maximum jitter
+/// `bounded_jitter` could have added for this `interval` -- an ordinary
+/// jittered wake is not a late cycle, only a cycle delayed by something else
+/// (typically the previous cycle overrunning its interval). `skipped_cycles`
+/// counts whole additional intervals that elapsed on top of that before this
+/// cycle started (0 in the ordinary case).
+fn schedule_drift(
+    scheduled_at: Option<Instant>,
+    started_at: Instant,
+    interval: Duration,
+) -> (bool, u64) {
+    if interval.is_zero() {
+        return (false, 0);
+    }
+    let Some(scheduled_at) = scheduled_at else {
+        return (false, 0);
+    };
+    let drift = started_at.saturating_duration_since(scheduled_at);
+    let late = drift > max_bounded_jitter(interval);
+    let skipped_cycles = (drift.as_secs_f64() / interval.as_secs_f64()).floor() as u64;
+    (late, skipped_cycles)
 }
 
 /// Per-cycle failure counts, split by the exit-code category (plan.md §12)
@@ -473,6 +526,91 @@ impl AccountFailure {
     }
 }
 
+/// One account's §13 "planned metrics" line, emitted exactly once per
+/// account per cycle regardless of success or failure -- unlike the
+/// "decision" event (emitted only on success) and "account_error" event
+/// (emitted only on failure), so a metrics consumer never has to correlate
+/// two different event shapes just to count source/actuation success and
+/// failure. Fields populated only as far as the cycle actually got are left
+/// absent rather than defaulted, so e.g. a source failure never reports a
+/// misleading `current_workers`.
+#[derive(Debug, Serialize)]
+struct AccountMetrics {
+    event: &'static str,
+    time: DateTime<Utc>,
+    account: String,
+    source_success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_age_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_workers: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desired_workers: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binding_window: Option<String>,
+    windows: Vec<WindowMetrics>,
+    actuation_attempted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actuation_succeeded: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct WindowMetrics {
+    id: String,
+    used_fraction: f64,
+    target_utilization: f64,
+    seconds_until_reset: u64,
+}
+
+impl AccountMetrics {
+    fn new(account: String, time: DateTime<Utc>) -> Self {
+        Self {
+            event: "metrics",
+            time,
+            account,
+            source_success: false,
+            sample_age_seconds: None,
+            current_workers: None,
+            desired_workers: None,
+            decision_reason: None,
+            binding_window: None,
+            windows: Vec::new(),
+            actuation_attempted: false,
+            actuation_succeeded: None,
+        }
+    }
+
+    /// Fills in every field a successfully computed `decision` makes
+    /// available: desired workers, the account-level decision reason (the
+    /// same derivation `readiness_for_decision` uses, for consistency with
+    /// the status surface), the binding window, and one `WindowMetrics` per
+    /// observed window with `seconds_until_reset` computed relative to
+    /// `now` and clamped to zero the same way `evaluate`'s own
+    /// `sample_age_seconds` is (a reset already in the past, per §9.3
+    /// `reset_due`, is reported as zero seconds away, never negative).
+    fn apply_decision(&mut self, decision: &Decision, decision_reason: String, now: DateTime<Utc>) {
+        self.desired_workers = Some(decision.desired_workers);
+        self.decision_reason = Some(decision_reason);
+        self.binding_window = decision.binding_window.clone();
+        self.windows = decision
+            .windows
+            .iter()
+            .map(|window| WindowMetrics {
+                id: window.id.clone(),
+                used_fraction: window.used_fraction,
+                target_utilization: window.target_utilization,
+                seconds_until_reset: window
+                    .resets_at
+                    .signed_duration_since(now)
+                    .num_seconds()
+                    .max(0) as u64,
+            })
+            .collect();
+    }
+}
+
 fn run_cycle(
     config: &Config,
     state: &mut State,
@@ -484,21 +622,35 @@ fn run_cycle(
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
+        let now = Utc::now();
+        let mut metrics = AccountMetrics::new(name.clone(), now);
         let result: Result<(), AccountFailure> = (|| {
             let snapshot =
                 source::collect(&account_config.source).map_err(AccountFailure::Observation)?;
+            metrics.source_success = true;
+            metrics.sample_age_seconds = Some(
+                now.signed_duration_since(snapshot.observed_at)
+                    .num_seconds()
+                    .max(0) as u64,
+            );
             let workers = fleet::current_workers(&account_config.fleet)
                 .map_err(AccountFailure::Observation)?;
+            metrics.current_workers = Some(workers);
             let prior = state.accounts.get(name).cloned().unwrap_or_default();
-            let decision = evaluate(name, account_config, &snapshot, &prior, workers, Utc::now())
+            let decision = evaluate(name, account_config, &snapshot, &prior, workers, now)
                 .map_err(AccountFailure::Observation)?;
+            let readiness = readiness_for_decision(&decision);
+            metrics.apply_decision(&decision, readiness.reason.clone(), now);
 
+            metrics.actuation_attempted = !observe_only;
             let actuated = if observe_only {
                 false
             } else {
-                fleet::actuate(&account_config.fleet, workers, decision.desired_workers)
-                    .map_err(AccountFailure::Actuation)?
-                    .actuated
+                let actuation =
+                    fleet::actuate(&account_config.fleet, workers, decision.desired_workers)
+                        .map_err(AccountFailure::Actuation)?;
+                metrics.actuation_succeeded = Some(true);
+                actuation.actuated
             };
             println!(
                 "{}",
@@ -521,14 +673,15 @@ fn run_cycle(
                 };
                 account_state.record(&snapshot, sample_workers, decision.desired_workers);
             }
-            outcome
-                .statuses
-                .insert(name.clone(), readiness_for_decision(&decision));
+            outcome.statuses.insert(name.clone(), readiness);
             Ok(())
         })();
         if let Err(failure) = result {
             match failure.category() {
-                "actuation" => outcome.actuation_failures += 1,
+                "actuation" => {
+                    outcome.actuation_failures += 1;
+                    metrics.actuation_succeeded = Some(false);
+                }
                 _ => outcome.observation_failures += 1,
             }
             outcome
@@ -545,6 +698,10 @@ fn run_cycle(
                 })
             );
         }
+        println!(
+            "{}",
+            serde_json::to_string(&metrics).expect("AccountMetrics always serializes")
+        );
     }
     outcome
 }
@@ -594,6 +751,56 @@ mod scheduling_tests {
     #[test]
     fn jitter_is_zero_for_a_zero_interval() {
         assert_eq!(bounded_jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn schedule_drift_is_never_late_for_the_first_cycle() {
+        let interval = Duration::from_secs(10);
+        let started_at = Instant::now();
+        assert_eq!(schedule_drift(None, started_at, interval), (false, 0));
+    }
+
+    #[test]
+    fn schedule_drift_is_never_late_for_a_zero_interval() {
+        let scheduled_at = Instant::now();
+        let started_at = scheduled_at + Duration::from_secs(999);
+        assert_eq!(
+            schedule_drift(Some(scheduled_at), started_at, Duration::ZERO),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn schedule_drift_is_not_late_within_the_jitter_window() {
+        let interval = Duration::from_secs(10);
+        let scheduled_at = Instant::now();
+        // max_bounded_jitter(10s) == 1s; landing exactly at that ceiling is
+        // still an ordinary jittered wake, not lateness.
+        let started_at = scheduled_at + max_bounded_jitter(interval);
+        assert_eq!(
+            schedule_drift(Some(scheduled_at), started_at, interval),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn schedule_drift_flags_late_beyond_the_jitter_window_without_skipping_a_whole_interval() {
+        let interval = Duration::from_secs(10);
+        let scheduled_at = Instant::now();
+        let started_at = scheduled_at + max_bounded_jitter(interval) + Duration::from_millis(1);
+        let (late, skipped_cycles) = schedule_drift(Some(scheduled_at), started_at, interval);
+        assert!(late);
+        assert_eq!(skipped_cycles, 0);
+    }
+
+    #[test]
+    fn schedule_drift_counts_whole_skipped_intervals() {
+        let interval = Duration::from_secs(10);
+        let scheduled_at = Instant::now();
+        let started_at = scheduled_at + Duration::from_secs(25);
+        let (late, skipped_cycles) = schedule_drift(Some(scheduled_at), started_at, interval);
+        assert!(late);
+        assert_eq!(skipped_cycles, 2);
     }
 }
 
@@ -1002,5 +1209,88 @@ mod status_tests {
             path,
             PathBuf::from("/var/lib/subscription-governor/status.json")
         );
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use subscription_governor::controller::WindowDecision;
+
+    fn window(id: &str, resets_at: DateTime<Utc>) -> WindowDecision {
+        WindowDecision {
+            id: id.to_owned(),
+            used_fraction: 0.42,
+            target_utilization: 0.9,
+            resets_at,
+            desired_workers: 2,
+            reason: "paced_to_reset".to_owned(),
+            observed_burn_per_worker_hour: Some(0.01),
+        }
+    }
+
+    fn decision(windows: Vec<WindowDecision>) -> Decision {
+        Decision {
+            account: "a".to_owned(),
+            observed_at: Utc::now(),
+            current_workers: 1,
+            desired_workers: 3,
+            stale: false,
+            windows,
+            binding_window: Some("weekly".to_owned()),
+            banked_resets: None,
+        }
+    }
+
+    #[test]
+    fn a_fresh_metrics_line_reports_only_the_event_and_account_before_any_step_succeeds() {
+        let now = Utc::now();
+        let metrics = AccountMetrics::new("a".to_owned(), now);
+        let value = serde_json::to_value(&metrics).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object["event"], "metrics");
+        assert_eq!(object["account"], "a");
+        assert_eq!(object["source_success"], false);
+        assert_eq!(object["actuation_attempted"], false);
+        assert!(object["windows"].as_array().unwrap().is_empty());
+        for absent in [
+            "sample_age_seconds",
+            "current_workers",
+            "desired_workers",
+            "decision_reason",
+            "binding_window",
+            "actuation_succeeded",
+        ] {
+            assert!(
+                !object.contains_key(absent),
+                "unpopulated field {absent:?} must be omitted, not printed as null"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_decision_fills_desired_workers_reason_and_binding_window() {
+        let now = Utc::now();
+        let mut metrics = AccountMetrics::new("a".to_owned(), now);
+        let d = decision(vec![window("weekly", now + chrono::Duration::hours(2))]);
+        metrics.apply_decision(&d, "paced_to_reset".to_owned(), now);
+        assert_eq!(metrics.desired_workers, Some(3));
+        assert_eq!(metrics.decision_reason.as_deref(), Some("paced_to_reset"));
+        assert_eq!(metrics.binding_window.as_deref(), Some("weekly"));
+        assert_eq!(metrics.windows.len(), 1);
+        assert_eq!(metrics.windows[0].id, "weekly");
+        assert_eq!(metrics.windows[0].seconds_until_reset, 2 * 3600);
+    }
+
+    #[test]
+    fn apply_decision_clamps_seconds_until_reset_to_zero_for_a_reset_already_in_the_past() {
+        let now = Utc::now();
+        let mut metrics = AccountMetrics::new("a".to_owned(), now);
+        let d = decision(vec![window(
+            "five_hour",
+            now - chrono::Duration::minutes(5),
+        )]);
+        metrics.apply_decision(&d, "reset_due".to_owned(), now);
+        assert_eq!(metrics.windows[0].seconds_until_reset, 0);
     }
 }
