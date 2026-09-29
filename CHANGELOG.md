@@ -37,6 +37,9 @@ what `main` actually does today, not a diff against a prior tag.
   that account and never blocks or misrepresents another account's cycle.
 - A hardened systemd service example (`deploy/systemd/`), with restart
   limits and filesystem protections.
+- Exact-pinned dependency versions and a `scripts/audit.sh` RustSec
+  security-advisory check (`cargo audit`); see
+  [docs/notes/dependency-policy.md](docs/notes/dependency-policy.md).
 
 This is pre-release software. See [the implementation plan](docs/plan/plan.md)
 §16 for what remains open in WP5 through WP7 -- signal-aware shutdown,
