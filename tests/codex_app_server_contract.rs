@@ -423,3 +423,36 @@ fn an_oversized_stdout_frame_is_discarded_without_breaking_the_real_response() {
     );
     assert_eq!(snapshot.windows.len(), 2);
 }
+
+#[test]
+fn a_restart_attempt_within_the_backoff_window_fails_fast_without_spawning_again() {
+    // A path that can never be spawned -- no fake-app-server scripting is
+    // needed here at all, since every attempt fails identically at
+    // `Command::spawn`, letting this test isolate the backoff *gate* itself
+    // from the handshake logic exercised elsewhere in this file.
+    let executable = PathBuf::from("/nonexistent/definitely-not-a-codex-app-server");
+    let source = SourceConfig::CodexAppServer {
+        executable,
+        timeout_seconds: 5,
+    };
+
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    shutdown_codex_sessions();
+
+    let first_error = format!("{:#}", collect(&source).unwrap_err());
+    assert!(
+        !first_error.contains("backing off"),
+        "the very first attempt for a never-before-seen executable must never be backoff-gated: \
+         {first_error}"
+    );
+
+    let second_error = format!("{:#}", collect(&source).unwrap_err());
+    shutdown_codex_sessions();
+    assert!(
+        second_error.contains("backing off"),
+        "a restart attempted immediately after a failure must fail fast on the backoff gate \
+         instead of trying (and failing) to spawn again: {second_error}"
+    );
+}

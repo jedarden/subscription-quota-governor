@@ -5,6 +5,7 @@ use crate::model::{
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use fs2::FileExt;
+use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -49,6 +50,13 @@ const MAX_CODEX_FRAME_BYTES: usize = 1024 * 1024;
 /// notification stream answers most polls from cache, short enough to bound
 /// drift to a handful of poll cycles.
 const CODEX_RECONCILE_INTERVAL: Duration = Duration::from_secs(900);
+/// Base delay before the first Codex session restart attempt after a
+/// failure, and the amount each consecutive failure's delay doubles from
+/// (plan.md §7.2: "Restart with capped exponential backoff and jitter").
+const CODEX_RESTART_BACKOFF_BASE: Duration = Duration::from_secs(5);
+/// Ceiling the doubling restart backoff delay never exceeds, however many
+/// consecutive failures precede it.
+const CODEX_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
 /// A 3xx response encountered where redirects are disabled. `Display`
 /// includes only the response's own status code and the requested URL --
@@ -146,6 +154,8 @@ pub enum CodexSourceError {
     ResultMissing,
     #[error("Codex rate-limit response contained no usable quota windows")]
     NoUsableWindows,
+    #[error("Codex session restart is backing off for {retry_after:?} after repeated failures")]
+    RestartBackoff { retry_after: Duration },
 }
 
 /// Errors from the generic `command`/`normalized_file`/`normalized_http`
@@ -753,13 +763,20 @@ fn codex_sessions() -> &'static Mutex<HashMap<PathBuf, CodexSession>> {
     CODEX_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Terminates and forgets every live supervised Codex session. Available for
+/// Terminates and forgets every live supervised Codex session, and clears
+/// every executable's restart backoff state along with them. Available for
 /// a caller's orderly shutdown path, so a kept-alive app-server child does
 /// not outlive the governor process, and for test isolation, since sessions
-/// are cached process-wide rather than per-call.
+/// (and their backoff history) are cached process-wide rather than per-call.
 pub fn shutdown_codex_sessions() {
     if let Some(sessions) = CODEX_SESSIONS.get() {
         let mut guard = sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clear();
+    }
+    if let Some(backoff) = CODEX_RESTART_BACKOFF.get() {
+        let mut guard = backoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.clear();
@@ -770,11 +787,14 @@ pub fn shutdown_codex_sessions() {
 /// one is live, transparently spawning and handshaking a fresh session
 /// first if there is none yet or the existing one just failed. This is the
 /// "supervised" half of §7.2: one broken session (the app-server exited,
-/// the pipe broke, a request timed out) causes one respawn on the next
-/// poll that actually needs to talk to it (a poll answered entirely from
-/// the notification cache -- see [`codex_session_read_rate_limits`] --
+/// the pipe broke, a request timed out) causes a respawn attempt on the
+/// next poll that actually needs to talk to it (a poll answered entirely
+/// from the notification cache -- see [`codex_session_read_rate_limits`] --
 /// never gets a chance to notice), not a permanent failure for every poll
-/// after it.
+/// after it -- gated by [`restart_codex_session`]'s capped exponential
+/// backoff so a crash-looping app-server is retried with growing patience
+/// rather than on every poll cycle regardless of how recently the last
+/// attempt failed.
 ///
 /// Returns the rate-limit result alongside the wall-clock time it was
 /// actually obtained, which may predate this call by up to
@@ -796,10 +816,111 @@ fn with_codex_session(executable: &Path, timeout_seconds: u64) -> Result<(Value,
         }
     }
 
-    let mut session = spawn_and_handshake_codex(executable, timeout_seconds)?;
-    let value = codex_session_read_rate_limits(&mut session, timeout_seconds)?;
+    let (session, value) = restart_codex_session(executable, timeout_seconds)?;
     guard.insert(executable.to_owned(), session);
     Ok(value)
+}
+
+/// Tracks consecutive Codex session restart failures for one executable
+/// path (plan.md §7.2: "Restart with capped exponential backoff and
+/// jitter"). Kept separate from [`CODEX_SESSIONS`] because it must survive
+/// across a failed restart attempt, when there is no [`CodexSession`] left
+/// to attach it to.
+#[derive(Default, Clone, Copy)]
+struct CodexRestartBackoff {
+    consecutive_failures: u32,
+    /// A restart attempted before this instant is refused outright, without
+    /// touching the process at all. `None` (the default) never blocks.
+    not_before: Option<std::time::Instant>,
+}
+
+impl CodexRestartBackoff {
+    /// `Err(remaining)` if a restart is not yet allowed, naming how much
+    /// longer to wait; `Ok(())` if it may proceed now. A pure function of
+    /// the state and `now` so it is unit-testable without a real clock wait.
+    fn check(&self, now: std::time::Instant) -> std::result::Result<(), Duration> {
+        match self.not_before {
+            Some(not_before) if now < not_before => Err(not_before - now),
+            _ => Ok(()),
+        }
+    }
+
+    /// Applies a restart attempt's outcome: success clears the backoff
+    /// entirely (the session is healthy again), failure increments the
+    /// consecutive-failure count and schedules the next allowed attempt via
+    /// [`codex_restart_backoff_delay`].
+    fn record(&mut self, succeeded: bool, now: std::time::Instant) {
+        if succeeded {
+            *self = Self::default();
+            return;
+        }
+        self.consecutive_failures += 1;
+        self.not_before = Some(now + codex_restart_backoff_delay(self.consecutive_failures));
+    }
+}
+
+static CODEX_RESTART_BACKOFF: OnceLock<Mutex<HashMap<PathBuf, CodexRestartBackoff>>> =
+    OnceLock::new();
+
+fn codex_restart_backoff_map() -> &'static Mutex<HashMap<PathBuf, CodexRestartBackoff>> {
+    CODEX_RESTART_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Computes the capped-exponential-with-jitter delay before the next Codex
+/// restart attempt is allowed, given the executable's number of consecutive
+/// prior failures (plan.md §7.2). Doubles from [`CODEX_RESTART_BACKOFF_BASE`]
+/// per failure, capped at [`CODEX_RESTART_BACKOFF_MAX`], then jitters down to
+/// a uniformly random point in `[0, cap]` -- the standard "full jitter"
+/// algorithm -- so sessions that started failing at the same moment (a
+/// shared root cause) don't all retry in lockstep.
+fn codex_restart_backoff_delay(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(20);
+    let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    let cap = CODEX_RESTART_BACKOFF_BASE
+        .saturating_mul(multiplier)
+        .min(CODEX_RESTART_BACKOFF_MAX);
+    if cap.is_zero() {
+        return Duration::ZERO;
+    }
+    let millis = rand::thread_rng().gen_range(0..=cap.as_millis() as u64);
+    Duration::from_millis(millis)
+}
+
+/// Spawns and handshakes a fresh Codex session and performs its first
+/// rate-limit read, refusing outright (without touching the process) if
+/// `executable`'s backoff window from a prior failure has not yet elapsed.
+/// Records the attempt's outcome in the backoff tracker either way, so a
+/// successful restart clears a prior failure streak and an unsuccessful one
+/// (whether the handshake itself or the first read afterward fails) grows
+/// it -- matching the pre-existing invariant that a session is only ever
+/// handed back to the caller once both the handshake and the first read
+/// have succeeded.
+fn restart_codex_session(
+    executable: &Path,
+    timeout_seconds: u64,
+) -> Result<(CodexSession, (Value, DateTime<Utc>))> {
+    {
+        let map = codex_restart_backoff_map();
+        let guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = guard.get(executable).copied().unwrap_or_default();
+        state
+            .check(std::time::Instant::now())
+            .map_err(|retry_after| CodexSourceError::RestartBackoff { retry_after })?;
+    }
+
+    let outcome = (|| -> Result<(CodexSession, (Value, DateTime<Utc>))> {
+        let mut session = spawn_and_handshake_codex(executable, timeout_seconds)?;
+        let value = codex_session_read_rate_limits(&mut session, timeout_seconds)?;
+        Ok((session, value))
+    })();
+
+    let map = codex_restart_backoff_map();
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(executable.to_owned())
+        .or_default()
+        .record(outcome.is_ok(), std::time::Instant::now());
+    outcome
 }
 
 /// A live Codex app-server child past the `initialize`/`initialized`
@@ -1487,6 +1608,69 @@ mod tests {
             "a cache older than CODEX_RECONCILE_INTERVAL must force a fresh full read, so a \
              notification stream alone can never indefinitely postpone reconciliation"
         );
+    }
+
+    #[test]
+    fn codex_restart_backoff_allows_the_very_first_attempt() {
+        let state = CodexRestartBackoff::default();
+        assert!(state.check(std::time::Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn codex_restart_backoff_blocks_immediately_after_a_failure() {
+        let now = std::time::Instant::now();
+        let mut state = CodexRestartBackoff::default();
+        state.record(false, now);
+        assert!(
+            state.check(now).is_err(),
+            "a restart attempted the instant a failure was recorded must be blocked, not retried \
+             in a tight loop"
+        );
+    }
+
+    #[test]
+    fn codex_restart_backoff_allows_a_retry_once_its_window_elapses() {
+        let now = std::time::Instant::now();
+        let mut state = CodexRestartBackoff::default();
+        state.record(false, now);
+        let well_past_the_cap = now + CODEX_RESTART_BACKOFF_MAX + Duration::from_secs(1);
+        assert!(state.check(well_past_the_cap).is_ok());
+    }
+
+    #[test]
+    fn codex_restart_backoff_resets_after_a_success() {
+        let now = std::time::Instant::now();
+        let mut state = CodexRestartBackoff::default();
+        state.record(false, now);
+        state.record(false, now);
+        assert!(state.consecutive_failures >= 2);
+
+        state.record(true, now);
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(
+            state.check(now).is_ok(),
+            "a reset backoff must never block the very next attempt after a success"
+        );
+    }
+
+    #[test]
+    fn codex_restart_backoff_delay_never_exceeds_the_cap_even_after_many_failures() {
+        for _ in 0..50 {
+            assert!(codex_restart_backoff_delay(50) <= CODEX_RESTART_BACKOFF_MAX);
+        }
+    }
+
+    #[test]
+    fn codex_restart_backoff_delay_is_bounded_by_the_doubling_base_before_the_cap() {
+        // failures=1 -> exponent 0 -> multiplier 1 -> cap = BASE.
+        for _ in 0..50 {
+            assert!(codex_restart_backoff_delay(1) <= CODEX_RESTART_BACKOFF_BASE);
+        }
+        // failures=3 -> exponent 2 -> multiplier 4 -> cap = 4 * BASE (still
+        // well under CODEX_RESTART_BACKOFF_MAX).
+        for _ in 0..50 {
+            assert!(codex_restart_backoff_delay(3) <= CODEX_RESTART_BACKOFF_BASE * 4);
+        }
     }
 
     #[test]
