@@ -38,6 +38,17 @@ const MAX_GENERIC_SOURCE_BYTES: u64 = 1024 * 1024;
 /// response is a small JSON document, so this is generous headroom rather
 /// than a tight budget, matching [`MAX_GENERIC_SOURCE_BYTES`].
 const MAX_CODEX_FRAME_BYTES: usize = 1024 * 1024;
+/// Ceiling on how long a Codex session's push-notification cache may answer
+/// a poll before an authoritative `account/rateLimits/read` is forced
+/// (plan.md §7.2: "Consume rate-limit update notifications while
+/// periodically reconciling with authoritative full reads"). Notifications
+/// alone never reset this clock -- only a completed full read does -- so a
+/// missed or dropped `account/rateLimits/updated` push can drift the
+/// reported quota for at most this long. Three times the 300-second default
+/// `poll_interval_seconds` (plan.md §8): long enough that a healthy
+/// notification stream answers most polls from cache, short enough to bound
+/// drift to a handful of poll cycles.
+const CODEX_RECONCILE_INTERVAL: Duration = Duration::from_secs(900);
 
 /// A 3xx response encountered where redirects are disabled. `Display`
 /// includes only the response's own status code and the requested URL --
@@ -725,8 +736,8 @@ fn parse_anthropic_limit(id: &str, value: &Value) -> Option<QuotaWindow> {
 }
 
 fn collect_codex(executable: &Path, timeout_seconds: u64) -> Result<QuotaSnapshot> {
-    let result = with_codex_session(executable, timeout_seconds)?;
-    parse_codex_rate_limits(&result, Utc::now())
+    let (result, observed_at) = with_codex_session(executable, timeout_seconds)?;
+    parse_codex_rate_limits(&result, observed_at)
 }
 
 /// Every live, handshaked Codex app-server session, keyed by executable
@@ -760,8 +771,15 @@ pub fn shutdown_codex_sessions() {
 /// first if there is none yet or the existing one just failed. This is the
 /// "supervised" half of §7.2: one broken session (the app-server exited,
 /// the pipe broke, a request timed out) causes one respawn on the next
-/// poll, not a permanent failure for every poll after it.
-fn with_codex_session(executable: &Path, timeout_seconds: u64) -> Result<Value> {
+/// poll that actually needs to talk to it (a poll answered entirely from
+/// the notification cache -- see [`codex_session_read_rate_limits`] --
+/// never gets a chance to notice), not a permanent failure for every poll
+/// after it.
+///
+/// Returns the rate-limit result alongside the wall-clock time it was
+/// actually obtained, which may predate this call by up to
+/// [`CODEX_RECONCILE_INTERVAL`] when the answer came from the cache.
+fn with_codex_session(executable: &Path, timeout_seconds: u64) -> Result<(Value, DateTime<Utc>)> {
     let sessions = codex_sessions();
     let mut guard = sessions
         .lock()
@@ -788,12 +806,31 @@ fn with_codex_session(executable: &Path, timeout_seconds: u64) -> Result<Value> 
 /// handshake, ready for repeated `account/rateLimits/read` requests across
 /// polls. `next_id` continues incrementing across calls so JSON-RPC ids stay
 /// unique for the life of the session, not just within one poll.
+///
+/// `last_result` and `last_reconciled_at` implement plan.md §7.2's push
+/// notification cache: `last_result` holds the most recent rate-limit
+/// payload from either an `account/rateLimits/updated` notification or a
+/// full `account/rateLimits/read`, and `last_reconciled_at` records when the
+/// last *full read* completed -- notifications update `last_result` without
+/// moving this clock, so [`CODEX_RECONCILE_INTERVAL`] bounds how long the
+/// session may answer polls from the cache alone.
 struct CodexSession {
     child: ChildGuard,
     stdin: ChildStdin,
     receiver: mpsc::Receiver<Value>,
     reader: Option<JoinHandle<()>>,
     next_id: i64,
+    last_result: Option<Value>,
+    last_reconciled_at: std::time::Instant,
+    /// Wall-clock time `last_result` was actually obtained -- the moment a
+    /// full read's response or a notification was received, never the
+    /// moment a *cached* answer is later handed back to a poll. Reported as
+    /// the returned snapshot's `observed_at` (plan.md §9.1's freshness gate
+    /// compares `now - observed_at`), so a poll served from an
+    /// increasingly-old cache is honestly reported as increasingly old,
+    /// rather than stamped with the current time and appearing artificially
+    /// fresh.
+    last_observed_at: DateTime<Utc>,
 }
 
 impl Drop for CodexSession {
@@ -828,9 +865,10 @@ fn spawn_and_handshake_codex(executable: &Path, timeout_seconds: u64) -> Result<
             match read_bounded_codex_frame(&mut reader, MAX_CODEX_FRAME_BYTES) {
                 Ok(Some(CodexFrame::Line(line))) => {
                     // A line that isn't valid JSON (or, further downstream
-                    // in receive_response, a notification or a mismatched
-                    // id) is an unrelated frame -- ignore it and keep
-                    // reading rather than treating it as fatal.
+                    // in receive_codex_response/drain_pending_codex_notifications,
+                    // an unrecognized notification or a mismatched id) is an
+                    // unrelated frame -- ignore it and keep reading rather
+                    // than treating it as fatal.
                     if let Ok(value) = serde_json::from_str::<Value>(&line) {
                         if sender.send(value).is_err() {
                             return;
@@ -853,6 +891,11 @@ fn spawn_and_handshake_codex(executable: &Path, timeout_seconds: u64) -> Result<
         receiver,
         reader: Some(reader),
         next_id: 1,
+        last_result: None,
+        last_reconciled_at: std::time::Instant::now(),
+        // Never read before last_result is populated; the placeholder value
+        // is never observed.
+        last_observed_at: Utc::now(),
     };
 
     let initialize_id = session.next_id;
@@ -867,7 +910,7 @@ fn spawn_and_handshake_codex(executable: &Path, timeout_seconds: u64) -> Result<
         .stdin
         .flush()
         .map_err(CodexSourceError::WriteFailed)?;
-    let initialized = receive_response(&session.receiver, initialize_id, timeout_seconds)
+    let initialized = receive_codex_response(&mut session, initialize_id, timeout_seconds)
         .map_err(|_| CodexSourceError::InitializeTimedOut)?;
     if let Some(error) = initialized.get("error") {
         let code = error.get("code").and_then(Value::as_i64);
@@ -890,10 +933,30 @@ fn spawn_and_handshake_codex(executable: &Path, timeout_seconds: u64) -> Result<
     Ok(session)
 }
 
+/// Answers one poll's rate-limit request, preferring the session's
+/// push-notification cache over the network (plan.md §7.2). Drains any
+/// notifications that arrived since the last poll first, so a push that
+/// landed while this session was otherwise idle is picked up promptly; only
+/// falls through to a full `account/rateLimits/read` round trip when there
+/// is no cached result yet or [`CODEX_RECONCILE_INTERVAL`] has elapsed since
+/// the last one.
 fn codex_session_read_rate_limits(
     session: &mut CodexSession,
     timeout_seconds: u64,
-) -> Result<Value> {
+) -> Result<(Value, DateTime<Utc>)> {
+    drain_pending_codex_notifications(session);
+    if codex_cache_is_usable(
+        &session.last_result,
+        session.last_reconciled_at,
+        std::time::Instant::now(),
+    ) {
+        let result = session
+            .last_result
+            .clone()
+            .expect("codex_cache_is_usable only returns true when last_result is Some");
+        return Ok((result, session.last_observed_at));
+    }
+
     let id = session.next_id;
     session.next_id += 1;
     writeln!(
@@ -906,16 +969,75 @@ fn codex_session_read_rate_limits(
         .stdin
         .flush()
         .map_err(CodexSourceError::WriteFailed)?;
-    let response = receive_response(&session.receiver, id, timeout_seconds)
+    let response = receive_codex_response(session, id, timeout_seconds)
         .map_err(|_| CodexSourceError::RateLimitsTimedOut)?;
     if let Some(error) = response.get("error") {
         let code = error.get("code").and_then(Value::as_i64);
         return Err(CodexSourceError::RateLimitsRejected { code }.into());
     }
-    response
+    let result = response
         .get("result")
         .cloned()
-        .ok_or_else(|| CodexSourceError::ResultMissing.into())
+        .ok_or(CodexSourceError::ResultMissing)?;
+    let observed_at = Utc::now();
+    session.last_result = Some(result.clone());
+    session.last_reconciled_at = std::time::Instant::now();
+    session.last_observed_at = observed_at;
+    Ok((result, observed_at))
+}
+
+/// Whether a session's cached rate-limit result is fresh enough to answer a
+/// poll without a network round trip: there must be a cached result at all,
+/// and [`CODEX_RECONCILE_INTERVAL`] must not yet have elapsed since the last
+/// *full read* (`last_reconciled_at`) -- a notification updates the cached
+/// value but deliberately never this clock, so an uninterrupted stream of
+/// pushes can never indefinitely postpone reconciliation. Takes its inputs
+/// by value rather than `&CodexSession` so it can be unit-tested without
+/// constructing a full session (which needs a real child process).
+fn codex_cache_is_usable(
+    last_result: &Option<Value>,
+    last_reconciled_at: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    last_result.is_some()
+        && now.saturating_duration_since(last_reconciled_at) < CODEX_RECONCILE_INTERVAL
+}
+
+/// Drains every message currently waiting on the session's channel without
+/// blocking, capturing the latest `account/rateLimits/updated` push into the
+/// cache and discarding anything else -- a stray late response or an
+/// unrelated notification. Called before deciding whether a poll can be
+/// answered from the cache, so a push that arrived while this session was
+/// idle between polls (the reader thread keeps running regardless) is
+/// applied promptly rather than sitting unseen until the next full read.
+fn drain_pending_codex_notifications(session: &mut CodexSession) {
+    while let Ok(value) = session.receiver.try_recv() {
+        capture_codex_notification(session, &value);
+    }
+}
+
+/// Updates the session's push-notification cache if `value` is a
+/// well-formed `account/rateLimits/updated` notification. Per JSON-RPC,
+/// only requests and responses carry an `id`; a notification does not, so
+/// that alone distinguishes it from a stray/late response. Its `params` is
+/// assumed to carry the same result-shaped payload as
+/// `account/rateLimits/read`'s `result` (plan.md §7.2 documents both
+/// methods on the same protocol; no other shape is specified), so it can
+/// feed the same [`parse_codex_rate_limits`] parser unchanged. Anything else
+/// -- an unrelated method, a malformed notification -- is silently ignored,
+/// matching how any other unrelated frame is already handled: one bad
+/// message must never fail an otherwise-healthy session.
+fn capture_codex_notification(session: &mut CodexSession, value: &Value) {
+    if value.get("id").is_some() {
+        return;
+    }
+    if value.get("method").and_then(Value::as_str) != Some("account/rateLimits/updated") {
+        return;
+    }
+    if let Some(params) = value.get("params") {
+        session.last_result = Some(params.clone());
+        session.last_observed_at = Utc::now();
+    }
 }
 
 struct ChildGuard(Child);
@@ -990,8 +1112,14 @@ fn drain_until_newline(reader: &mut impl BufRead) -> std::io::Result<()> {
     }
 }
 
-fn receive_response(
-    receiver: &mpsc::Receiver<Value>,
+/// Waits for the JSON-RPC response whose `id` matches, meanwhile capturing
+/// any `account/rateLimits/updated` notification interleaved ahead of it
+/// into the session's cache (via [`capture_codex_notification`]) instead of
+/// silently discarding it -- everything else non-matching (a stray response
+/// to an abandoned request, an unrelated notification) is still discarded,
+/// same as before this session gained a cache.
+fn receive_codex_response(
+    session: &mut CodexSession,
     id: i64,
     timeout_seconds: u64,
 ) -> Result<Value> {
@@ -1000,12 +1128,14 @@ fn receive_response(
         let remaining = deadline
             .checked_duration_since(std::time::Instant::now())
             .context("response deadline elapsed")?;
-        let value = receiver
+        let value = session
+            .receiver
             .recv_timeout(remaining)
             .context("app-server response channel closed")?;
         if value.get("id").and_then(Value::as_i64) == Some(id) {
             return Ok(value);
         }
+        capture_codex_notification(session, &value);
     }
 }
 
@@ -1322,6 +1452,41 @@ mod tests {
         assert_eq!(detail.id, "credit-1");
         assert_eq!(detail.status, "available");
         assert_eq!(detail.expires_at.unwrap().timestamp(), 1_800_200_000);
+    }
+
+    #[test]
+    fn codex_cache_is_usable_requires_a_cached_result() {
+        let now = std::time::Instant::now();
+        assert!(
+            !codex_cache_is_usable(&None, now, now),
+            "no cached result yet must never be reported usable, regardless of timing"
+        );
+    }
+
+    #[test]
+    fn codex_cache_is_usable_accepts_a_recent_full_read() {
+        let now = std::time::Instant::now();
+        let one_second_ago = now - Duration::from_secs(1);
+        assert!(codex_cache_is_usable(
+            &Some(json!({"rateLimitsByLimitId": {}})),
+            one_second_ago,
+            now
+        ));
+    }
+
+    #[test]
+    fn codex_cache_is_usable_expires_once_the_reconcile_interval_elapses() {
+        let now = std::time::Instant::now();
+        let just_past_the_interval = now - CODEX_RECONCILE_INTERVAL - Duration::from_secs(1);
+        assert!(
+            !codex_cache_is_usable(
+                &Some(json!({"rateLimitsByLimitId": {}})),
+                just_past_the_interval,
+                now
+            ),
+            "a cache older than CODEX_RECONCILE_INTERVAL must force a fresh full read, so a \
+             notification stream alone can never indefinitely postpone reconciliation"
+        );
     }
 
     #[test]
