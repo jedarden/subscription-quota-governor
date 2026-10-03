@@ -1217,7 +1217,7 @@ transport type or credential model is introduced. Requirements:
 
 - [ ] `subgov snapshot ACCOUNT --host HOST` prints only that host's resource
   snapshot, same non-actuating contract as plain `snapshot` (§12).
-- [ ] `run`/`run --once` decision output includes a per-host breakdown when
+- [x] `run`/`run --once` decision output includes a per-host breakdown when
   `hosts` is configured; unchanged single-line output when it is not.
 
 ### 22.13 Work packages
