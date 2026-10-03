@@ -161,6 +161,17 @@ accounts:
     assert_eq!(metric_by_id["west"]["placed_workers"], 2);
     assert_eq!(metrics["account"], "acct");
     assert_eq!(metrics["actuation_attempted"], false);
+
+    let saved_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(saved_state["schema_version"], 3);
+    assert_eq!(
+        saved_state["host_states"]["acct"]["east"]["placement_history"][0]["target_workers"],
+        4
+    );
+    assert_eq!(
+        saved_state["host_states"]["acct"]["west"]["placement_history"][0]["target_workers"],
+        2
+    );
 }
 
 #[cfg(unix)]
