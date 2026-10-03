@@ -638,6 +638,150 @@ mod tests {
         }
 
         proptest! {
+            /// The public placement result never exceeds the controller's
+            /// account target when no existing workers need a step-limited
+            /// scale-down. Step limits intentionally let a shrinking target
+            /// lag behind current workers for several cycles.
+            #[test]
+            fn placed_total_never_exceeds_account_target(
+                account_target in 0u32..50,
+                specs in prop::collection::vec(arb_host(), 1..6),
+            ) {
+                let now = Utc::now();
+                let mut hosts = BTreeMap::new();
+                let mut resources = BTreeMap::new();
+                for (index, (ceiling, fresh, cpu, mem_available, mem_total, mem_reserve_mb, _)) in specs.iter().enumerate() {
+                    let id = format!("h{index}");
+                    hosts.insert(id.clone(), resource_host(Some(*ceiling), *mem_reserve_mb));
+                    resources.insert(
+                        id.clone(),
+                        snapshot(now, &id, *fresh, *cpu, *mem_available, *mem_total),
+                    );
+                }
+                let config = account(hosts, 12, 100, 100);
+                let placements = place(
+                    "acct",
+                    account_target,
+                    &config,
+                    &BTreeMap::new(),
+                    &resources,
+                    now,
+                ).unwrap();
+                let total: u32 = placements.iter().map(|placement| placement.target).sum();
+                prop_assert!(total <= account_target, "placed {total} workers for target {account_target}");
+            }
+
+            /// A host's reported headroom comes only from its own resource
+            /// snapshot. Marking a different host stale can change eligibility
+            /// and distribution, but cannot inflate this host's own headroom.
+            #[test]
+            fn disabling_one_host_does_not_inflate_other_hosts_headroom(
+                specs in prop::collection::vec(
+                    (0.01f64..=1.0, 1u64..4096, 1u64..4096),
+                    2..6,
+                ),
+                disabled_seed in any::<usize>(),
+            ) {
+                let now = Utc::now();
+                let disabled_index = disabled_seed % specs.len();
+                let mut hosts = BTreeMap::new();
+                let mut resources = BTreeMap::new();
+                for (index, (cpu, mem_available, mem_total)) in specs.iter().enumerate() {
+                    let id = format!("h{index}");
+                    hosts.insert(id.clone(), resource_host(Some(100), 0));
+                    resources.insert(
+                        id.clone(),
+                        snapshot(now, &id, true, *cpu, (*mem_available).min(*mem_total), *mem_total),
+                    );
+                }
+                let config = account(hosts, 100, 100, 100);
+                let before = place(
+                    "acct",
+                    20,
+                    &config,
+                    &BTreeMap::new(),
+                    &resources,
+                    now,
+                ).unwrap();
+                resources.get_mut(&format!("h{disabled_index}")).unwrap().fresh = false;
+                let after = place(
+                    "acct",
+                    20,
+                    &config,
+                    &BTreeMap::new(),
+                    &resources,
+                    now,
+                ).unwrap();
+
+                for index in 0..specs.len() {
+                    if index == disabled_index {
+                        continue;
+                    }
+                    let id = format!("h{index}");
+                    prop_assert_eq!(find(&before, &id).headroom, find(&after, &id).headroom);
+                    prop_assert!(find(&after, &id).eligible);
+                }
+            }
+
+            /// Equal-headroom ties always hand remainder workers to the
+            /// lexicographically smallest host keys, independent of map
+            /// insertion order or repeated evaluation.
+            #[test]
+            fn equal_headroom_ties_are_deterministic_by_host_key(
+                host_count in 2usize..8,
+                account_target in 0u32..50,
+            ) {
+                let now = Utc::now();
+                let mut forward_hosts = BTreeMap::new();
+                for index in 0..host_count {
+                    let id = format!("host-{index:02}");
+                    forward_hosts.insert(id.clone(), unconstrained_host(Some(100)));
+                }
+                let mut reverse_hosts = BTreeMap::new();
+                for index in (0..host_count).rev() {
+                    let id = format!("host-{index:02}");
+                    reverse_hosts.insert(id, unconstrained_host(Some(100)));
+                }
+                // Insert the same entries in reverse order to make the
+                // canonical host-key tie-break observable at the API.
+                let forward_config = account(forward_hosts, 100, 100, 100);
+                let reverse_config = account(reverse_hosts, 100, 100, 100);
+                let first = place(
+                    "acct",
+                    account_target,
+                    &forward_config,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    now,
+                ).unwrap();
+                let repeated = place(
+                    "acct",
+                    account_target,
+                    &forward_config,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    now,
+                ).unwrap();
+                let reordered = place(
+                    "acct",
+                    account_target,
+                    &reverse_config,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    now,
+                ).unwrap();
+                prop_assert_eq!(&first, &repeated);
+                prop_assert_eq!(&first, &reordered);
+
+                let base = account_target / host_count as u32;
+                let remainder = account_target % host_count as u32;
+                for (index, placement) in first.iter().enumerate() {
+                    let expected = base + u32::from((index as u32) < remainder);
+                    prop_assert_eq!(&placement.host_id, &format!("host-{index:02}"));
+                    prop_assert_eq!(placement.target, expected);
+                }
+            }
+
             /// plan.md §22.7's central invariant: placement never asks for
             /// more workers, in aggregate, than the controller already
             /// authorized. Checked against the pre-step-limit distribution
