@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "observed_at": "fixture",
+  "controllers": [
+    {
+      "name": "subgov-codex",
+      "host": "codinghome",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "actuating",
+      "config_path": "codex.yaml",
+      "state_path": "codex-state.json",
+      "actuator": "Codex worker target file",
+      "evidence": "Account one."
+    },
+    {
+      "name": "cgov-alias",
+      "host": "lab",
+      "account_id": "anthropic:other-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "actuating",
+      "config_path": "other.yaml",
+      "state_path": "other-state.json",
+      "actuator": "same Codex worker fleet",
+      "evidence": "Different account does not make shared fleet safe."
+    }
+  ]
+}

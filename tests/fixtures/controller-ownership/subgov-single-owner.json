@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "observed_at": "fixture",
+  "controllers": [
+    {
+      "name": "cgov-codinghome-needle-sonnet",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=needle-sonnet",
+      "mode": "actuating",
+      "config_path": "cgov-config",
+      "state_path": "cgov-state",
+      "actuator": "cgov needle-sonnet worker launch path",
+      "evidence": "Independent Claude fleet."
+    },
+    {
+      "name": "subgov-codinghome-codex",
+      "host": "codinghome",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "actuating",
+      "config_path": "future subgov config",
+      "state_path": "/home/coding/.local/state/subscription-governor/codex.json",
+      "actuator": "future Codex fleet adapter; not enabled by this task",
+      "evidence": "Simulated sole Codex owner for first-account rollout."
+    },
+    {
+      "name": "codex-governor-codinghome-codex",
+      "host": "codinghome",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "planned",
+      "config_path": "codex-governor plan",
+      "state_path": null,
+      "actuator": "planned needle run --agent codex --count 1 child launcher",
+      "evidence": "Planned handoff target; not active while subgov owns Codex."
+    },
+    {
+      "name": "needle-glm-quota-controller-codinghome",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:glm-5.3-flash:local-base+lab-elastic",
+      "mode": "disabled",
+      "config_path": "needle-glm-quota-controller script",
+      "state_path": "needle-glm-quota-controller state",
+      "actuator": "systemd user units on codinghome and lab",
+      "evidence": "Unchanged disabled control loop."
+    },
+    {
+      "name": "needle-zai-governor-codinghome",
+      "host": "codinghome",
+      "account_id": "zai:expansion-proxy-quota",
+      "fleet_id": "needle:ex44-expansion:glm-icg+glm-roam-18-24",
+      "mode": "disabled",
+      "config_path": "needle-zai-governor script",
+      "state_path": "needle-zai-governor state",
+      "actuator": "needle-worker@glm-icg and needle-worker@glm-roam-18..24 user units",
+      "evidence": "Unchanged disabled control loop."
+    }
+  ]
+}

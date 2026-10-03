@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "observed_at": "2026-10-03",
+  "controllers": [
+    {
+      "name": "cgov-codinghome-needle-sonnet",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=needle-sonnet",
+      "mode": "actuating",
+      "config_path": "/home/coding/.config/claude-governor/governor.yaml",
+      "state_path": "/home/coding/.config/claude-governor/governor-state.json",
+      "actuator": "cgov daemon worker launch path for needle-sonnet",
+      "evidence": "Active claude-governor.service; live config has only needle-sonnet."
+    },
+    {
+      "name": "needle-glm-quota-controller-codinghome",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:glm-5.3-flash:local-base+lab-elastic",
+      "mode": "disabled",
+      "config_path": "/home/coding/bin/needle-glm-quota-controller",
+      "state_path": "/home/coding/.local/state/needle-glm-quota-controller/state.json",
+      "actuator": "systemd user units on codinghome and lab",
+      "evidence": "Controller service inactive and timer disabled; script reads cgov quota state."
+    },
+    {
+      "name": "needle-zai-governor-codinghome",
+      "host": "codinghome",
+      "account_id": "zai:expansion-proxy-quota",
+      "fleet_id": "needle:ex44-expansion:glm-icg+glm-roam-18-24",
+      "mode": "disabled",
+      "config_path": "/home/coding/.local/bin/needle-zai-governor",
+      "state_path": "/home/coding/.local/state/needle-zai-governor/desired_count-v3",
+      "actuator": "needle-worker@glm-icg and needle-worker@glm-roam-18..24 user units",
+      "evidence": "Controller service inactive and timer disabled."
+    },
+    {
+      "name": "subgov-codinghome-codex",
+      "host": "codinghome",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "absent",
+      "config_path": null,
+      "state_path": "/home/coding/.local/state/subscription-governor/codex.json",
+      "actuator": null,
+      "evidence": "No config or launch path found; existing state artifact is empty and matches examples/codex.yaml."
+    },
+    {
+      "name": "subgov-lab-codex",
+      "host": "lab",
+      "account_id": "codex:lab-profile-unverified",
+      "fleet_id": "needle:agent=codex",
+      "mode": "absent",
+      "config_path": null,
+      "state_path": null,
+      "actuator": null,
+      "evidence": "No subgov config, state file, unit, timer, or process found."
+    },
+    {
+      "name": "codex-governor-codinghome-codex",
+      "host": "codinghome",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "planned",
+      "config_path": "/home/coding/codex-governor/docs/plan/plan.md",
+      "state_path": null,
+      "actuator": "planned needle run --agent codex --count 1 child launcher",
+      "evidence": "Repository plan and open handoff bead exist; no installed binary or service found."
+    }
+  ]
+}

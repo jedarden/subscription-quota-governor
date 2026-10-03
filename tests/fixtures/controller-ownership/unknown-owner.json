@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "observed_at": "fixture",
+  "controllers": [
+    {
+      "name": "unclassified-controller",
+      "host": "lab",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "unknown",
+      "config_path": null,
+      "state_path": null,
+      "actuator": null,
+      "evidence": "Unknown ownership must fail closed."
+    }
+  ]
+}

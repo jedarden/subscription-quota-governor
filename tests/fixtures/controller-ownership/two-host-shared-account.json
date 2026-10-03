@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "observed_at": "fixture",
+  "controllers": [
+    {
+      "name": "subgov-codinghome-codex",
+      "host": "codinghome",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "actuating",
+      "config_path": "codinghome.yaml",
+      "state_path": "/home/coding/.local/state/subscription-governor/codex.json",
+      "actuator": "Codex worker target file on codinghome",
+      "evidence": "First host fixture."
+    },
+    {
+      "name": "codex-governor-lab-codex",
+      "host": "lab",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex",
+      "mode": "actuating",
+      "config_path": "lab.toml",
+      "state_path": "/home/coding/.local/state/codex-governor/registry.sqlite",
+      "actuator": "Codex NEEDLE worker launcher on lab",
+      "evidence": "Same subscription account across two hosts must block."
+    }
+  ]
+}

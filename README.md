@@ -146,6 +146,7 @@ default.
 
 See [architecture decisions](docs/adr/README.md),
 [configuration notes](docs/notes/configuration.md),
+[controller ownership preflight](docs/notes/runbooks/controller-ownership.md),
 [configuration compatibility policy](docs/notes/compatibility.md),
 [dependency pinning and audit policy](docs/notes/dependency-policy.md),
 [state backup and removal](docs/notes/state-backup-and-removal.md),

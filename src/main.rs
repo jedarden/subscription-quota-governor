@@ -46,6 +46,12 @@ enum Commands {
     /// Print each account's readiness classification from the last
     /// completed cycle, without inspecting credentials or live sources.
     Status,
+    /// Read a no-secret inventory and reject overlapping controller ownership.
+    Preflight {
+        /// JSON inventory assembled from the read-only host inspection procedure.
+        #[arg(short, long)]
+        inventory: PathBuf,
+    },
 }
 
 /// Stable exit-code categories (plan.md §12). Each carries the underlying
@@ -101,6 +107,10 @@ fn main() -> ExitCode {
 
 fn run_cli() -> Result<(), GovernorError> {
     let cli = Cli::parse();
+    if let Commands::Preflight { inventory } = &cli.command {
+        return subscription_governor::preflight::run(inventory)
+            .map_err(GovernorError::CliOrConfig);
+    }
     let config = Config::load(&cli.config).map_err(GovernorError::CliOrConfig)?;
     match cli.command {
         Commands::Check => {
@@ -113,6 +123,7 @@ fn run_cli() -> Result<(), GovernorError> {
         Commands::Snapshot { account } => snapshot(&config, &account),
         Commands::Run { once, observe_only } => run(config, once, observe_only),
         Commands::Status => status(&config),
+        Commands::Preflight { .. } => unreachable!("preflight handled before config loading"),
     }
 }
 

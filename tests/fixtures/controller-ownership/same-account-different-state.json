@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "observed_at": "fixture",
+  "controllers": [
+    {
+      "name": "subgov-codinghome-codex",
+      "host": "codinghome",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex-codinghome",
+      "mode": "actuating",
+      "config_path": "codinghome.yaml",
+      "state_path": "/home/coding/.local/state/subscription-governor/codex.json",
+      "actuator": "Codex target file on codinghome",
+      "evidence": "First host fixture."
+    },
+    {
+      "name": "subgov-lab-codex",
+      "host": "lab",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex-lab",
+      "mode": "actuating",
+      "config_path": "lab.yaml",
+      "state_path": "/home/coding/.local/state/subscription-governor/lab-codex.json",
+      "actuator": "Codex target file on lab",
+      "evidence": "Same account and different state path must still conflict."
+    }
+  ]
+}
