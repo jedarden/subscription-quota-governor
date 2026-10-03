@@ -163,7 +163,8 @@ impl State {
                 return Ok((Self::default(), None))
             }
             Err(error) => {
-                return Err(error).with_context(|| format!("failed to read state {}", path.display()))
+                return Err(error)
+                    .with_context(|| format!("failed to read state {}", path.display()))
             }
         };
         let state: Self = match serde_json::from_slice(&bytes) {
@@ -209,8 +210,7 @@ impl State {
         // was actually loadable with one that no longer is. Catching that
         // here keeps the temp-file-then-rename path fail closed: nothing
         // that can't be read back ever reaches `path`.
-        let mut payload =
-            serde_json::to_vec_pretty(self).context("failed to serialize state")?;
+        let mut payload = serde_json::to_vec_pretty(self).context("failed to serialize state")?;
         serde_json::from_slice::<Self>(&payload).with_context(|| {
             format!(
                 "serialized state for {} does not round-trip; refusing to persist it over the last valid state",
@@ -226,8 +226,9 @@ impl State {
                 .write(true)
                 .open(&temporary)
                 .with_context(|| format!("failed to create {}", temporary.display()))?;
-            restrict_permissions(&file)
-                .with_context(|| format!("failed to restrict permissions on {}", temporary.display()))?;
+            restrict_permissions(&file).with_context(|| {
+                format!("failed to restrict permissions on {}", temporary.display())
+            })?;
             file.write_all(&payload)?;
             file.sync_all()?;
             fs::rename(&temporary, path)
@@ -264,8 +265,9 @@ impl StateLock {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("failed to open lock {}", lock_path.display()))?;
-        restrict_permissions(&file)
-            .with_context(|| format!("failed to restrict permissions on {}", lock_path.display()))?;
+        restrict_permissions(&file).with_context(|| {
+            format!("failed to restrict permissions on {}", lock_path.display())
+        })?;
         file.try_lock_exclusive()
             .with_context(|| format!("another governor owns {}", lock_path.display()))?;
         Ok(Self { _file: file })
@@ -310,7 +312,11 @@ fn temporary_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn snapshot_with_one_window(id: &str, used_fraction: f64, resets_at: DateTime<Utc>) -> QuotaSnapshot {
+    fn snapshot_with_one_window(
+        id: &str,
+        used_fraction: f64,
+        resets_at: DateTime<Utc>,
+    ) -> QuotaSnapshot {
         QuotaSnapshot {
             observed_at: Utc::now(),
             fresh: true,
@@ -330,8 +336,7 @@ mod tests {
         let mut account = AccountState::default();
         let resets_at = Utc::now() + chrono::Duration::hours(5);
         for i in 0..(MAX_HISTORY_SAMPLES_PER_GENERATION + 5) {
-            let snapshot =
-                snapshot_with_one_window("5h", i as f64 * 0.01, resets_at);
+            let snapshot = snapshot_with_one_window("5h", i as f64 * 0.01, resets_at);
             account.record(&snapshot, 1, 3);
         }
         let history = account.history.get("5h").unwrap();

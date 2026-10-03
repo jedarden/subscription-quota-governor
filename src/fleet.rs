@@ -265,10 +265,7 @@ fn command_actuator_actuate(argv: &[String], desired: u32, timeout: Duration) ->
     let mut command = new_process_group_command(&rendered[0]);
     command
         .args(&rendered[1..])
-        .env(
-            IDEMPOTENCY_TOKEN_ENV,
-            idempotency_token(&rendered, desired),
-        )
+        .env(IDEMPOTENCY_TOKEN_ENV, idempotency_token(&rendered, desired))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -727,7 +724,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_hung_actuation_is_bounded_and_never_reported_as_successful() {
-        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "sleep 5".to_string()];
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 5".to_string(),
+        ];
         let start = Instant::now();
         let result = command_actuator_actuate(&argv, 4, Duration::from_millis(100));
         assert!(
@@ -802,12 +803,17 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let target_path = dir.join("target");
 
-        let hung_argv = vec!["/bin/sh".to_string(), "-c".to_string(), "sleep 5".to_string()];
+        let hung_argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 5".to_string(),
+        ];
         let hung_result = command_actuator_actuate(&hung_argv, 4, Duration::from_millis(100));
         assert!(hung_result.is_err());
 
-        let working_config =
-            fleet_config_with_actuator(ActuatorConfig::TargetFile { path: target_path.clone() });
+        let working_config = fleet_config_with_actuator(ActuatorConfig::TargetFile {
+            path: target_path.clone(),
+        });
         let outcome = actuate(&working_config, 3, 8).unwrap();
         assert!(
             outcome.actuated,

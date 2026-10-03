@@ -28,17 +28,25 @@ fn load_fixture(name: &str) -> Value {
         "{}/tests/fixtures/anthropic-usage/{name}.json",
         env!("CARGO_MANIFEST_DIR")
     );
-    let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
     serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
 }
 
 #[test]
 fn legacy_payload_normalizes_all_three_named_windows() {
     let payload = load_fixture("legacy");
-    let snapshot = parse_anthropic_usage(&payload, observed()).expect("legacy fixture should parse");
+    let snapshot =
+        parse_anthropic_usage(&payload, observed()).expect("legacy fixture should parse");
 
     assert_eq!(snapshot.windows.len(), 3);
-    let by_id = |id: &str| snapshot.windows.iter().find(|window| window.id == id).unwrap();
+    let by_id = |id: &str| {
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == id)
+            .unwrap()
+    };
     assert_eq!(by_id("five_hour").used_fraction, 0.225);
     assert_eq!(by_id("seven_day").used_fraction, 0.61);
     assert_eq!(by_id("weekly_scoped").used_fraction, 0.0825);
@@ -47,10 +55,17 @@ fn legacy_payload_normalizes_all_three_named_windows() {
 #[test]
 fn generic_payload_normalizes_limits_array_entries() {
     let payload = load_fixture("generic");
-    let snapshot = parse_anthropic_usage(&payload, observed()).expect("generic fixture should parse");
+    let snapshot =
+        parse_anthropic_usage(&payload, observed()).expect("generic fixture should parse");
 
     assert_eq!(snapshot.windows.len(), 2);
-    let by_id = |id: &str| snapshot.windows.iter().find(|window| window.id == id).unwrap();
+    let by_id = |id: &str| {
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == id)
+            .unwrap()
+    };
     assert_eq!(by_id("five_hour").used_fraction, 0.335);
     assert_eq!(by_id("seven_day").used_fraction, 0.70);
 }
@@ -58,7 +73,8 @@ fn generic_payload_normalizes_limits_array_entries() {
 #[test]
 fn scoped_payload_prefers_the_generic_limit_over_the_same_id_legacy_field() {
     let payload = load_fixture("scoped");
-    let snapshot = parse_anthropic_usage(&payload, observed()).expect("scoped fixture should parse");
+    let snapshot =
+        parse_anthropic_usage(&payload, observed()).expect("scoped fixture should parse");
 
     // weekly_scoped appears both as a legacy field (12.0%) and a generic
     // limit (46.5%) with the same id; the generic limit must win, per
@@ -84,15 +100,21 @@ fn null_payload_skips_null_and_inactive_windows_without_failing_the_snapshot() {
 #[test]
 fn forward_compatible_payload_normalizes_an_unrecognized_limit_kind() {
     let payload = load_fixture("forward_compatible");
-    let snapshot =
-        parse_anthropic_usage(&payload, observed()).expect("forward-compatible fixture should parse");
+    let snapshot = parse_anthropic_usage(&payload, observed())
+        .expect("forward-compatible fixture should parse");
 
     // "monthly_bonus_pool" is not one of the three hardcoded legacy names,
     // and the payload carries unknown top-level fields (account_tier,
     // future_feature_flags) that must be silently ignored rather than
     // breaking parsing, per plan.md §6.3.
     assert_eq!(snapshot.windows.len(), 2);
-    let by_id = |id: &str| snapshot.windows.iter().find(|window| window.id == id).unwrap();
+    let by_id = |id: &str| {
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == id)
+            .unwrap()
+    };
     assert_eq!(by_id("five_hour").used_fraction, 0.18);
     assert_eq!(by_id("monthly_bonus_pool").used_fraction, 0.40);
 }
@@ -108,7 +130,10 @@ fn every_fixture_produces_only_finite_in_range_used_fractions() {
                 window.used_fraction.is_finite() && (0.0..=1.0).contains(&window.used_fraction),
                 "{name} fixture produced an out-of-range used_fraction: {window:?}"
             );
-            assert!(!window.id.is_empty(), "{name} fixture produced an empty window id");
+            assert!(
+                !window.id.is_empty(),
+                "{name} fixture produced an empty window id"
+            );
         }
     }
 }

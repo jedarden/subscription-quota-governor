@@ -169,7 +169,9 @@ pub fn evaluate(
     // §9.6: "the account result is the minimum of those counts." Ties fall to
     // the first matching window in snapshot order (Iterator::min_by_key's
     // documented tie-break), since the plan does not prescribe one.
-    let binding = decisions.iter().min_by_key(|decision| decision.desired_workers);
+    let binding = decisions
+        .iter()
+        .min_by_key(|decision| decision.desired_workers);
     let ordinary_desired = binding
         .map(|decision| decision.desired_workers)
         .unwrap_or(current_workers);
@@ -495,15 +497,8 @@ mod tests {
             ],
             reset_credits: None,
         };
-        let decision = evaluate(
-            "test",
-            &config,
-            &snapshot,
-            &AccountState::default(),
-            4,
-            now,
-        )
-        .unwrap();
+        let decision =
+            evaluate("test", &config, &snapshot, &AccountState::default(), 4, now).unwrap();
         // Both windows tie at fleet.min_workers (target_reached); the first
         // window in snapshot order wins the tie.
         assert_eq!(decision.binding_window.as_deref(), Some("first_at_target"));
@@ -1485,8 +1480,7 @@ mod tests {
                 if !stale {
                     // A burst every fifth cycle; silent otherwise.
                     let rate = if cycle % 5 == 4 { 0.08 } else { 0.0 };
-                    used_fraction =
-                        (used_fraction + workers as f64 * rate * cycle_hours).min(1.0);
+                    used_fraction = (used_fraction + workers as f64 * rate * cycle_hours).min(1.0);
                 }
                 let snapshot = QuotaSnapshot {
                     observed_at: clock.now(),

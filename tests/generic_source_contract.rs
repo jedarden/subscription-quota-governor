@@ -116,8 +116,9 @@ fn valid_snapshot() -> Vec<u8> {
 fn a_valid_snapshot_collects_successfully_via_every_transport() {
     let bytes = valid_snapshot();
     for transport in ALL_TRANSPORTS {
-        let snapshot = collect_via_transport(transport, &bytes)
-            .unwrap_or_else(|error| panic!("{transport:?} should collect a valid snapshot: {error:#}"));
+        let snapshot = collect_via_transport(transport, &bytes).unwrap_or_else(|error| {
+            panic!("{transport:?} should collect a valid snapshot: {error:#}")
+        });
         assert_eq!(snapshot.windows.len(), 1, "{transport:?}");
         assert_eq!(snapshot.windows[0].id, "weekly", "{transport:?}");
         assert_eq!(snapshot.windows[0].used_fraction, 0.42, "{transport:?}");
@@ -212,7 +213,8 @@ fn every_transport_helper_produces_a_value_serde_json_can_round_trip() {
     // hands to every transport are valid QuotaSnapshot JSON, not an
     // accidentally-malformed literal that would make every "valid" test
     // above pass for the wrong reason.
-    let value: Value = serde_json::from_slice(&valid_snapshot()).expect("fixture must be valid JSON");
+    let value: Value =
+        serde_json::from_slice(&valid_snapshot()).expect("fixture must be valid JSON");
     let _: QuotaSnapshot =
         serde_json::from_value(value).expect("fixture must deserialize as QuotaSnapshot");
 }

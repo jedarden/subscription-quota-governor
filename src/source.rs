@@ -196,7 +196,7 @@ pub enum GenericSourceError {
     #[error("HTTP source timeout_seconds must be greater than zero")]
     InvalidTimeout,
     #[error("normalized HTTP source request failed")]
-    HttpRequestFailed(#[source] ureq::Error),
+    HttpRequestFailed(#[source] Box<ureq::Error>),
     #[error("normalized HTTP source response {0}")]
     HttpRedirectRefused(#[source] RedirectRefused),
     #[error("failed to read normalized HTTP source response body")]
@@ -394,7 +394,7 @@ fn read_generic_http_bytes(url: &str, timeout_seconds: u64) -> Result<Vec<u8>> {
     let response = agent
         .get(url)
         .call()
-        .map_err(GenericSourceError::HttpRequestFailed)?;
+        .map_err(|source| GenericSourceError::HttpRequestFailed(Box::new(source)))?;
     let response = reject_redirect(response).map_err(GenericSourceError::HttpRedirectRefused)?;
     let mut reader = response.into_reader();
     read_bounded(&mut reader, MAX_GENERIC_SOURCE_BYTES)

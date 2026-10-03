@@ -37,10 +37,9 @@ enum Step {
 }
 
 fn main() {
-    let script_path = std::env::var("FAKE_CODEX_SCRIPT")
-        .expect("FAKE_CODEX_SCRIPT must name a script file");
-    let script_bytes =
-        std::fs::read(&script_path).expect("failed to read FAKE_CODEX_SCRIPT file");
+    let script_path =
+        std::env::var("FAKE_CODEX_SCRIPT").expect("FAKE_CODEX_SCRIPT must name a script file");
+    let script_bytes = std::fs::read(&script_path).expect("failed to read FAKE_CODEX_SCRIPT file");
     let steps: Vec<Step> =
         serde_json::from_slice(&script_bytes).expect("FAKE_CODEX_SCRIPT is not valid JSON");
 

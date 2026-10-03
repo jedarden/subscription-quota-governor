@@ -28,11 +28,7 @@ use subscription_governor::source::collect_resource;
 
 fn command(script: &str) -> SourceConfig {
     SourceConfig::Command {
-        argv: vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            script.to_string(),
-        ],
+        argv: vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
     }
 }
 
@@ -98,8 +94,8 @@ fn a_slow_but_reachable_target_still_succeeds_within_the_command_timeout() {
     // runtime").
     let slow = command(&format!("sleep 2; echo '{VALID_RESOURCE_JSON}'"));
     let start = Instant::now();
-    let snapshot =
-        collect_resource(&slow).expect("a slow but eventually-responding target must still succeed");
+    let snapshot = collect_resource(&slow)
+        .expect("a slow but eventually-responding target must still succeed");
     assert!(start.elapsed() >= Duration::from_secs(2));
     assert_eq!(snapshot.mem_total_mb, 65536);
 }

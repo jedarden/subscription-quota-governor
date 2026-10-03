@@ -403,8 +403,7 @@ mod tests {
         let outcome2 = run_cycle(&accounts, &mut states, false, clock.now());
         let decision2 = &outcome2.decisions["acct"];
         assert_eq!(decision2.windows[0].reason, "paced_to_reset");
-        let observed_burn = decision2
-            .windows[0]
+        let observed_burn = decision2.windows[0]
             .observed_burn_per_worker_hour
             .expect("a real delta must yield an observed burn rate");
         assert!(

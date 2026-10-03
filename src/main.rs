@@ -1062,17 +1062,19 @@ mod exit_code_tests {
             accounts,
         };
 
-        let mut prior = subscription_governor::state::AccountState::default();
-        prior.last_target = Some(7);
-        prior.windows.insert(
-            "five_hour".to_string(),
-            subscription_governor::state::WindowSample {
-                observed_at: Utc::now() - chrono::Duration::hours(1),
-                used_fraction: 0.42,
-                resets_at: Utc::now() + chrono::Duration::hours(1),
-                workers: 2,
-            },
-        );
+        let prior = subscription_governor::state::AccountState {
+            last_target: Some(7),
+            windows: BTreeMap::from([(
+                "five_hour".to_string(),
+                subscription_governor::state::WindowSample {
+                    observed_at: Utc::now() - chrono::Duration::hours(1),
+                    used_fraction: 0.42,
+                    resets_at: Utc::now() + chrono::Duration::hours(1),
+                    workers: 2,
+                },
+            )]),
+            ..Default::default()
+        };
 
         let mut state = State::default();
         state.accounts.insert("a".to_string(), prior.clone());

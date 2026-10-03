@@ -42,7 +42,8 @@ fn load_fixture(name: &str) -> Value {
         "{}/tests/fixtures/zai-collector/{name}.json",
         env!("CARGO_MANIFEST_DIR")
     );
-    let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
     serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
 }
 
@@ -73,7 +74,13 @@ fn a_normal_fixture_collects_successfully_through_the_command_transport() {
         collect_via_command(&fixture).expect("a schema-conformant fixture must collect cleanly");
 
     assert_eq!(snapshot.windows.len(), 2);
-    let by_id = |id: &str| snapshot.windows.iter().find(|window| window.id == id).unwrap();
+    let by_id = |id: &str| {
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == id)
+            .unwrap()
+    };
     assert_eq!(by_id("five_hour").used_fraction, 0.28);
     assert_eq!(by_id("weekly").used_fraction, 0.52);
     assert!(snapshot.fresh);
@@ -83,18 +90,27 @@ fn a_normal_fixture_collects_successfully_through_the_command_transport() {
 #[test]
 fn a_near_limit_fixture_preserves_the_reached_flag() {
     let fixture = load_fixture("near_limit");
-    let snapshot = collect_via_command(&fixture).expect("a fixture at the limit must still collect");
+    let snapshot =
+        collect_via_command(&fixture).expect("a fixture at the limit must still collect");
 
-    let five_hour = snapshot.windows.iter().find(|window| window.id == "five_hour").unwrap();
+    let five_hour = snapshot
+        .windows
+        .iter()
+        .find(|window| window.id == "five_hour")
+        .unwrap();
     assert_eq!(five_hour.used_fraction, 1.0);
-    assert!(five_hour.reached, "a window reported at 100% usage must keep its reached signal");
+    assert!(
+        five_hour.reached,
+        "a window reported at 100% usage must keep its reached signal"
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn a_stale_fixture_preserves_the_freshness_flag() {
     let fixture = load_fixture("stale");
-    let snapshot = collect_via_command(&fixture).expect("a stale fixture is still a valid snapshot");
+    let snapshot =
+        collect_via_command(&fixture).expect("a stale fixture is still a valid snapshot");
 
     assert!(
         !snapshot.fresh,
@@ -119,7 +135,11 @@ fn a_reset_generation_rollover_fixture_is_accepted_despite_its_reset_time_alread
     let snapshot = collect_via_command(&fixture)
         .expect("a just-rolled-over window must not be rejected for its past resets_at");
 
-    let five_hour = snapshot.windows.iter().find(|window| window.id == "five_hour").unwrap();
+    let five_hour = snapshot
+        .windows
+        .iter()
+        .find(|window| window.id == "five_hour")
+        .unwrap();
     assert_eq!(
         five_hour.used_fraction, 0.02,
         "the new generation's near-zero usage must pass through unchanged"
@@ -372,11 +392,18 @@ fn percentage_derived_and_absolute_derived_usage_normalize_to_identical_governor
 fn every_committed_fixture_is_a_valid_quota_snapshot_document() {
     for name in ["normal", "near_limit", "stale", "reset_generation_rollover"] {
         let fixture = load_fixture(name);
-        let snapshot: QuotaSnapshot = serde_json::from_value(fixture)
-            .unwrap_or_else(|error| panic!("{name} fixture must deserialize as QuotaSnapshot: {error}"));
-        assert!(!snapshot.windows.is_empty(), "{name} fixture must not have an empty windows array");
+        let snapshot: QuotaSnapshot = serde_json::from_value(fixture).unwrap_or_else(|error| {
+            panic!("{name} fixture must deserialize as QuotaSnapshot: {error}")
+        });
+        assert!(
+            !snapshot.windows.is_empty(),
+            "{name} fixture must not have an empty windows array"
+        );
         for window in &snapshot.windows {
-            assert!(!window.id.is_empty(), "{name} fixture has a window with an empty id");
+            assert!(
+                !window.id.is_empty(),
+                "{name} fixture has a window with an empty id"
+            );
             assert!(
                 window.used_fraction.is_finite() && (0.0..=1.0).contains(&window.used_fraction),
                 "{name} fixture has an out-of-range used_fraction: {window:?}"
