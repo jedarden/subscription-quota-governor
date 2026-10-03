@@ -34,6 +34,9 @@ subgov --config examples/codex.yaml snapshot codex
 subgov --config examples/all-three.yaml run --once --observe-only
 ```
 
+The [Linux release guide](docs/notes/releasing.md) documents the pinned build
+command, artifact checksums, provenance format, and Forgejo package location.
+
 Run in `--observe-only` mode for at least two polling intervals before enabling
 actuation. The `linear_to_reset` strategy deliberately holds the current target
 until it has two observations in the same reset generation; zero observed delta
