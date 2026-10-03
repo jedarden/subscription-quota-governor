@@ -1,0 +1,67 @@
+# One controller on codinghome places one Anthropic account across codinghome
+# and lab. This is a configuration example, not an enabled controller.
+#
+# needle_status and needle_run operate on the host running subgov. Because the
+# controller runs on codinghome, the lab leg uses fixed SSH commands. Install
+# resource-probe, needle-worker-count, and needle-set-target on lab before use.
+# The two NEEDLE helpers must count claude-print heartbeats and reconcile a
+# target safely using needle test-agent / needle run / needle stop. They are
+# site-local helpers; {desired_workers} is subgov's bounded integer target.
+#
+# The reserves mirror plan.md §22.3's illustration; measure both hosts and
+# adjust them before enabling. Confirm lab's claude-print adapter uses the
+# same Anthropic subscription before treating the hosts as one account. On
+# codinghome, transfer Anthropic fleet ownership from cgov before enabling.
+
+version: 1
+poll_interval_seconds: 300
+state_path: ~/.local/state/subscription-governor/claude-anthropic-codinghome-lab.json
+
+accounts:
+  claude-anthropic:
+    source:
+      type: anthropic_oauth
+      credentials_path: ~/.claude/.credentials.json
+      timeout_seconds: 15
+    utilization:
+      reserve_fraction: 0.15
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      minimum_sample_seconds: 300
+    fleet:
+      min_workers: 0
+      max_workers: 8
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 2
+      hosts:
+        codinghome:
+          max_workers: 6
+          resource_reserve:
+            cpu_reserve_fraction: 0.25
+            mem_reserve_mb: 4096
+          resource_source:
+            type: command
+            argv: [/home/coding/subscription-quota-governor/examples/resource-probe, codinghome]
+          observer:
+            type: needle_status
+            agent: claude-print
+          actuator:
+            type: needle_run
+            repo: /home/coding/pose-detection
+            adapter: claude-print
+        lab:
+          max_workers: 8
+          resource_reserve:
+            cpu_reserve_fraction: 0.30
+            mem_reserve_mb: 8192
+          resource_source:
+            type: command
+            argv: [ssh, -o, BatchMode=yes, -o, ConnectTimeout=5, lab, resource-probe, lab]
+          observer:
+            type: command
+            argv: [ssh, -o, BatchMode=yes, -o, ConnectTimeout=5, lab, needle-worker-count, claude-print]
+          actuator:
+            type: command
+            argv: [ssh, -o, BatchMode=yes, -o, ConnectTimeout=5, lab, needle-set-target, /home/coding/pdftract, claude-print, "{desired_workers}"]
