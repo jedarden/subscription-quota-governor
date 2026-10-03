@@ -1,125 +1,47 @@
 # Runbook: rolling a governed account back
 
-Restates [WP8's staged rollout requirements](../../plan/plan.md#wp8-staged-production-rollout)
-(§16, "maintain a one-command rollback to observe-only or the previous
-controller") as an operator procedure, cross-checked against `src/main.rs`.
-There are two distinct rollback targets, and they have different scope and
-different mechanics -- pick the one that matches what you actually need to
-undo.
+This runbook implements [WP8 step 8](../../plan/plan.md#wp8-staged-production-rollout): keep a one-command rollback ready before enabling an actuator. The command is [`scripts/rollback.sh`](../../../scripts/rollback.sh); it changes the systemd launch command, restarts `subgov`, and verifies the effective command before reporting success.
 
-| Rollback target | Scope | Requires a restart? |
+| Target | Command | Result |
 | --- | --- | --- |
-| Observe-only | Whole process (every account it runs) | Yes, but with a flag change only |
-| The previous controller | One account at a time | Yes, plus stopping/starting an external process |
+| Observe-only | `sudo scripts/rollback.sh observe-only` | `subgov.service` keeps collecting and recording observations but cannot actuate. |
+| Previous system service | `sudo scripts/rollback.sh previous cgov.service` | `subgov.service` is first restarted in observe-only, then the named prior controller is enabled and started. |
+| Previous user service | `scripts/rollback.sh --user previous cgov.service subgov.service` | Both units are managed in the current user's systemd manager; the prior controller starts only after subgov is observe-only. |
 
-## Rollback 1: to observe-only
+These defaults match `deploy/systemd/subgov.service`: `/usr/local/bin/subgov`, `/etc/subgov/governor.yaml`, and the system unit `subgov.service`. Set `SUBGOV_BIN` or `SUBGOV_CONFIG` when the deployed paths differ, passing them through `sudo env`, for example `sudo env SUBGOV_CONFIG=/etc/subgov/codex.yaml scripts/rollback.sh observe-only`. Pass the subgov unit as the final argument when it is not `subgov.service`:
 
-Use this when `subgov`'s own decisions are suspect (a bad reset-rollover
-interaction, an unexpected `desired_workers`, anything you want to stop
-*acting on* without losing quota telemetry or burn-rate learning). This is
-the same mechanism [the README](../../README.md#install-and-try-it) and the
-[systemd service doc](../../deploy/systemd/README.md) already recommend for
-*first* enabling an account -- it's the identical lever in reverse.
+```sh
+sudo env SUBGOV_CONFIG=/etc/subgov/codex.yaml scripts/rollback.sh observe-only subgov@codex.service
+sudo env SUBGOV_CONFIG=/etc/subgov/codex.yaml scripts/rollback.sh previous cgov-codex.service subgov@codex.service
+```
 
-**The one command:** restart `subgov run` with `--observe-only` added.
-There is no live toggle -- config and CLI flags are read once at process
-start (`Cli::parse()` / `Config::load` in `src/main.rs::run_cli`, with no
-file-watching or reload path) -- so this is "one flag, one restart," not a
-signal or API call to a running process.
+For a user service such as the existing cgov deployment, install subgov as a user service too and run both through the same user manager. The script's `--user` mode writes under `${XDG_CONFIG_HOME:-~/.config}/systemd/user`; the user manager must be available, and linger must be enabled if the service has to survive logout or start after reboot. `--user` applies to both subgov and the prior controller, so it cannot hand off between a system unit and a user unit.
 
-- **Systemd deployment:** `systemctl edit subgov` (or edit the drop-in) to
-  append `--observe-only` to the unit's `ExecStart=` line, then
-  `systemctl daemon-reload && systemctl restart subgov`.
-- **Foreground/manual:** stop the running `subgov run` process (send it
-  `SIGTERM`/`SIGINT` -- `install_shutdown_flag` in `src/main.rs` handles
-  this gracefully, finishing the in-flight cycle and persisting state
-  before exiting, rather than being killed mid-write) and start it again
-  with `--observe-only` appended to the same command line.
+The script requires systemd service units and absolute binary/config paths without whitespace or systemd specifier characters. It writes its owned drop-in at `<unit-dir>/<subgov-unit>.d/zzzz-subgov-rollback.conf`, reloads systemd, restarts the service, and checks that the effective `ExecStart` contains `--observe-only`. In previous-controller mode it discovers systemd activation units (such as timers), disables and stops them, then stops the prior controller before changing subgov. After verifying subgov is observe-only, it enables and starts the prior service and restores its activation units. If a start fails, subgov remains observe-only.
 
-**Scope:** `--observe-only` is a whole-process flag (`Commands::Run {
-once, observe_only }` in `src/main.rs`) -- it applies to every account that
-`subgov` instance runs, not one account selectively. If you need to roll
-back only *one* account while others keep actuating normally under the
-same process, that's not this lever -- see "Rolling back one account among
-several" below.
+## Scope and safety
 
-**What does not change:** observation and learning continue exactly as
-before. `run_cycle` in `src/main.rs` still calls `source::collect`,
-`evaluate`, and (for a non-stale decision) `AccountState::record` --
-`observe_only` only gates the `fleet::actuate` call and the `actuated` flag
-in the `decision` event, per §12 ("print decisions and persist observations
-without changing targets"). Rolling back to observe-only does not reset or
-pause burn-rate history, and does not require deleting or touching
-`state.json`.
+`--observe-only` applies to the entire `subgov` process. If one process has several accounts configured, rolling it back pauses actuation for all of them. To roll back just one account, run that account in its own systemd unit/configuration; then name that unit in the command above. The prior-controller unit must govern the same account/fleet, and the operator should check [controller ownership](controller-ownership.md) before enabling it.
 
-## Rollback 2: to the previous controller
+The sequence prevents an overlap between actuating controllers: activation units and the previous service are stopped, then `subgov` is restarted and verified non-actuating before the previous service is started again. If any step fails, the sequence favors a gap with no controller acting over overlapping controllers. The process continues observing in the previous-controller mode. The rollback does not reset `state.json` or discard quota history.
 
-Use this when `subgov` needs to be taken out of the loop entirely for an
-account -- most commonly during the staged rollout WP8 describes, if a
-problem surfaces after switching an account over and you need to hand it
-back to whatever governed it before.
+If the rollback command fails, inspect its error and `systemctl status <unit>`. A failed observe-only restart prevents starting the previous controller; in previous-controller mode the prior unit will be stopped, so inspect both units before resuming control. A failed previous-controller start leaves `subgov` observe-only.
 
-1. **Stop `subgov`'s actuation for that account first, without stopping
-   observation yet**, using Rollback 1 above (`--observe-only`) if you
-   want a brief overlap window to compare before fully cutting over, or
-   stop the `subgov` process/unit outright if not.
-2. **Start the previous controller for that account.** This is the exact
-   reverse of WP8 step 3 ("stop the existing governor for one account
-   before starting `subgov` in observe-only mode for that same account"),
-   run backward.
-3. **Avoid an overlap window where both controllers actuate the same
-   fleet.** This is precisely the condition the
-   [conflicting-controllers runbook](conflicting-controllers.md) covers --
-   read it before doing this if you haven't already. `subgov`'s
-   `StateLock` provides no protection here at all: it only locks against
-   another *`subgov`* instance sharing the same `state_path`, not against
-   a differently-shaped previous controller. The safe sequence is stop-then-start,
-   not start-then-stop: bring the previous controller's actuation online
-   only after `subgov` has genuinely stopped actuating that account (fully
-   stopped, or confirmed `--observe-only`), not before.
+## Returning control to subgov
 
-**What doesn't need cleanup:** `subgov`'s `state.json` is irrelevant to any
-other controller -- nothing about it needs to be deleted, reset, or handed
-off (see [state backup and removal](../state-backup-and-removal.md) if you
-do want to archive it for later reference before decommissioning). If the
-actuator was `target_file`, the previous controller almost certainly
-doesn't read that same file (it's `subgov`'s own internal handoff format,
-not a standard one), so there's nothing to reconcile there either -- the
-one exception is if you deliberately built the previous controller to
-consume `subgov`'s `target_file` output as an interim measure, in which
-case that file's last-written value is exactly what the previous
-controller should pick up as read as a starting point, not a state.json.
+After the incident, stop and disable the previous controller before removing the observe-only drop-in and restarting `subgov` in its configured mode. For system services:
 
-## Rolling back one account among several
+```sh
+sudo systemctl disable --now cgov.service
+sudo rm /etc/systemd/system/subgov.service.d/zzzz-subgov-rollback.conf
+sudo systemctl daemon-reload
+sudo systemctl restart subgov.service
+```
 
-Per WP8, rollout is staged per account -- accounts don't all move to
-`subgov` at once, and neither `--observe-only` nor stopping the whole
-process is scoped to one account. To roll back a single account while
-`subgov` keeps actuating others in the same process:
-
-1. Edit that account's `fleet.actuator` to `none` in the config file (or
-   swap the whole account block back to whatever it was before, if rolling
-   back to a previous controller for just that account).
-2. Restart `subgov` (same config-is-read-once caveat as above -- there is
-   no per-account live toggle).
-
-This is a config edit plus a full-process restart, not a single flag --
-"one-command rollback" in WP8's sense is about the mechanism being simple
-and pre-planned (no code changes, no manual state surgery), not literally
-one shell invocation in every case.
+For user services, use `systemctl --user` and remove the drop-in from `${XDG_CONFIG_HOME:-~/.config}/systemd/user`. Substitute the actual unit names used in the rollback. Confirm only the intended controller is actuating before resuming normal service.
 
 ## Verification
 
-- **Observe-only rollback:** the next `decision` event shows
-  `"observe_only": true, "actuated": false` regardless of what
-  `desired_workers` says; `subgov status` continues updating (still
-  learning), just with no actuation.
-- **Previous-controller rollback:** confirm only the previous controller's
-  process is actuating (per the conflicting-controllers runbook's
-  detection steps) and that `subgov` for that account is either fully
-  stopped or confirmed `observe_only`/`actuator: none` -- never both
-  processes actuating simultaneously, even briefly.
-- **Single-account rollback:** that account's `decision` events show
-  `"actuated": false` (or the new controller's own signal, if handed off
-  entirely) while other accounts in the same `subgov` process continue
-  actuating normally.
+- **Observe-only:** the script exits successfully only after `systemd` reports the service active and its effective `ExecStart` includes `--observe-only`. The next `decision` event should show `"observe_only": true, "actuated": false`; `subgov status` continues to update.
+- **Previous controller:** the script starts it only after observe-only has been verified. Confirm that only the prior controller is actuating and that the named prior unit is active.
+- **Account isolation:** use an account-scoped subgov unit if other accounts must continue actuating during rollback.
