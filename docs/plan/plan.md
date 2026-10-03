@@ -473,7 +473,7 @@ Requirements:
 - [x] Refuse a second governor using the same state path.
 - [x] Serialize to a same-directory temporary file, `fsync`, and rename.
 - [x] Keep account state isolated in a map keyed by configured account name.
-- [ ] Add an explicit state schema version.
+- [x] Add an explicit state schema version.
 - [ ] Preserve the last valid state when a write fails.
 - [ ] `fsync` the parent directory after rename on Unix.
 - [ ] Set restrictive mode on state and lock files.
@@ -1204,7 +1204,7 @@ transport type or credential model is introduced. Requirements:
 
 ### 22.11 State and observability extensions
 
-- [ ] State is keyed by `(account, host)` for per-host samples in addition to
+- [x] State is keyed by `(account, host)` for per-host samples in addition to
   the existing per-account key (§10); the account-level "last desired total"
   is unchanged and remains the controller's, not placement's, output.
 - [ ] Decision events (§13) gain a per-host placement record alongside the

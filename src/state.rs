@@ -11,10 +11,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The only schema version this binary can write, and the newest it can
-/// read. A file with no `schema_version` at all predates versioning but has
-/// the same shape as version 1, so it defaults to current rather than an
-/// unknown-legacy marker.
-pub const STATE_SCHEMA_VERSION: u32 = 1;
+/// read. A file with no `schema_version` at all predates versioning and is
+/// read with the current version; explicit version 1 files are migrated by
+/// defaulting the new host-state map and advancing the version on load.
+pub const STATE_SCHEMA_VERSION: u32 = 2;
 
 fn current_schema_version() -> u32 {
     STATE_SCHEMA_VERSION
@@ -26,6 +26,11 @@ pub struct State {
     pub schema_version: u32,
     #[serde(default)]
     pub accounts: BTreeMap<String, AccountState>,
+    /// Per-host samples keyed first by account, then by configured host id.
+    /// This is separate from `accounts` so a host placement can never replace
+    /// the account controller's `last_target` total.
+    #[serde(default)]
+    pub host_states: BTreeMap<String, BTreeMap<String, HostState>>,
 }
 
 impl Default for State {
@@ -33,6 +38,7 @@ impl Default for State {
         Self {
             schema_version: STATE_SCHEMA_VERSION,
             accounts: BTreeMap::new(),
+            host_states: BTreeMap::new(),
         }
     }
 }
@@ -52,6 +58,19 @@ pub struct AccountState {
     /// Bounded burn-rate history per window, keyed by window id. Reset
     /// whenever a window's `resets_at` changes, since samples from a prior
     /// generation cannot inform this generation's slope.
+    #[serde(default)]
+    pub history: BTreeMap<String, WindowHistory>,
+}
+
+/// Quota samples associated with one host in one account. `workers` in each
+/// window sample is that host's observed worker count; unlike `AccountState`,
+/// this record has no desired-total field.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct HostState {
+    #[serde(default)]
+    pub windows: BTreeMap<String, WindowSample>,
+    /// Bounded burn-rate history per window, keyed by window id. Reset
+    /// whenever a window's `resets_at` changes.
     #[serde(default)]
     pub history: BTreeMap<String, WindowHistory>,
 }
@@ -80,49 +99,80 @@ pub struct HistorySample {
 
 impl AccountState {
     pub fn record(&mut self, snapshot: &QuotaSnapshot, workers: u32, target: u32) {
-        self.windows = snapshot
-            .windows
-            .iter()
-            .map(|window| {
-                (
-                    window.id.clone(),
-                    WindowSample {
-                        observed_at: snapshot.observed_at,
-                        used_fraction: window.used_fraction,
-                        resets_at: window.resets_at,
-                        workers,
-                    },
-                )
-            })
-            .collect();
-
-        // Rebuilt fresh each call, like `windows` above, so a window that
-        // drops out of the snapshot (e.g. a policy change) doesn't leave an
-        // orphaned generation accumulating forever.
-        let mut history = BTreeMap::new();
-        for window in &snapshot.windows {
-            let mut entry = self
-                .history
-                .remove(&window.id)
-                .filter(|existing: &WindowHistory| existing.resets_at == window.resets_at)
-                .unwrap_or_else(|| WindowHistory {
-                    resets_at: window.resets_at,
-                    samples: VecDeque::new(),
-                });
-            entry.samples.push_back(HistorySample {
-                observed_at: snapshot.observed_at,
-                used_fraction: window.used_fraction,
-                workers,
-            });
-            while entry.samples.len() > MAX_HISTORY_SAMPLES_PER_GENERATION {
-                entry.samples.pop_front();
-            }
-            history.insert(window.id.clone(), entry);
-        }
-        self.history = history;
-
+        record_samples(&mut self.windows, &mut self.history, snapshot, workers);
         self.last_target = Some(target);
     }
+}
+
+impl HostState {
+    pub fn record(&mut self, snapshot: &QuotaSnapshot, workers: u32) {
+        record_samples(&mut self.windows, &mut self.history, snapshot, workers);
+    }
+}
+
+impl State {
+    /// Record a sample under the `(account, host)` key without changing the
+    /// account-level desired total maintained by `AccountState::record`.
+    pub fn record_host(
+        &mut self,
+        account: &str,
+        host: &str,
+        snapshot: &QuotaSnapshot,
+        workers: u32,
+    ) {
+        self.host_states
+            .entry(account.to_owned())
+            .or_default()
+            .entry(host.to_owned())
+            .or_default()
+            .record(snapshot, workers);
+    }
+}
+
+fn record_samples(
+    windows: &mut BTreeMap<String, WindowSample>,
+    history: &mut BTreeMap<String, WindowHistory>,
+    snapshot: &QuotaSnapshot,
+    workers: u32,
+) {
+    *windows = snapshot
+        .windows
+        .iter()
+        .map(|window| {
+            (
+                window.id.clone(),
+                WindowSample {
+                    observed_at: snapshot.observed_at,
+                    used_fraction: window.used_fraction,
+                    resets_at: window.resets_at,
+                    workers,
+                },
+            )
+        })
+        .collect();
+
+    // Rebuilt fresh each call, like `windows` above, so a window that drops
+    // out of the snapshot does not leave an orphaned generation accumulating.
+    let mut next_history = BTreeMap::new();
+    for window in &snapshot.windows {
+        let mut entry = history
+            .remove(&window.id)
+            .filter(|existing: &WindowHistory| existing.resets_at == window.resets_at)
+            .unwrap_or_else(|| WindowHistory {
+                resets_at: window.resets_at,
+                samples: VecDeque::new(),
+            });
+        entry.samples.push_back(HistorySample {
+            observed_at: snapshot.observed_at,
+            used_fraction: window.used_fraction,
+            workers,
+        });
+        while entry.samples.len() > MAX_HISTORY_SAMPLES_PER_GENERATION {
+            entry.samples.pop_front();
+        }
+        next_history.insert(window.id.clone(), entry);
+    }
+    *history = next_history;
 }
 
 /// A state file exists but does not parse as a `State` at all (bad JSON,
@@ -167,7 +217,7 @@ impl State {
                     .with_context(|| format!("failed to read state {}", path.display()))
             }
         };
-        let state: Self = match serde_json::from_slice(&bytes) {
+        let mut state: Self = match serde_json::from_slice(&bytes) {
             Ok(state) => state,
             Err(parse_error) => {
                 let quarantined_path = quarantine_path(path);
@@ -194,6 +244,13 @@ impl State {
                 state.schema_version,
                 STATE_SCHEMA_VERSION
             );
+        }
+        // Version 2 adds the independent per-(account, host) sample map.
+        // Missing host state defaults empty, so the only migration required
+        // for version 1 is to advance the in-memory version before the next
+        // save makes that upgrade durable.
+        if state.schema_version < STATE_SCHEMA_VERSION {
+            state.schema_version = STATE_SCHEMA_VERSION;
         }
         Ok((state, None))
     }
@@ -410,6 +467,65 @@ mod tests {
         let history = loaded.accounts["acct"].history.get("5h").unwrap();
         assert_eq!(history.samples.len(), 2);
         assert_eq!(history.samples.back().unwrap().used_fraction, 0.3);
+    }
+
+    #[test]
+    fn host_samples_are_isolated_by_account_and_host_without_changing_account_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let resets_at = Utc::now() + chrono::Duration::hours(5);
+        let snapshot = snapshot_with_one_window("5h", 0.3, resets_at);
+
+        let mut state = State::default();
+        state
+            .accounts
+            .entry("acct-a".to_string())
+            .or_default()
+            .record(&snapshot, 10, 12);
+        state.record_host("acct-a", "host-1", &snapshot, 4);
+        state.record_host("acct-a", "host-2", &snapshot, 6);
+        state.record_host("acct-b", "host-1", &snapshot, 2);
+        state.save(&path).unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(loaded.accounts["acct-a"].last_target, Some(12));
+        assert_eq!(
+            loaded.host_states["acct-a"]["host-1"].windows["5h"].workers,
+            4
+        );
+        assert_eq!(
+            loaded.host_states["acct-a"]["host-2"].windows["5h"].workers,
+            6
+        );
+        assert_eq!(
+            loaded.host_states["acct-b"]["host-1"].windows["5h"].workers,
+            2
+        );
+        assert!(
+            loaded.host_states["acct-a"]["host-1"].history["5h"]
+                .samples
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn host_history_is_bounded_per_reset_generation() {
+        let mut state = State::default();
+        let resets_at = Utc::now() + chrono::Duration::hours(5);
+        for i in 0..(MAX_HISTORY_SAMPLES_PER_GENERATION + 3) {
+            let snapshot = snapshot_with_one_window("5h", i as f64 * 0.01, resets_at);
+            state.record_host("acct", "host", &snapshot, 2);
+        }
+
+        let history = &state.host_states["acct"]["host"].history["5h"];
+        assert_eq!(history.samples.len(), MAX_HISTORY_SAMPLES_PER_GENERATION);
+        assert_eq!(
+            history.samples.front().unwrap().used_fraction,
+            0.03,
+            "oldest samples should be evicted independently for this host"
+        );
     }
 
     #[test]
@@ -848,16 +964,11 @@ mod tests {
         assert!(!path.exists());
     }
 
-    // Migration tests below prove a governor started against an on-disk
-    // file from every schema version this binary actually supports reading
-    // migrates cleanly rather than failing or silently truncating (WP3).
-    // Per STATE_SCHEMA_VERSION's own doc comment, that set is exactly two
-    // shapes: a pre-versioning file with no `schema_version` key at all
-    // (the real v0.1 baseline -- no `history` field either, since that was
-    // introduced alongside versioning), and an explicit `schema_version: 1`
-    // file (the current version, a no-op "migration"). A version number
-    // this binary never wrote (anything > STATE_SCHEMA_VERSION) is not a
-    // supported source and is covered separately by
+    // Migration tests below prove a governor started against the unversioned
+    // baseline or explicit version 1 upgrades cleanly rather than failing or
+    // silently truncating. Version 1 gains an empty host-state map; account
+    // samples and last_target remain intact. A version number newer than this
+    // binary wrote is covered separately by
     // `load_refuses_a_newer_schema_version`.
 
     #[test]
@@ -951,5 +1062,48 @@ mod tests {
         assert!(quarantined.is_none());
         assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
         assert_eq!(loaded.accounts["acct"].last_target, Some(5));
+    }
+
+    #[test]
+    fn migrates_version_one_state_and_preserves_account_samples_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "accounts": {
+                    "acct": {
+                        "windows": {
+                            "5h": {
+                                "observed_at": "2026-01-01T00:00:00Z",
+                                "used_fraction": 0.42,
+                                "resets_at": "2026-01-01T05:00:00Z",
+                                "workers": 3
+                            }
+                        },
+                        "last_target": 7,
+                        "history": {}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let (migrated, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(migrated.schema_version, STATE_SCHEMA_VERSION);
+        assert!(migrated.host_states.is_empty());
+        assert_eq!(migrated.accounts["acct"].last_target, Some(7));
+        assert_eq!(migrated.accounts["acct"].windows["5h"].workers, 3);
+
+        migrated.save(&path).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["schema_version"],
+            serde_json::json!(STATE_SCHEMA_VERSION)
+        );
+        assert_eq!(raw["accounts"]["acct"]["last_target"], serde_json::json!(7));
+        assert!(raw["host_states"].as_object().unwrap().is_empty());
     }
 }
