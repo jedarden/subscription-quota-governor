@@ -987,6 +987,11 @@ fn run_cycle(
                     }
                 }
             }
+            if let Some(placements) = &host_placements {
+                for placement in placements {
+                    state.record_host_placement(name, &placement.host_id, now, placement.target);
+                }
+            }
             outcome.statuses.insert(name.clone(), readiness);
             Ok(())
         })();

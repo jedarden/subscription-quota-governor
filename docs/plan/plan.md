@@ -1140,8 +1140,10 @@ Future placement hardening (parity with §9.8, not blocking v1.1):
   once v1.1 ships and real placement traces exist; like §9.8's evidence-gated
   bullets, there is nothing to build against yet, so this is plan text, not
   a bead, until those traces exist.
-- [ ] Bounded placement history for oscillation detection, parity with §9.8's
-  bursty/idle trace simulation.
+- [x] Retain the most recent 16 per-host placement decisions with timestamps.
+  A caller-selected transition threshold can detect targets alternating
+  between two worker counts; placement trace simulation verifies detection
+  during alternating headroom and expiry after a stable split.
 
 ### 22.8 Freshness and safety for resources
 

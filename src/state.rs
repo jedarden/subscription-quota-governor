@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 /// The only schema version this binary can write, and the newest it can
 /// read. A file with no `schema_version` at all predates versioning and is
-/// read with the current version; explicit version 1 files are migrated by
-/// defaulting the new host-state map and advancing the version on load.
-pub const STATE_SCHEMA_VERSION: u32 = 2;
+/// read with the current version. Earlier versions are migrated by defaulting
+/// fields added to account and host state, then advancing the version on load.
+pub const STATE_SCHEMA_VERSION: u32 = 3;
 
 fn current_schema_version() -> u32 {
     STATE_SCHEMA_VERSION
@@ -49,6 +49,9 @@ impl Default for State {
 /// that bounds memory and disk without deciding the final number.
 const MAX_HISTORY_SAMPLES_PER_GENERATION: usize = 16;
 
+/// Maximum number of recent per-host placement decisions retained on disk.
+pub const MAX_PLACEMENT_HISTORY_SAMPLES: usize = 16;
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct AccountState {
     #[serde(default)]
@@ -73,6 +76,18 @@ pub struct HostState {
     /// whenever a window's `resets_at` changes.
     #[serde(default)]
     pub history: BTreeMap<String, WindowHistory>,
+    /// Recent placement targets for this host. Each cycle is retained so a
+    /// consumer can inspect the cadence as well as detect alternating targets.
+    /// Oldest entries are evicted once the fixed history bound is reached.
+    #[serde(default)]
+    pub placement_history: VecDeque<PlacementSample>,
+}
+
+/// One host's planned placement target in a decision cycle.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct PlacementSample {
+    pub observed_at: DateTime<Utc>,
+    pub target_workers: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -108,6 +123,52 @@ impl HostState {
     pub fn record(&mut self, snapshot: &QuotaSnapshot, workers: u32) {
         record_samples(&mut self.windows, &mut self.history, snapshot, workers);
     }
+
+    /// Append a planned target, keeping only the newest bounded set of cycles.
+    pub fn record_placement(&mut self, observed_at: DateTime<Utc>, target_workers: u32) {
+        self.placement_history.push_back(PlacementSample {
+            observed_at,
+            target_workers,
+        });
+        while self.placement_history.len() > MAX_PLACEMENT_HISTORY_SAMPLES {
+            self.placement_history.pop_front();
+        }
+    }
+
+    /// Return whether the most recent `minimum_changes` target transitions
+    /// alternate between exactly two worker counts. Consecutive cycles at the
+    /// same target do not count as changes. Requiring the caller to choose the
+    /// threshold avoids baking an unvalidated oscillation policy into state.
+    pub fn placement_alternates_for(&self, minimum_changes: usize) -> bool {
+        if !(2..MAX_PLACEMENT_HISTORY_SAMPLES).contains(&minimum_changes)
+            || minimum_changes >= self.placement_history.len()
+        {
+            return false;
+        }
+
+        let needed_targets = minimum_changes + 1;
+        let mut recent_changes = Vec::with_capacity(needed_targets);
+        for sample in self.placement_history.iter().rev() {
+            if recent_changes.last() != Some(&sample.target_workers) {
+                recent_changes.push(sample.target_workers);
+                if recent_changes.len() == needed_targets {
+                    break;
+                }
+            }
+        }
+        if recent_changes.len() != needed_targets {
+            return false;
+        }
+        recent_changes.reverse();
+
+        let first = recent_changes[0];
+        let second = recent_changes[1];
+        first != second
+            && recent_changes
+                .iter()
+                .enumerate()
+                .all(|(index, target)| *target == if index % 2 == 0 { first } else { second })
+    }
 }
 
 impl State {
@@ -126,6 +187,23 @@ impl State {
             .entry(host.to_owned())
             .or_default()
             .record(snapshot, workers);
+    }
+
+    /// Record a planned placement under its `(account, host)` key, even when
+    /// quota observation is stale or the cycle runs in observe-only mode.
+    pub fn record_host_placement(
+        &mut self,
+        account: &str,
+        host: &str,
+        observed_at: DateTime<Utc>,
+        target_workers: u32,
+    ) {
+        self.host_states
+            .entry(account.to_owned())
+            .or_default()
+            .entry(host.to_owned())
+            .or_default()
+            .record_placement(observed_at, target_workers);
     }
 }
 
@@ -246,11 +324,22 @@ impl State {
             );
         }
         // Version 2 adds the independent per-(account, host) sample map.
-        // Missing host state defaults empty, so the only migration required
-        // for version 1 is to advance the in-memory version before the next
-        // save makes that upgrade durable.
+        // Version 3 adds per-host placement target history. Both additions
+        // default empty when loading an older file, so migration only needs
+        // to advance the in-memory version before the next save.
         if state.schema_version < STATE_SCHEMA_VERSION {
             state.schema_version = STATE_SCHEMA_VERSION;
+        }
+        // Keep the in-memory bound even if a file was written by an older
+        // development build or manually edited with an oversized history.
+        for host in state
+            .host_states
+            .values_mut()
+            .flat_map(BTreeMap::values_mut)
+        {
+            while host.placement_history.len() > MAX_PLACEMENT_HISTORY_SAMPLES {
+                host.placement_history.pop_front();
+            }
         }
         Ok((state, None))
     }
@@ -526,6 +615,72 @@ mod tests {
             0.03,
             "oldest samples should be evicted independently for this host"
         );
+    }
+
+    #[test]
+    fn host_placement_history_is_bounded_and_keeps_the_newest_cycles() {
+        let mut host = HostState::default();
+        let start = Utc::now();
+        for cycle in 0..(MAX_PLACEMENT_HISTORY_SAMPLES + 3) {
+            host.record_placement(
+                start + chrono::Duration::seconds(cycle as i64),
+                cycle as u32,
+            );
+        }
+
+        assert_eq!(host.placement_history.len(), MAX_PLACEMENT_HISTORY_SAMPLES);
+        assert_eq!(
+            host.placement_history.front().unwrap().target_workers,
+            3,
+            "oldest placement cycles should be evicted first"
+        );
+        assert_eq!(
+            host.placement_history.back().unwrap().target_workers,
+            (MAX_PLACEMENT_HISTORY_SAMPLES + 2) as u32
+        );
+    }
+
+    #[test]
+    fn placement_oscillation_detector_ignores_steady_cycles_and_checks_recent_changes() {
+        let now = Utc::now();
+        let mut host = HostState::default();
+        for (offset, target) in [(0, 2), (1, 5), (2, 2), (3, 5), (4, 5), (5, 5)] {
+            host.record_placement(now + chrono::Duration::seconds(offset), target);
+        }
+
+        assert!(!host.placement_alternates_for(1));
+        assert!(host.placement_alternates_for(3));
+        assert!(!host.placement_alternates_for(4));
+
+        host.record_placement(now + chrono::Duration::seconds(6), 3);
+        assert!(!host.placement_alternates_for(3));
+    }
+
+    #[test]
+    fn placement_history_round_trips_and_defaults_for_older_host_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let now = Utc::now();
+        let mut state = State::default();
+        state.record_host_placement("acct-a", "host-1", now, 2);
+        state.record_host_placement("acct-a", "host-1", now + chrono::Duration::seconds(1), 5);
+        state.record_host_placement("acct-b", "host-1", now, 9);
+        state.save(&path).unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.host_states["acct-a"]["host-1"].placement_history[1].target_workers,
+            5
+        );
+        assert_eq!(
+            loaded.host_states["acct-b"]["host-1"].placement_history[0].target_workers,
+            9
+        );
+
+        let old_host: HostState = serde_json::from_str(r#"{"windows":{},"history":{}}"#).unwrap();
+        assert!(old_host.placement_history.is_empty());
     }
 
     #[test]
@@ -965,11 +1120,10 @@ mod tests {
     }
 
     // Migration tests below prove a governor started against the unversioned
-    // baseline or explicit version 1 upgrades cleanly rather than failing or
-    // silently truncating. Version 1 gains an empty host-state map; account
+    // baseline or an older explicit version upgrades cleanly rather than
+    // failing or silently truncating. Newly added maps default empty; account
     // samples and last_target remain intact. A version number newer than this
-    // binary wrote is covered separately by
-    // `load_refuses_a_newer_schema_version`.
+    // binary wrote is covered separately by `load_refuses_a_newer_schema_version`.
 
     #[test]
     fn migrates_a_legacy_pre_versioning_file_and_preserves_its_data() {
@@ -1105,5 +1259,35 @@ mod tests {
         );
         assert_eq!(raw["accounts"]["acct"]["last_target"], serde_json::json!(7));
         assert!(raw["host_states"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrates_version_two_host_state_with_empty_placement_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        fs::write(
+            &path,
+            r#"{
+                "schema_version": 2,
+                "accounts": {"acct": {"windows": {}, "last_target": 4, "history": {}}},
+                "host_states": {
+                    "acct": {
+                        "host-1": {
+                            "windows": {},
+                            "history": {}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let (migrated, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(migrated.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(migrated.accounts["acct"].last_target, Some(4));
+        assert!(migrated.host_states["acct"]["host-1"]
+            .placement_history
+            .is_empty());
     }
 }

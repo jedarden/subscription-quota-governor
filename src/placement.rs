@@ -643,6 +643,101 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    /// Replays changing headroom through placement and state, then holds at a
+    /// steady split. The per-host history must expose the repeated A/B target
+    /// pattern while it is happening, stay capped, and age out the old pattern
+    /// after stable cycles replace it.
+    #[test]
+    fn alternating_headroom_trace_is_detectable_and_stable_trace_ages_out() {
+        use crate::state::{State, MAX_PLACEMENT_HISTORY_SAMPLES};
+
+        let mut hosts = BTreeMap::new();
+        hosts.insert("a".to_string(), resource_host(Some(10), 0));
+        hosts.insert("b".to_string(), resource_host(Some(10), 0));
+        let config = account(hosts, 10, 10, 10);
+        let mut state = State::default();
+        let mut current = BTreeMap::new();
+        let mut now = Utc::now();
+
+        for cycle in 0..20 {
+            now += Duration::seconds(30);
+            let (a_headroom, b_headroom) = if cycle % 2 == 0 {
+                (0.8, 0.2)
+            } else {
+                (0.2, 0.8)
+            };
+            let resources = BTreeMap::from([
+                (
+                    "a".to_string(),
+                    snapshot(
+                        now,
+                        "a",
+                        true,
+                        a_headroom,
+                        (a_headroom * 1000.0) as u64,
+                        1000,
+                    ),
+                ),
+                (
+                    "b".to_string(),
+                    snapshot(
+                        now,
+                        "b",
+                        true,
+                        b_headroom,
+                        (b_headroom * 1000.0) as u64,
+                        1000,
+                    ),
+                ),
+            ]);
+            let placements = place("acct", 10, &config, &current, &resources, now).unwrap();
+            assert_eq!(
+                find(&placements, "a").target,
+                if cycle % 2 == 0 { 8 } else { 2 }
+            );
+            assert_eq!(
+                find(&placements, "b").target,
+                if cycle % 2 == 0 { 2 } else { 8 }
+            );
+            for placement in placements {
+                current.insert(placement.host_id.clone(), placement.target);
+                state.record_host_placement("acct", &placement.host_id, now, placement.target);
+            }
+        }
+
+        for host_id in ["a", "b"] {
+            let history = &state.host_states["acct"][host_id];
+            assert_eq!(
+                history.placement_history.len(),
+                MAX_PLACEMENT_HISTORY_SAMPLES
+            );
+            assert!(history.placement_alternates_for(3));
+        }
+
+        for _ in 0..MAX_PLACEMENT_HISTORY_SAMPLES + 2 {
+            now += Duration::seconds(30);
+            let resources = BTreeMap::from([
+                ("a".to_string(), snapshot(now, "a", true, 0.5, 500, 1000)),
+                ("b".to_string(), snapshot(now, "b", true, 0.5, 500, 1000)),
+            ]);
+            let placements = place("acct", 10, &config, &current, &resources, now).unwrap();
+            for placement in placements {
+                assert_eq!(placement.target, 5);
+                current.insert(placement.host_id.clone(), placement.target);
+                state.record_host_placement("acct", &placement.host_id, now, placement.target);
+            }
+        }
+
+        for host_id in ["a", "b"] {
+            let history = &state.host_states["acct"][host_id];
+            assert_eq!(
+                history.placement_history.len(),
+                MAX_PLACEMENT_HISTORY_SAMPLES
+            );
+            assert!(!history.placement_alternates_for(3));
+        }
+    }
+
     /// §22.4: mem_total_mb == 0 must not produce NaN/inf headroom.
     #[test]
     fn zero_mem_total_does_not_panic_or_propagate_nan() {
