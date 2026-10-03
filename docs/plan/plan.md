@@ -1166,7 +1166,7 @@ site-local wrapper script is not required for the common case:
   reads the heartbeat directory directly, matching the pattern already
   proven in `claude-governor`) and returns the current worker count for the
   account's configured NEEDLE agent/adapter name on that host.
-- [ ] `actuator: { type: needle_run }` — launches or stops workers via
+- [x] `actuator: { type: needle_run }` — launches or stops workers via
   `needle run -w <repo> -a <adapter>` / session-pattern-matched stop, the
   same shell-out boundary `claude-governor`'s plan already documents and
   justifies (`docs/plan/plan.md` §"Separation of concerns" in that repo):

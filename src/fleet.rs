@@ -14,6 +14,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod needle;
+
 /// Maximum bytes read from an observer's file or command stdout (plan.md
 /// §11.1: "bound file and stdout size"). A worker count is a bare integer or
 /// a one-field JSON object, so this is generous headroom rather than a tight
@@ -40,9 +42,10 @@ pub trait Observer {
 
 /// Applies a desired worker count to an account's fleet.
 ///
-/// Implemented by the baseline `none`/`target_file`/`command` adapters and by
-/// in-memory test doubles that stand in for them in controller-cycle and
-/// integration tests. The signature takes only the desired count: plan.md
+/// Implemented by the baseline `none`/`target_file`/`command` adapters, the
+/// NEEDLE-native `needle_run` adapter, and in-memory test doubles that stand
+/// in for them in controller-cycle and integration tests. The signature takes
+/// only the desired count: plan.md
 /// §11.2's "pass no quota or credential data into actuator arguments" is
 /// enforced structurally here, not by convention -- there is no parameter an
 /// implementation could pass such data through even if it wanted to.
@@ -75,6 +78,10 @@ pub fn actuator_for(config: &ActuatorConfig) -> Box<dyn Actuator> {
         ActuatorConfig::None => Box::new(NoneActuator),
         ActuatorConfig::TargetFile { path } => Box::new(TargetFileActuator { path: path.clone() }),
         ActuatorConfig::Command { argv } => Box::new(CommandActuator { argv: argv.clone() }),
+        ActuatorConfig::NeedleRun { repo, adapter } => Box::new(needle::NeedleRunActuator {
+            repo: repo.clone(),
+            adapter: adapter.clone(),
+        }),
     }
 }
 

@@ -171,6 +171,10 @@ pub enum ActuatorConfig {
     Command {
         argv: Vec<String>,
     },
+    NeedleRun {
+        repo: PathBuf,
+        adapter: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -365,8 +369,10 @@ fn expand_observer_path(observer: &mut WorkerObserverConfig) {
 }
 
 fn expand_actuator_path(actuator: &mut ActuatorConfig) {
-    if let ActuatorConfig::TargetFile { path } = actuator {
-        *path = expand_tilde(path);
+    match actuator {
+        ActuatorConfig::TargetFile { path } => *path = expand_tilde(path),
+        ActuatorConfig::NeedleRun { repo, .. } => *repo = expand_tilde(repo),
+        ActuatorConfig::None | ActuatorConfig::Command { .. } => {}
     }
 }
 
@@ -465,6 +471,13 @@ fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
     if let ActuatorConfig::Command { argv } = &fleet.actuator {
         validate_argv(argv, &format!("account {account} actuator command"), true)?;
     }
+    if let ActuatorConfig::NeedleRun { repo, adapter } = &fleet.actuator {
+        validate_needle_run(
+            repo,
+            adapter,
+            &format!("account {account} actuator needle_run"),
+        )?;
+    }
     if let Some(hosts) = &fleet.hosts {
         if hosts.is_empty() {
             bail!("account {account}: fleet.hosts requires at least one host when present");
@@ -509,6 +522,13 @@ fn validate_host(
             argv,
             &format!("account {account} host {host_name} actuator command"),
             true,
+        )?;
+    }
+    if let ActuatorConfig::NeedleRun { repo, adapter } = &host.actuator {
+        validate_needle_run(
+            repo,
+            adapter,
+            &format!("account {account} host {host_name} actuator needle_run"),
         )?;
     }
     match &host.resource_source {
@@ -571,6 +591,20 @@ fn validate_argv(argv: &[String], context: &str, require_placeholder: bool) -> R
     }
     if require_placeholder && !argv.iter().any(|arg| arg.contains("{desired_workers}")) {
         bail!("{context}: argv must contain {{desired_workers}}");
+    }
+    Ok(())
+}
+
+fn validate_needle_run(repo: &Path, adapter: &str, context: &str) -> Result<()> {
+    if repo.as_os_str().is_empty() {
+        bail!("{context}: repo must not be empty");
+    }
+    if adapter.is_empty()
+        || !adapter
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("{context}: adapter must contain only ASCII letters, digits, '.', '_' or '-'");
     }
     Ok(())
 }
@@ -762,6 +796,39 @@ hosts:
         let config: Config = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn needle_run_actuator_config_validates_and_expands_repo_path() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: static, workers: 1 }
+actuator: { type: needle_run, repo: "~/work/project", adapter: claude-print }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let Config { mut accounts, .. } = config;
+        accounts.get_mut("acct").unwrap().fleet.expand_paths();
+        let ActuatorConfig::NeedleRun { repo, adapter } = &accounts["acct"].fleet.actuator else {
+            panic!("expected needle_run actuator");
+        };
+        assert_eq!(repo, &expand_tilde(Path::new("~/work/project")));
+        assert_eq!(adapter, "claude-print");
+    }
+
+    #[test]
+    fn needle_run_rejects_adapter_names_that_cannot_be_safely_matched() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: static, workers: 1 }
+actuator: { type: needle_run, repo: /workspace, adapter: "agent *" }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("adapter must contain only ASCII letters"),
+            "{err}"
+        );
     }
 
     #[test]

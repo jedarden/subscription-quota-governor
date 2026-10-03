@@ -128,10 +128,27 @@ The observer measures current workers. Supported types are `static`, `file`,
 and `command`. A command prints either a decimal integer or
 `{"current_workers": N}`.
 
-The actuator accepts `none`, `target_file`, and `command`. Target files are
-atomic handoffs to an external reconciler. Command argv is executed directly,
-with every `{desired_workers}` occurrence replaced. Shell expansion, pipes, and
-redirection do not occur.
+The actuator accepts `none`, `target_file`, `command`, and `needle_run`. Target
+files are atomic handoffs to an external reconciler. Command argv is executed
+directly, with every `{desired_workers}` occurrence replaced. Shell expansion,
+pipes, and redirection do not occur.
+
+`needle_run` takes a repository path and adapter, for example:
+
+```yaml
+actuator:
+  type: needle_run
+  repo: /home/coding/project
+  adapter: claude-print
+```
+
+It counts tmux sessions matching NEEDLE's `needle-<adapter>-*` naming pattern,
+launches the difference with `needle run -w <repo> -a <adapter>`, and scales
+down through `needle stop --identifier <full-session-name>`. Scale-down skips
+attached sessions and fails without stopping workers if there are too few
+detached matches. Use a dedicated adapter for each independently governed pool;
+the repo selects the launch workspace, while the adapter's session namespace
+defines the pool.
 
 Start with `none` or `--observe-only`. Confirm two or more same-generation
 samples and decision output before granting process-management authority.

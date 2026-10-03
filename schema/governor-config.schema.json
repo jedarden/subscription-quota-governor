@@ -189,6 +189,21 @@
               ]
             }
           }
+        },
+        {
+          "type": "object",
+          "required": ["type", "repo", "adapter"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "needle_run" },
+            "repo": { "type": "string", "minLength": 1 },
+            "adapter": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$",
+              "description": "NEEDLE agent adapter. Its `needle-<adapter>-*` tmux session namespace is the pool managed by this actuator."
+            }
+          }
         }
       ]
     },
