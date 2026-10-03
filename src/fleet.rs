@@ -69,6 +69,15 @@ pub fn observer_for(config: &WorkerObserverConfig) -> Box<dyn Observer> {
         WorkerObserverConfig::Static { workers } => Box::new(StaticObserver { workers: *workers }),
         WorkerObserverConfig::File { path } => Box::new(FileObserver { path: path.clone() }),
         WorkerObserverConfig::Command { argv } => Box::new(CommandObserver { argv: argv.clone() }),
+        WorkerObserverConfig::NeedleStatus {
+            agent,
+            heartbeat_dir,
+            stale_after_seconds,
+        } => Box::new(needle::NeedleStatusObserver {
+            agent: agent.clone(),
+            heartbeat_dir: heartbeat_dir.clone(),
+            stale_after_seconds: *stale_after_seconds,
+        }),
     }
 }
 

@@ -4,9 +4,12 @@
 //! tmux sessions in NEEDLE's `needle-<adapter>-*` namespace and delegates
 //! the requested change to `needle run` or `needle stop`.
 
-use super::{new_process_group_command, wait_with_timeout, Actuator, CHILD_TIMEOUT};
+use super::{new_process_group_command, wait_with_timeout, Actuator, Observer, CHILD_TIMEOUT};
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -15,6 +18,115 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_TMUX_OUTPUT_BYTES: u64 = 1024 * 1024;
+
+pub(super) struct NeedleStatusObserver {
+    pub(super) agent: String,
+    pub(super) heartbeat_dir: PathBuf,
+    pub(super) stale_after_seconds: u64,
+}
+
+impl Observer for NeedleStatusObserver {
+    fn current_workers(&self) -> Result<u32> {
+        count_needle_heartbeats(
+            &self.heartbeat_dir,
+            &self.agent,
+            self.stale_after_seconds,
+            Utc::now(),
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct NeedleHeartbeat {
+    qualified_id: String,
+    worker_id: String,
+    #[serde(rename = "last_heartbeat", alias = "timestamp")]
+    last_heartbeat: DateTime<Utc>,
+}
+
+/// Counts fresh NEEDLE heartbeats whose qualified filename belongs to `agent`.
+/// NEEDLE names these files `{agent}-{worker_id}.json`; checking the JSON's
+/// `worker_id` as well as `qualified_id` distinguishes adapters whose names
+/// share a prefix (for example, `claude-print` and `claude-print-opus`).
+fn count_needle_heartbeats(
+    heartbeat_dir: &Path,
+    agent: &str,
+    stale_after_seconds: u64,
+    now: DateTime<Utc>,
+) -> Result<u32> {
+    let stale_after_seconds = i64::try_from(stale_after_seconds)
+        .context("needle_status stale_after_seconds exceeds the supported range")?;
+    let prefix = format!("{agent}-");
+    let entries = match fs::read_dir(heartbeat_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read NEEDLE heartbeat directory {}",
+                    heartbeat_dir.display()
+                )
+            });
+        }
+    };
+
+    let mut workers = 0_u32;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read an entry in NEEDLE heartbeat directory {}",
+                heartbeat_dir.display()
+            )
+        })?;
+        if !entry
+            .file_type()
+            .with_context(|| {
+                format!(
+                    "failed to inspect NEEDLE heartbeat {}",
+                    entry.path().display()
+                )
+            })?
+            .is_file()
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(qualified_id) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        if !qualified_id.starts_with(&prefix) || qualified_id.len() == prefix.len() {
+            continue;
+        }
+
+        let mut file = File::open(&path)
+            .with_context(|| format!("failed to open NEEDLE heartbeat {}", path.display()))?;
+        let bytes = super::read_bounded(&mut file, super::MAX_OBSERVER_BYTES)
+            .with_context(|| format!("NEEDLE heartbeat {}", path.display()))?;
+        let heartbeat: NeedleHeartbeat = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid NEEDLE heartbeat {}", path.display()))?;
+        if heartbeat.qualified_id != format!("{agent}-{}", heartbeat.worker_id)
+            || heartbeat.qualified_id != qualified_id
+        {
+            continue;
+        }
+        let age = now.signed_duration_since(heartbeat.last_heartbeat);
+        let age_seconds = age.num_seconds();
+        let is_fresh = age_seconds < 0
+            || age_seconds < stale_after_seconds
+            || (age_seconds == stale_after_seconds && age.subsec_nanos() == 0);
+        if is_fresh {
+            workers = workers
+                .checked_add(1)
+                .context("NEEDLE heartbeat count exceeds u32::MAX")?;
+        }
+    }
+
+    Ok(workers)
+}
 
 pub(super) struct NeedleRunActuator {
     pub(super) repo: PathBuf,
@@ -286,7 +398,99 @@ fn read_capped(reader: &mut impl Read, limit: u64) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
     use tempfile::TempDir;
+
+    fn write_heartbeat(dir: &Path, agent: &str, worker_id: &str, timestamp: DateTime<Utc>) {
+        let qualified_id = format!("{agent}-{worker_id}");
+        fs::write(
+            dir.join(format!("{qualified_id}.json")),
+            serde_json::json!({
+                "qualified_id": qualified_id,
+                "worker_id": worker_id,
+                "last_heartbeat": timestamp.to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn needle_status_counts_fresh_heartbeats_for_only_the_configured_agent() {
+        let dir = TempDir::new().unwrap();
+        let now = Utc::now();
+        write_heartbeat(dir.path(), "claude-print", "worker-1", now);
+        write_heartbeat(dir.path(), "claude-print", "worker-2", now);
+        write_heartbeat(dir.path(), "claude-print-opus", "worker-3", now);
+        fs::write(dir.path().join("other-agent-worker-4.json"), "not json").unwrap();
+
+        assert_eq!(
+            count_needle_heartbeats(dir.path(), "claude-print", 60, now).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn needle_status_observer_factory_reports_the_current_worker_count() {
+        let dir = TempDir::new().unwrap();
+        write_heartbeat(dir.path(), "codex", "worker-1", Utc::now());
+        let config = crate::config::WorkerObserverConfig::NeedleStatus {
+            agent: "codex".to_string(),
+            heartbeat_dir: dir.path().to_path_buf(),
+            stale_after_seconds: 60,
+        };
+        let observer = crate::fleet::observer_for(&config);
+
+        assert_eq!(observer.current_workers().unwrap(), 1);
+    }
+
+    #[test]
+    fn needle_status_excludes_stale_heartbeats_and_includes_the_boundary() {
+        let dir = TempDir::new().unwrap();
+        let now = Utc::now();
+        write_heartbeat(
+            dir.path(),
+            "codex",
+            "boundary",
+            now - ChronoDuration::seconds(60),
+        );
+        write_heartbeat(
+            dir.path(),
+            "codex",
+            "stale",
+            now - ChronoDuration::milliseconds(60_500),
+        );
+
+        assert_eq!(
+            count_needle_heartbeats(dir.path(), "codex", 60, now).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn needle_status_treats_a_missing_heartbeat_directory_as_zero_workers() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+
+        assert_eq!(
+            count_needle_heartbeats(&missing, "codex", 60, Utc::now()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn needle_status_fails_closed_on_a_malformed_matching_heartbeat() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("codex-worker-1.json"),
+            serde_json::json!({ "qualified_id": "codex-worker-1", "worker_id": "worker-1" })
+                .to_string(),
+        )
+        .unwrap();
+
+        let error = count_needle_heartbeats(dir.path(), "codex", 60, Utc::now()).unwrap_err();
+        assert!(error.to_string().contains("invalid NEEDLE heartbeat"));
+    }
 
     #[cfg(unix)]
     fn fake_program(dir: &TempDir, name: &str, body: &str) -> PathBuf {

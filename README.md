@@ -138,9 +138,10 @@ Use `source.type: command` for another observer; the command must emit exactly
 one normalized object on stdout. Commands are argument arrays and never passed
 through a shell.
 
-Fleet observers can be a static value, a file containing an integer, or a
-command printing an integer (or `{"current_workers": N}`). Actuators can write
-an atomic target file or execute an argv array containing
+Fleet observers can be a static value, a file containing an integer, a command
+printing an integer (or `{"current_workers": N}`), or `needle_status` counting
+fresh heartbeats for a configured NEEDLE adapter. Actuators can write an atomic
+target file or execute an argv array containing
 `{desired_workers}`. A `none` actuator makes observe-only deployment the safe
 default.
 

@@ -125,8 +125,22 @@ reserved for the JSON object; diagnostics belong on stderr.
 ## Fleet integration
 
 The observer measures current workers. Supported types are `static`, `file`,
-and `command`. A command prints either a decimal integer or
-`{"current_workers": N}`.
+`command`, and `needle_status`. A command prints either a decimal integer or
+`{"current_workers": N}`. `needle_status` counts fresh heartbeat files for one
+NEEDLE adapter on the local host:
+
+```yaml
+observer:
+  type: needle_status
+  agent: claude-print
+  heartbeat_dir: ~/.needle/state/heartbeats # optional; this is the default
+  stale_after_seconds: 60                   # optional; this is the default
+```
+
+The observer matches NEEDLE's `{agent}-{worker_id}.json` heartbeat files and
+ignores entries older than `stale_after_seconds`. A missing heartbeat directory
+means zero workers; malformed matching heartbeats fail the observation so an
+invalid count cannot drive scaling.
 
 The actuator accepts `none`, `target_file`, `command`, and `needle_run`. Target
 files are atomic handoffs to an external reconciler. Command argv is executed

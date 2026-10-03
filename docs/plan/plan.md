@@ -1162,10 +1162,9 @@ The generic `command`/`file` observer and actuator (§11) remain sufficient
 for any orchestrator. For NEEDLE specifically, add a first-party pair so a
 site-local wrapper script is not required for the common case:
 
-- [ ] `observer: { type: needle_status }` — runs `needle status --json` (or
-  reads the heartbeat directory directly, matching the pattern already
-  proven in `claude-governor`) and returns the current worker count for the
-  account's configured NEEDLE agent/adapter name on that host.
+- [x] `observer: { type: needle_status }` — reads the heartbeat directory
+  directly and returns the fresh worker count for the configured NEEDLE
+  agent/adapter on that host.
 - [x] `actuator: { type: needle_run }` — launches or stops workers via
   `needle run -w <repo> -a <adapter>` / session-pattern-matched stop, the
   same shell-out boundary `claude-governor`'s plan already documents and
@@ -1270,7 +1269,7 @@ source mid-run degrades to holding that host without affecting the other.
 
 Dependencies: WP11.
 
-- [ ] `needle_status` observer and `needle_run` actuator (§22.9).
+- [x] `needle_status` observer and `needle_run` actuator (§22.9).
 - [ ] `needle_adapter_parity` doctor-style check.
 - [ ] Example config wiring an account across two real hosts.
 

@@ -155,9 +155,35 @@ pub enum ObserverReconciliation {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerObserverConfig {
-    Static { workers: u32 },
-    File { path: PathBuf },
-    Command { argv: Vec<String> },
+    Static {
+        workers: u32,
+    },
+    File {
+        path: PathBuf,
+    },
+    Command {
+        argv: Vec<String>,
+    },
+    NeedleStatus {
+        /// NEEDLE adapter name whose workers are counted on this host.
+        agent: String,
+        /// NEEDLE heartbeat directory; defaults to `~/.needle/state/heartbeats`.
+        #[serde(default = "default_needle_heartbeat_dir")]
+        heartbeat_dir: PathBuf,
+        /// Ignore heartbeats older than this many seconds.
+        #[serde(default = "default_needle_stale_after_seconds")]
+        stale_after_seconds: u64,
+    },
+}
+
+fn default_needle_heartbeat_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".needle/state/heartbeats"))
+        .unwrap_or_else(|| PathBuf::from("~/.needle/state/heartbeats"))
+}
+
+fn default_needle_stale_after_seconds() -> u64 {
+    60
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -363,8 +389,12 @@ impl HostConfig {
 }
 
 fn expand_observer_path(observer: &mut WorkerObserverConfig) {
-    if let WorkerObserverConfig::File { path } = observer {
-        *path = expand_tilde(path);
+    match observer {
+        WorkerObserverConfig::File { path } => *path = expand_tilde(path),
+        WorkerObserverConfig::NeedleStatus { heartbeat_dir, .. } => {
+            *heartbeat_dir = expand_tilde(heartbeat_dir)
+        }
+        WorkerObserverConfig::Static { .. } | WorkerObserverConfig::Command { .. } => {}
     }
 }
 
@@ -468,6 +498,19 @@ fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
     if let Some(WorkerObserverConfig::Command { argv }) = &fleet.observer {
         validate_argv(argv, &format!("account {account} observer command"), false)?;
     }
+    if let Some(WorkerObserverConfig::NeedleStatus {
+        agent,
+        heartbeat_dir,
+        stale_after_seconds,
+    }) = &fleet.observer
+    {
+        validate_needle_status(
+            agent,
+            heartbeat_dir,
+            *stale_after_seconds,
+            &format!("account {account} observer needle_status"),
+        )?;
+    }
     if let ActuatorConfig::Command { argv } = &fleet.actuator {
         validate_argv(argv, &format!("account {account} actuator command"), true)?;
     }
@@ -515,6 +558,19 @@ fn validate_host(
             argv,
             &format!("account {account} host {host_name} observer command"),
             false,
+        )?;
+    }
+    if let WorkerObserverConfig::NeedleStatus {
+        agent,
+        heartbeat_dir,
+        stale_after_seconds,
+    } = &host.observer
+    {
+        validate_needle_status(
+            agent,
+            heartbeat_dir,
+            *stale_after_seconds,
+            &format!("account {account} host {host_name} observer needle_status"),
         )?;
     }
     if let ActuatorConfig::Command { argv } = &host.actuator {
@@ -607,6 +663,28 @@ fn validate_needle_run(repo: &Path, adapter: &str, context: &str) -> Result<()> 
         bail!("{context}: adapter must contain only ASCII letters, digits, '.', '_' or '-'");
     }
     Ok(())
+}
+
+fn validate_needle_status(
+    agent: &str,
+    heartbeat_dir: &Path,
+    stale_after_seconds: u64,
+    context: &str,
+) -> Result<()> {
+    if agent.is_empty()
+        || !agent
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("{context}: agent must contain only ASCII letters, digits, '.', '_' or '-'");
+    }
+    if heartbeat_dir.as_os_str().is_empty() {
+        bail!("{context}: heartbeat_dir must not be empty");
+    }
+    validate_duration(
+        stale_after_seconds,
+        &format!("{context} stale_after_seconds"),
+    )
 }
 
 pub fn expand_tilde(path: &Path) -> PathBuf {
@@ -827,6 +905,95 @@ actuator: { type: needle_run, repo: /workspace, adapter: "agent *" }"#,
         let err = config.validate().unwrap_err().to_string();
         assert!(
             err.contains("adapter must contain only ASCII letters"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn needle_status_config_defaults_and_expands_heartbeat_directory() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer:
+  type: needle_status
+  agent: claude-print
+  heartbeat_dir: ~/test-heartbeats"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let Config { mut accounts, .. } = config;
+        accounts.get_mut("acct").unwrap().fleet.expand_paths();
+        let Some(WorkerObserverConfig::NeedleStatus {
+            agent,
+            heartbeat_dir,
+            stale_after_seconds,
+        }) = accounts["acct"].fleet.observer.as_ref()
+        else {
+            panic!("expected needle_status observer");
+        };
+
+        assert_eq!(agent, "claude-print");
+        assert_eq!(heartbeat_dir, &expand_tilde(Path::new("~/test-heartbeats")));
+        assert_eq!(*stale_after_seconds, 60);
+    }
+
+    #[test]
+    fn needle_status_defaults_to_needles_heartbeat_directory() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: needle_status, agent: claude-print }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let Some(WorkerObserverConfig::NeedleStatus { heartbeat_dir, .. }) =
+            config.accounts["acct"].fleet.observer.as_ref()
+        else {
+            panic!("expected needle_status observer");
+        };
+
+        let expected = dirs::home_dir()
+            .map(|home| home.join(".needle/state/heartbeats"))
+            .unwrap_or_else(|| PathBuf::from("~/.needle/state/heartbeats"));
+        assert_eq!(heartbeat_dir, &expected);
+    }
+
+    #[test]
+    fn needle_status_rejects_invalid_agent_names() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: needle_status, agent: "claude print" }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("agent must contain only ASCII letters"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn needle_status_requires_a_positive_staleness_threshold() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: needle_status, agent: claude-print, stale_after_seconds: 0 }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("observer needle_status stale_after_seconds must be positive"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn needle_status_rejects_an_empty_heartbeat_directory() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: needle_status, agent: claude-print, heartbeat_dir: "" }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("observer needle_status: heartbeat_dir must not be empty"),
             "{err}"
         );
     }

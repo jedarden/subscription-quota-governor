@@ -150,6 +150,33 @@
             "type": { "const": "command" },
             "argv": { "$ref": "#/$defs/argv" }
           }
+        },
+        {
+          "type": "object",
+          "required": ["type", "agent"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "needle_status" },
+            "agent": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$",
+              "description": "NEEDLE adapter name; Config::validate() permits ASCII letters, digits, '.', '_' and '-'."
+            },
+            "heartbeat_dir": {
+              "type": "string",
+              "minLength": 1,
+              "default": "~/.needle/state/heartbeats",
+              "description": "NEEDLE heartbeat directory; a leading ~/ is expanded."
+            },
+            "stale_after_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807,
+              "default": 60,
+              "description": "Ignore heartbeats older than this many seconds. Config::validate() rejects 0 or a value above i64::MAX."
+            }
+          }
         }
       ]
     },
