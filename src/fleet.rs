@@ -1,6 +1,11 @@
-use crate::config::{ActuatorConfig, FleetConfig, ObserverReconciliation, WorkerObserverConfig};
+use crate::config::{
+    AccountConfig, ActuatorConfig, FleetConfig, HostConfig, ObserverReconciliation,
+    WorkerObserverConfig,
+};
+use crate::placement::HostPlacement;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -82,6 +87,74 @@ pub fn current_workers(config: &FleetConfig) -> Result<u32> {
     reconcile_observed_range(observed, config)
 }
 
+/// Reads the worker count from each configured host's observer.
+///
+/// Host counts stay keyed by host id so callers can pass them directly to
+/// [`crate::placement::place`]. Account-level minimum and maximum limits are
+/// not applied to each host individually; those limits describe the aggregate
+/// account, while each host may have a different ceiling.
+pub fn current_host_workers(config: &AccountConfig) -> Result<BTreeMap<String, u32>> {
+    let hosts = configured_hosts(config)?;
+    hosts
+        .iter()
+        .map(|(host_id, host)| {
+            let observed = observer_for(&host.observer)
+                .current_workers()
+                .with_context(|| format!("host {host_id} observer failed"))?;
+            Ok((host_id.clone(), observed))
+        })
+        .collect()
+}
+
+/// Dispatches each placement target to the actuator configured for that host.
+///
+/// The complete host-id mapping is validated before the first actuator runs,
+/// preventing malformed or partial placement results from causing a partial
+/// set of host mutations. Per-host `current` and `target` values are consumed
+/// directly from placement; host actuators never receive account quota data.
+pub fn actuate_host_targets(
+    config: &AccountConfig,
+    placements: &[HostPlacement],
+) -> Result<BTreeMap<String, ActuationOutcome>> {
+    let hosts = configured_hosts(config)?;
+    let mut by_host = BTreeMap::new();
+    for placement in placements {
+        if !hosts.contains_key(&placement.host_id) {
+            bail!("placement references unknown host {}", placement.host_id);
+        }
+        if by_host
+            .insert(placement.host_id.as_str(), placement)
+            .is_some()
+        {
+            bail!("placement contains duplicate host {}", placement.host_id);
+        }
+    }
+    for host_id in hosts.keys() {
+        if !by_host.contains_key(host_id.as_str()) {
+            bail!("placement is missing configured host {host_id}");
+        }
+    }
+
+    hosts
+        .iter()
+        .map(|(host_id, host)| {
+            let placement = by_host[host_id.as_str()];
+            let outcome = actuate_config(&host.actuator, placement.current, placement.target)
+                .with_context(|| format!("host {host_id} actuator failed"))?;
+            Ok((host_id.clone(), outcome))
+        })
+        .collect()
+}
+
+fn configured_hosts(config: &AccountConfig) -> Result<&BTreeMap<String, HostConfig>> {
+    config
+        .fleet
+        .hosts
+        .as_ref()
+        .filter(|hosts| !hosts.is_empty())
+        .context("fleet.hosts must contain at least one host")
+}
+
 /// Applies plan.md §11.1's range requirement: "reject counts outside the
 /// configured fleet range unless a documented reconciliation mode is
 /// selected." Layered on top of `Observer::current_workers` (rather than
@@ -116,13 +189,21 @@ fn reconcile_observed_range(observed: u32, config: &FleetConfig) -> Result<u32> 
 /// must not treat this cycle's observation as authoritative -- retaining
 /// whatever state it already holds is what lets the next cycle reconcile.
 pub fn actuate(config: &FleetConfig, observed: u32, desired: u32) -> Result<ActuationOutcome> {
+    actuate_config(&config.actuator, observed, desired)
+}
+
+fn actuate_config(
+    actuator: &ActuatorConfig,
+    observed: u32,
+    desired: u32,
+) -> Result<ActuationOutcome> {
     if desired == observed {
         return Ok(ActuationOutcome { actuated: false });
     }
-    if matches!(config.actuator, ActuatorConfig::None) {
+    if matches!(actuator, ActuatorConfig::None) {
         return Ok(ActuationOutcome { actuated: false });
     }
-    actuator_for(&config.actuator).actuate(desired)?;
+    actuator_for(actuator).actuate(desired)?;
     Ok(ActuationOutcome { actuated: true })
 }
 
@@ -439,7 +520,10 @@ fn temporary_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ActuatorConfig, WorkerObserverConfig};
+    use crate::config::{
+        AccountConfig, ActuatorConfig, BankedResetConfig, FleetConfig, HostConfig,
+        ObserverReconciliation, SourceConfig, Strategy, UtilizationConfig, WorkerObserverConfig,
+    };
 
     struct RecordingActuator {
         calls: std::cell::RefCell<Vec<u32>>,
@@ -450,6 +534,159 @@ mod tests {
             self.calls.borrow_mut().push(desired);
             Ok(())
         }
+    }
+
+    fn host(observer: WorkerObserverConfig, actuator: ActuatorConfig) -> HostConfig {
+        HostConfig {
+            max_workers: None,
+            resource_reserve: None,
+            resource_source: None,
+            observer,
+            actuator,
+        }
+    }
+
+    fn account_with_hosts(hosts: BTreeMap<String, HostConfig>) -> AccountConfig {
+        AccountConfig {
+            source: SourceConfig::NormalizedFile {
+                path: PathBuf::from("unused"),
+            },
+            fleet: FleetConfig {
+                min_workers: 0,
+                max_workers: 10,
+                bootstrap_workers: 1,
+                max_scale_up_per_cycle: 1,
+                max_scale_down_per_cycle: 1,
+                observer: None,
+                actuator: ActuatorConfig::None,
+                observer_reconciliation: ObserverReconciliation::default(),
+                hosts: Some(hosts),
+            },
+            utilization: UtilizationConfig {
+                target_utilization: Some(0.85),
+                reserve_fraction: None,
+                strategy: Strategy::LinearToReset,
+                stale_after_seconds: 300,
+                stale_behavior: Default::default(),
+                minimum_sample_seconds: 60,
+                windows: BTreeMap::new(),
+            },
+            banked_resets: BankedResetConfig::default(),
+        }
+    }
+
+    fn placement(host_id: &str, current: u32, target: u32) -> HostPlacement {
+        HostPlacement {
+            host_id: host_id.into(),
+            current,
+            target,
+            ceiling: 10,
+            headroom: 1.0,
+            fresh: true,
+            eligible: true,
+        }
+    }
+
+    #[test]
+    fn current_host_workers_uses_each_hosts_configured_observer() {
+        let account = account_with_hosts(BTreeMap::from([
+            (
+                "east".into(),
+                host(
+                    WorkerObserverConfig::Static { workers: 2 },
+                    ActuatorConfig::None,
+                ),
+            ),
+            (
+                "west".into(),
+                host(
+                    WorkerObserverConfig::Static { workers: 7 },
+                    ActuatorConfig::None,
+                ),
+            ),
+        ]));
+
+        assert_eq!(
+            current_host_workers(&account).unwrap(),
+            BTreeMap::from([("east".into(), 2), ("west".into(), 7)])
+        );
+    }
+
+    #[test]
+    fn actuate_host_targets_routes_each_placement_to_the_matching_host() {
+        let dir = std::env::temp_dir().join(format!("subgov-host-actuate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let east_target = dir.join("east-target");
+        let west_target = dir.join("west-target");
+        let account = account_with_hosts(BTreeMap::from([
+            (
+                "east".into(),
+                host(
+                    WorkerObserverConfig::Static { workers: 1 },
+                    ActuatorConfig::TargetFile {
+                        path: east_target.clone(),
+                    },
+                ),
+            ),
+            (
+                "west".into(),
+                host(
+                    WorkerObserverConfig::Static { workers: 4 },
+                    ActuatorConfig::TargetFile {
+                        path: west_target.clone(),
+                    },
+                ),
+            ),
+        ]));
+
+        // Reverse host order to show dispatch follows each placement's id,
+        // not the order in which placements were produced.
+        let outcomes = actuate_host_targets(
+            &account,
+            &[placement("west", 4, 6), placement("east", 1, 3)],
+        )
+        .unwrap();
+
+        assert!(outcomes["east"].actuated);
+        assert!(outcomes["west"].actuated);
+        assert_eq!(fs::read_to_string(east_target).unwrap().trim(), "3");
+        assert_eq!(fs::read_to_string(west_target).unwrap().trim(), "6");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn actuate_host_targets_rejects_incomplete_placement_before_actuating() {
+        let dir = std::env::temp_dir().join(format!("subgov-host-missing-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let east_target = dir.join("east-target");
+        let west_target = dir.join("west-target");
+        let account = account_with_hosts(BTreeMap::from([
+            (
+                "east".into(),
+                host(
+                    WorkerObserverConfig::Static { workers: 1 },
+                    ActuatorConfig::TargetFile {
+                        path: east_target.clone(),
+                    },
+                ),
+            ),
+            (
+                "west".into(),
+                host(
+                    WorkerObserverConfig::Static { workers: 4 },
+                    ActuatorConfig::TargetFile {
+                        path: west_target.clone(),
+                    },
+                ),
+            ),
+        ]));
+
+        let error = actuate_host_targets(&account, &[placement("east", 1, 3)]).unwrap_err();
+
+        assert!(error.to_string().contains("missing configured host west"));
+        assert!(!east_target.exists());
+        assert!(!west_target.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
