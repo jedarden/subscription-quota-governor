@@ -113,6 +113,21 @@ pub fn current_host_workers(config: &AccountConfig) -> Result<BTreeMap<String, u
         .collect()
 }
 
+/// Sums per-host observations into the account-level count consumed by the
+/// quota controller, then applies the same account range policy used by the
+/// single-host observer.
+pub fn total_host_workers(
+    config: &FleetConfig,
+    current_by_host: &BTreeMap<String, u32>,
+) -> Result<u32> {
+    let total = current_by_host.values().try_fold(0u32, |total, workers| {
+        total
+            .checked_add(*workers)
+            .context("sum of per-host worker counts exceeds u32")
+    })?;
+    reconcile_observed_range(total, config)
+}
+
 /// Dispatches each placement target to the actuator configured for that host.
 ///
 /// The complete host-id mapping is validated before the first actuator runs,

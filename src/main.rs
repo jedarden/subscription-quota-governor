@@ -13,9 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use subscription_governor::config::Config;
+use subscription_governor::config::{Config, ResourceSourceConfig, SourceConfig};
 use subscription_governor::controller::{evaluate, Decision};
 use subscription_governor::fleet;
+use subscription_governor::model::ResourceSnapshot;
+use subscription_governor::placement::{self, HostPlacement};
 use subscription_governor::source;
 use subscription_governor::state::{State, StateLock};
 
@@ -562,6 +564,8 @@ struct AccountMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     binding_window: Option<String>,
     windows: Vec<WindowMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hosts: Option<Vec<HostMetrics>>,
     actuation_attempted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     actuation_succeeded: Option<bool>,
@@ -573,6 +577,32 @@ struct WindowMetrics {
     used_fraction: f64,
     target_utilization: f64,
     seconds_until_reset: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct HostMetrics {
+    host_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_utilization: Option<HostResourceUtilization>,
+    placed_workers: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct HostResourceUtilization {
+    cpu_used_fraction: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_used_fraction: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HostDecisionRecord {
+    host_id: String,
+    resource_snapshot: Option<ResourceSnapshot>,
+    current_workers: u32,
+    headroom: f64,
+    fresh: bool,
+    eligible: bool,
+    target_workers: u32,
 }
 
 impl AccountMetrics {
@@ -588,6 +618,7 @@ impl AccountMetrics {
             decision_reason: None,
             binding_window: None,
             windows: Vec::new(),
+            hosts: None,
             actuation_attempted: false,
             actuation_succeeded: None,
         }
@@ -620,6 +651,104 @@ impl AccountMetrics {
             })
             .collect();
     }
+
+    fn apply_host_placements(&mut self, hosts: &[HostDecisionRecord]) {
+        self.hosts = Some(
+            hosts
+                .iter()
+                .map(|host| HostMetrics {
+                    host_id: host.host_id.clone(),
+                    resource_utilization: host.resource_snapshot.as_ref().map(|snapshot| {
+                        HostResourceUtilization {
+                            cpu_used_fraction: 1.0 - snapshot.cpu_available_fraction,
+                            memory_used_fraction: (snapshot.mem_total_mb > 0).then(|| {
+                                1.0 - snapshot.mem_available_mb as f64
+                                    / snapshot.mem_total_mb as f64
+                            }),
+                        }
+                    }),
+                    placed_workers: host.target_workers,
+                })
+                .collect(),
+        );
+    }
+}
+
+fn resource_source_as_source(source: &ResourceSourceConfig) -> SourceConfig {
+    match source {
+        ResourceSourceConfig::NormalizedFile { path } => {
+            SourceConfig::NormalizedFile { path: path.clone() }
+        }
+        ResourceSourceConfig::NormalizedHttp {
+            url,
+            timeout_seconds,
+        } => SourceConfig::NormalizedHttp {
+            url: url.clone(),
+            timeout_seconds: *timeout_seconds,
+        },
+        ResourceSourceConfig::Command { argv } => SourceConfig::Command { argv: argv.clone() },
+    }
+}
+
+fn collect_host_resources(
+    account: &str,
+    account_config: &subscription_governor::config::AccountConfig,
+) -> BTreeMap<String, ResourceSnapshot> {
+    let mut resources = BTreeMap::new();
+    if let Some(hosts) = &account_config.fleet.hosts {
+        for (host_id, host) in hosts {
+            let Some(resource_source) = &host.resource_source else {
+                continue;
+            };
+            let result = source::collect_resource(&resource_source_as_source(resource_source))
+                .and_then(|snapshot| {
+                    if snapshot.host_id == *host_id {
+                        Ok(snapshot)
+                    } else {
+                        Err(anyhow!(
+                            "resource snapshot host_id {} does not match configured host {host_id}",
+                            snapshot.host_id
+                        ))
+                    }
+                });
+            match result {
+                Ok(snapshot) => {
+                    resources.insert(host_id.clone(), snapshot);
+                }
+                Err(_) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "host_resource_error",
+                            "account": account,
+                            "host_id": host_id,
+                            "time": Utc::now(),
+                            "category": "resource_observation",
+                        })
+                    );
+                }
+            }
+        }
+    }
+    resources
+}
+
+fn host_decision_records(
+    placements: &[HostPlacement],
+    resources: &BTreeMap<String, ResourceSnapshot>,
+) -> Vec<HostDecisionRecord> {
+    placements
+        .iter()
+        .map(|placement| HostDecisionRecord {
+            host_id: placement.host_id.clone(),
+            resource_snapshot: resources.get(&placement.host_id).cloned(),
+            current_workers: placement.current,
+            headroom: placement.headroom,
+            fresh: placement.fresh,
+            eligible: placement.eligible,
+            target_workers: placement.target,
+        })
+        .collect()
 }
 
 fn run_cycle(
@@ -635,6 +764,10 @@ fn run_cycle(
         }
         let now = Utc::now();
         let mut metrics = AccountMetrics::new(name.clone(), now);
+        let mut host_current: Option<BTreeMap<String, u32>> = None;
+        let mut host_placements: Option<Vec<HostPlacement>> = None;
+        let mut host_records: Option<Vec<HostDecisionRecord>> = None;
+        let mut host_actuation: Option<BTreeMap<String, fleet::ActuationOutcome>> = None;
         let result: Result<(), AccountFailure> = (|| {
             let snapshot =
                 source::collect(&account_config.source).map_err(AccountFailure::Observation)?;
@@ -644,8 +777,22 @@ fn run_cycle(
                     .num_seconds()
                     .max(0) as u64,
             );
-            let workers = fleet::current_workers(&account_config.fleet)
-                .map_err(AccountFailure::Observation)?;
+            let workers = if account_config
+                .fleet
+                .hosts
+                .as_ref()
+                .is_some_and(|hosts| !hosts.is_empty())
+            {
+                let current = fleet::current_host_workers(account_config)
+                    .map_err(AccountFailure::Observation)?;
+                let total = fleet::total_host_workers(&account_config.fleet, &current)
+                    .map_err(AccountFailure::Observation)?;
+                host_current = Some(current);
+                total
+            } else {
+                fleet::current_workers(&account_config.fleet)
+                    .map_err(AccountFailure::Observation)?
+            };
             metrics.current_workers = Some(workers);
             let prior = state.accounts.get(name).cloned().unwrap_or_default();
             let decision = evaluate(name, account_config, &snapshot, &prior, workers, now)
@@ -653,9 +800,33 @@ fn run_cycle(
             let readiness = readiness_for_decision(&decision);
             metrics.apply_decision(&decision, readiness.reason.clone(), now);
 
+            if let Some(current) = &host_current {
+                let resources = collect_host_resources(name, account_config);
+                let placements = placement::place(
+                    name,
+                    decision.desired_workers,
+                    account_config,
+                    current,
+                    &resources,
+                    now,
+                )
+                .map_err(AccountFailure::Observation)?;
+                let records = host_decision_records(&placements, &resources);
+                metrics.apply_host_placements(&records);
+                host_records = Some(records);
+                host_placements = Some(placements);
+            }
+
             metrics.actuation_attempted = !observe_only;
             let actuated = if observe_only {
                 false
+            } else if let Some(placements) = &host_placements {
+                let outcomes = fleet::actuate_host_targets(account_config, placements)
+                    .map_err(AccountFailure::Actuation)?;
+                metrics.actuation_succeeded = Some(true);
+                let any_actuated = outcomes.values().any(|outcome| outcome.actuated);
+                host_actuation = Some(outcomes);
+                any_actuated
             } else {
                 let actuation =
                     fleet::actuate(&account_config.fleet, workers, decision.desired_workers)
@@ -663,15 +834,20 @@ fn run_cycle(
                 metrics.actuation_succeeded = Some(true);
                 actuation.actuated
             };
+            let mut event = json!({
+                "event": "decision",
+                "observe_only": observe_only,
+                "actuated": actuated,
+                "decision": decision,
+            });
+            if let Some(hosts) = &host_records {
+                event["hosts"] = serde_json::to_value(hosts)
+                    .map_err(|error| AccountFailure::Observation(error.into()))?;
+            }
             println!(
                 "{}",
-                serde_json::to_string(&json!({
-                    "event": "decision",
-                    "observe_only": observe_only,
-                    "actuated": actuated,
-                    "decision": decision,
-                }))
-                .map_err(|error| AccountFailure::Observation(error.into()))?
+                serde_json::to_string(&event)
+                    .map_err(|error| AccountFailure::Observation(error.into()))?
             );
             let account_state = state.accounts.entry(name.clone()).or_default();
             if decision.stale {
@@ -683,6 +859,20 @@ fn run_cycle(
                     workers
                 };
                 account_state.record(&snapshot, sample_workers, decision.desired_workers);
+                if let (Some(current), Some(placements)) = (&host_current, &host_placements) {
+                    for placement in placements {
+                        let sample_workers = if host_actuation
+                            .as_ref()
+                            .and_then(|outcomes| outcomes.get(&placement.host_id))
+                            .is_some_and(|outcome| outcome.actuated)
+                        {
+                            placement.target
+                        } else {
+                            current[&placement.host_id]
+                        };
+                        state.record_host(name, &placement.host_id, &snapshot, sample_workers);
+                    }
+                }
             }
             outcome.statuses.insert(name.clone(), readiness);
             Ok(())
@@ -1266,6 +1456,10 @@ mod metrics_tests {
         assert_eq!(object["source_success"], false);
         assert_eq!(object["actuation_attempted"], false);
         assert!(object["windows"].as_array().unwrap().is_empty());
+        assert!(
+            !object.contains_key("hosts"),
+            "single-host metrics retain their existing JSON shape"
+        );
         for absent in [
             "sample_age_seconds",
             "current_workers",

@@ -1207,10 +1207,10 @@ transport type or credential model is introduced. Requirements:
 - [x] State is keyed by `(account, host)` for per-host samples in addition to
   the existing per-account key (§10); the account-level "last desired total"
   is unchanged and remains the controller's, not placement's, output.
-- [ ] Decision events (§13) gain a per-host placement record alongside the
+- [x] Decision events (§13) gain a per-host placement record alongside the
   existing per-account decision: resource snapshot, headroom, eligibility,
   and the placed target, keyed by account and host.
-- [ ] Metrics (§13) add per-host resource utilization and placed-worker count
+- [x] Metrics (§13) add per-host resource utilization and placed-worker count
   alongside the existing per-account/per-window metrics.
 
 ### 22.12 CLI extensions
@@ -1256,10 +1256,10 @@ loses share, never gains it.
 
 Dependencies: WP4, WP10.
 
-- [ ] Per-host observer/actuator wiring in `src/fleet.rs`.
-- [ ] Per-`(account, host)` state (§22.11).
-- [ ] Per-host decision events and metrics (§22.11).
-- [ ] Integration test: one account, two hosts, one host stale — the healthy
+- [x] Per-host observer/actuator wiring in `src/fleet.rs`.
+- [x] Per-`(account, host)` state (§22.11).
+- [x] Per-host decision events and metrics (§22.11).
+- [x] Integration test: one account, two hosts, one host stale — the healthy
   host absorbs the account total up to its ceiling and the stale host holds.
 
 Definition of done: a full observe-only cycle across a two-host account

@@ -97,19 +97,57 @@ pub fn place(
         .filter(|id| fresh_of[id] && headroom_of[id] > 0.0)
         .collect();
 
+    // Ineligible hosts retain their current allocation while the account
+    // target is stable or growing. This is the §22.8 frozen-host guarantee:
+    // stale resource data alone must not drain a host. When the account
+    // target shrinks, they may step down normally toward zero, as §22.8
+    // allows. Reserve that ineligible allocation before distributing the
+    // remaining account budget among eligible hosts.
+    let current_total = current_of
+        .values()
+        .fold(0u32, |total, workers| total.saturating_add(*workers));
+    let mut ineligible_target = BTreeMap::new();
+    for id in hosts.keys().map(String::as_str) {
+        if !eligible.contains(&id) {
+            let current = current_of[id];
+            let target = if account_target >= current_total {
+                current
+            } else {
+                0
+            };
+            ineligible_target.insert(
+                id,
+                apply_step_limit(
+                    target,
+                    current,
+                    ceiling_of[id],
+                    config.fleet.max_scale_up_per_cycle,
+                    config.fleet.max_scale_down_per_cycle,
+                ),
+            );
+        }
+    }
+
     // §22.7: "if eligible is empty: target[h] = current[h] for every host --
     // hold, never scale up blind."
     let raw_target: BTreeMap<&str, u32> = if eligible.is_empty() {
         current_of.clone()
     } else {
         let all_hosts: Vec<&str> = hosts.keys().map(String::as_str).collect();
-        distribute(
-            account_target,
+        let ineligible_total = ineligible_target
+            .values()
+            .fold(0u32, |total, workers| total.saturating_add(*workers));
+        let mut distributed = distribute(
+            account_target.saturating_sub(ineligible_total),
             &eligible,
             &headroom_of,
             &ceiling_of,
             &all_hosts,
-        )
+        );
+        for (id, target) in ineligible_target {
+            distributed.insert(id, target);
+        }
+        distributed
     };
 
     let placements = hosts

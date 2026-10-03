@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://git.ardenone.com/jedarden/subscription-quota-governor/raw/branch/main/schema/metrics-event.schema.json",
   "title": "Metrics events (JSONL, stdout)",
-  "description": "The §13 'Planned metrics' surface: two JSONL event shapes `main::run_cycle`/`main::run` print to stdout, both distinct from the richer `decision` event covered by decision-event.schema.json. `metrics` is printed exactly once per account per cycle, regardless of success or failure, so a metrics consumer never has to correlate the success-only `decision` event with the failure-only `account_error` event just to count source/actuation success and failure. `cycle_metrics` is printed exactly once per full run_cycle invocation (not per account), carrying the loop-level timing and scheduling-drift metrics that have no per-account meaning. additionalProperties is left open everywhere because the underlying Rust structs (AccountMetrics/WindowMetrics in src/main.rs) do not use #[serde(deny_unknown_fields)].",
+  "description": "The §13 'Planned metrics' surface: two JSONL event shapes `main::run_cycle`/`main::run` print to stdout, both distinct from the richer `decision` event covered by decision-event.schema.json. `metrics` is printed exactly once per account per cycle, regardless of success or failure, so a metrics consumer never has to correlate the success-only `decision` event with the failure-only `account_error` event just to count source/actuation success and failure. Multi-host accounts add a `hosts` array with per-host CPU/memory utilization when observed and placed worker counts. `cycle_metrics` is printed exactly once per full run_cycle invocation (not per account), carrying the loop-level timing and scheduling-drift metrics that have no per-account meaning. additionalProperties is left open everywhere because the underlying Rust metric structs in src/main.rs do not use #[serde(deny_unknown_fields)].",
   "oneOf": [
     { "$ref": "#/$defs/metrics" },
     { "$ref": "#/$defs/cycleMetrics" }
@@ -61,6 +61,11 @@
           "description": "One entry per observed, enabled window, in snapshot order. Empty when no decision was computed (source or worker-observer failure) or the decision was stale.",
           "items": { "$ref": "#/$defs/windowMetrics" }
         },
+        "hosts": {
+          "type": "array",
+          "description": "Present only when fleet.hosts is configured and placement completed. Each record is keyed by the parent account and host_id, with CPU and memory utilization when a resource snapshot was obtained and the placed target count.",
+          "items": { "$ref": "#/$defs/hostMetrics" }
+        },
         "actuation_attempted": {
           "type": "boolean",
           "description": "True iff a decision was computed and the cycle was not observe-only -- i.e. the fleet actuator was invoked this cycle. False whenever no decision was reached, or the cycle ran with --observe-only."
@@ -95,6 +100,28 @@
           "type": "integer",
           "minimum": 0,
           "description": "window.resets_at - decision time, clamped to zero -- a reset the clock has passed but the provider has not yet rolled over (§9.3 \"reset_due\") is reported as zero seconds away, never negative."
+        }
+      }
+    },
+    "hostMetrics": {
+      "type": "object",
+      "required": ["host_id", "placed_workers"],
+      "additionalProperties": true,
+      "properties": {
+        "host_id": { "type": "string", "minLength": 1 },
+        "resource_utilization": {
+          "type": "object",
+          "required": ["cpu_used_fraction"],
+          "additionalProperties": true,
+          "properties": {
+            "cpu_used_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+            "memory_used_fraction": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "placed_workers": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The target count assigned to this host by placement, whether or not this cycle was observe-only."
         }
       }
     },
@@ -169,6 +196,28 @@
           "used_fraction": 0.35,
           "target_utilization": 0.85,
           "seconds_until_reset": 124811511
+        }
+      ],
+      "actuation_attempted": false
+    },
+    {
+      "event": "metrics",
+      "time": "2026-09-29T03:08:41.488739636Z",
+      "account": "claude-anthropic",
+      "source_success": true,
+      "windows": [],
+      "hosts": [
+        {
+          "host_id": "lab-east",
+          "resource_utilization": {
+            "cpu_used_fraction": 0.3,
+            "memory_used_fraction": 0.125
+          },
+          "placed_workers": 3
+        },
+        {
+          "host_id": "lab-west",
+          "placed_workers": 1
         }
       ],
       "actuation_attempted": false

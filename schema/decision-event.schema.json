@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://git.ardenone.com/jedarden/subscription-quota-governor/raw/branch/main/schema/decision-event.schema.json",
   "title": "Decision event (JSONL, stdout)",
-  "description": "The §13 stable event contract for the one JSONL line `run_cycle` (src/main.rs) prints to stdout per account per cycle: `{\"event\": \"decision\", \"observe_only\": ..., \"actuated\": ..., \"decision\": <Decision>}`. Mirrors Decision/WindowDecision/BankedResetDecision in src/controller.rs exactly, including the `binding_window` field WP2 added for the §9.6 multi-window arbitration winner. additionalProperties is left open everywhere because the Rust structs do not use #[serde(deny_unknown_fields)] -- a field this schema does not yet know about is a forward-compatible addition, not a violation. `reason` and `windows[].reason` are closed enums because they are fixed Rust string literals, not provider- or user-supplied text; adding a new reason value is a change to this file, not just to the binary. This schema covers only the `decision` event -- `status`, `account_error`, and `shutdown` events (also printed per §13/12) are not in scope for this file.",
+  "description": "The §13 stable event contract for the one JSONL line `run_cycle` (src/main.rs) prints to stdout per account per cycle: `{\"event\": \"decision\", \"observe_only\": ..., \"actuated\": ..., \"decision\": <Decision>}` with an optional per-host `hosts` breakdown when fleet.hosts is configured. Mirrors Decision/WindowDecision/BankedResetDecision in src/controller.rs exactly, including the `binding_window` field WP2 added for the §9.6 multi-window arbitration winner. additionalProperties is left open everywhere because the Rust structs do not use #[serde(deny_unknown_fields)] -- a field this schema does not yet know about is a forward-compatible addition, not a violation. `reason` and `windows[].reason` are closed enums because they are fixed Rust string literals, not provider- or user-supplied text; adding a new reason value is a change to this file, not just to the binary. This schema covers only the `decision` event -- `status`, `account_error`, and `shutdown` events (also printed per §13/12) are not in scope for this file.",
   "type": "object",
   "required": ["event", "observe_only", "actuated", "decision"],
   "additionalProperties": true,
@@ -18,9 +18,56 @@
       "type": "boolean",
       "description": "Whether the fleet actuator was invoked and reported success this cycle. False for observe-only cycles, a stale decision that held at the current count, and any cycle whose actuation failed (which is instead reported via a separate `account_error` event, not this one)."
     },
-    "decision": { "$ref": "#/$defs/decision" }
+    "decision": { "$ref": "#/$defs/decision" },
+    "hosts": {
+      "type": "array",
+      "description": "Present only when the account configures fleet.hosts. Records are keyed by decision.account and host_id and report the resource observation and resulting per-host placement.",
+      "items": { "$ref": "#/$defs/hostPlacement" }
+    }
   },
   "$defs": {
+    "hostPlacement": {
+      "type": "object",
+      "required": [
+        "host_id",
+        "resource_snapshot",
+        "current_workers",
+        "headroom",
+        "fresh",
+        "eligible",
+        "target_workers"
+      ],
+      "additionalProperties": true,
+      "description": "One configured host's resource-aware placement result. resource_snapshot is null when no usable snapshot was obtained; such a configured resource source makes the host ineligible and placement holds its current count.",
+      "properties": {
+        "host_id": { "type": "string", "minLength": 1 },
+        "resource_snapshot": {
+          "type": ["object", "null"],
+          "required": [
+            "observed_at",
+            "fresh",
+            "host_id",
+            "cpu_available_fraction",
+            "mem_available_mb",
+            "mem_total_mb"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "observed_at": { "$ref": "#/$defs/timestamp" },
+            "fresh": { "type": "boolean" },
+            "host_id": { "type": "string", "minLength": 1 },
+            "cpu_available_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+            "mem_available_mb": { "type": "integer", "minimum": 0 },
+            "mem_total_mb": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "current_workers": { "type": "integer", "minimum": 0 },
+        "headroom": { "type": "number", "minimum": 0, "maximum": 1 },
+        "fresh": { "type": "boolean" },
+        "eligible": { "type": "boolean" },
+        "target_workers": { "type": "integer", "minimum": 0 }
+      }
+    },
     "decision": {
       "type": "object",
       "required": [
@@ -215,7 +262,25 @@
           }
         ],
         "binding_window": "weekly"
-      }
+      },
+      "hosts": [
+        {
+          "host_id": "lab-east",
+          "resource_snapshot": {
+            "observed_at": "2026-09-28T12:00:00Z",
+            "fresh": true,
+            "host_id": "lab-east",
+            "cpu_available_fraction": 0.7,
+            "mem_available_mb": 28672,
+            "mem_total_mb": 32768
+          },
+          "current_workers": 1,
+          "headroom": 0.7,
+          "fresh": true,
+          "eligible": true,
+          "target_workers": 3
+        }
+      ]
     },
     {
       "event": "decision",
