@@ -532,6 +532,7 @@ subgov --config PATH check
 subgov --config PATH snapshot ACCOUNT
 subgov --config PATH run --once [--observe-only]
 subgov --config PATH run [--observe-only]
+subgov --config PATH doctor
 ```
 
 ### `check`
@@ -562,6 +563,15 @@ subgov --config PATH run [--observe-only]
   operation, saving valid state, terminating children, and exiting promptly.
 - Never overlap cycles for the same account.
 
+### `doctor`
+
+- Check each configured `needle_run` adapter with `needle test-agent` without
+  starting or stopping workers.
+- Fail with a non-zero exit if NEEDLE reports the adapter as unavailable, its
+  CLI probe fails, or the check times out.
+- Repeat the same bounded readiness check immediately before any
+  `needle_run` actuator inspects sessions or changes workers.
+
 Proposed stable exit codes:
 
 | Code | Meaning |
@@ -571,6 +581,7 @@ Proposed stable exit codes:
 | 3 | State ownership or persistence failure. |
 | 4 | One or more source/observer failures. |
 | 5 | Actuation failure. |
+| 6 | Doctor readiness check failure. |
 
 ## 13. Observability
 
@@ -1171,9 +1182,11 @@ site-local wrapper script is not required for the common case:
   justifies (`docs/plan/plan.md` §"Separation of concerns" in that repo):
   subgov decides a number, NEEDLE still owns worker lifecycle, bead
   claiming, and prompt templating entirely.
-- [ ] A `needle_adapter_parity` check (mirroring `cgov doctor`'s
+- [x] A `needle_adapter_parity` check (mirroring `cgov doctor`'s
   `claude_print_parity`) that fails closed when a host's configured NEEDLE
-  adapter is missing or unreachable, rather than actuating blind.
+  adapter is missing or unreachable, rather than actuating blind. `subgov
+  doctor` checks each configured adapter without mutation; `needle_run` repeats
+  the bounded check immediately before actuation.
 - Explicitly out of scope here (§3 non-goal): coordinating NEEDLE bead claims
   across hosts. This adapter only ever sets a target *count* per host: it
   does not choose which repository a host's workers roam into, and it does
@@ -1270,7 +1283,7 @@ source mid-run degrades to holding that host without affecting the other.
 Dependencies: WP11.
 
 - [x] `needle_status` observer and `needle_run` actuator (§22.9).
-- [ ] `needle_adapter_parity` doctor-style check.
+- [x] `needle_adapter_parity` doctor-style check.
 - [ ] Example config wiring an account across two real hosts.
 
 Definition of done: `subgov run --once --observe-only` against a live

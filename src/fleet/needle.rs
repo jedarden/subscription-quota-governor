@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const MAX_TMUX_OUTPUT_BYTES: u64 = 1024 * 1024;
+const MAX_CHILD_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 pub(super) struct NeedleStatusObserver {
     pub(super) agent: String,
@@ -152,6 +152,7 @@ fn reconcile_needle_workers(
     adapter: &str,
     desired: u32,
 ) -> Result<()> {
+    check_needle_adapter_with_program(needle_program, adapter)?;
     let sessions = list_sessions(tmux_program)?;
     let prefix = session_prefix(adapter);
     let mut matching: Vec<_> = sessions
@@ -186,6 +187,51 @@ fn reconcile_needle_workers(
             }
             Ok(())
         }
+    }
+}
+
+pub(super) fn check_needle_adapter(adapter: &str) -> Result<()> {
+    check_needle_adapter_with_program("needle", adapter)
+}
+
+fn check_needle_adapter_with_program(needle_program: &str, adapter: &str) -> Result<()> {
+    let output = capture_with_timeout(needle_program, &["test-agent", adapter], CHILD_TIMEOUT)
+        .with_context(|| format!("failed to check NEEDLE adapter {adapter}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        bail!(
+            "NEEDLE adapter {adapter} check exited with {}{}",
+            output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let status = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Status:").map(str::trim));
+    if status != Some("READY") {
+        bail!(
+            "NEEDLE adapter {adapter} is not ready (test-agent status: {})",
+            status.unwrap_or("missing")
+        );
+    }
+
+    let probe = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Probe:").map(str::trim))
+        .and_then(|probe| probe.strip_prefix("exit "))
+        .and_then(|probe| probe.split_whitespace().next())
+        .and_then(|code| code.parse::<i32>().ok());
+    match probe {
+        Some(0) => Ok(()),
+        Some(code) => bail!("NEEDLE adapter {adapter} probe exited with {code}"),
+        None => bail!("NEEDLE adapter {adapter} did not report a probe exit code"),
     }
 }
 
@@ -326,8 +372,14 @@ fn capture_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Resu
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to execute {program}"))?;
-    let stdout = child.stdout.take().context("tmux stdout was not piped")?;
-    let stderr = child.stderr.take().context("tmux stderr was not piped")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("command stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("command stderr was not piped")?;
     let (sender, receiver) = mpsc::channel();
     let stdout_reader = spawn_capped_reader(stdout, true, sender.clone());
     let stderr_reader = spawn_capped_reader(stderr, false, sender);
@@ -345,7 +397,7 @@ fn capture_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Resu
                         super::kill_child_tree(&mut child);
                         let _ = stdout_reader.join();
                         let _ = stderr_reader.join();
-                        return Err(error).context("failed to read tmux output");
+                        return Err(error).context("failed to read command output");
                     }
                 }
             }
@@ -353,13 +405,13 @@ fn capture_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Resu
                 super::kill_child_tree(&mut child);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                bail!("tmux list-sessions timed out after {timeout:?}");
+                bail!("command {program} timed out after {timeout:?}");
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 super::kill_child_tree(&mut child);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                bail!("tmux output reader ended unexpectedly");
+                bail!("command output reader ended unexpectedly");
             }
         }
     }
@@ -379,7 +431,7 @@ fn spawn_capped_reader<R: Read + Send + 'static>(
     sender: mpsc::Sender<(bool, Result<Vec<u8>>)>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let _ = sender.send((is_stdout, read_capped(&mut stream, MAX_TMUX_OUTPUT_BYTES)));
+        let _ = sender.send((is_stdout, read_capped(&mut stream, MAX_CHILD_OUTPUT_BYTES)));
     })
 }
 
@@ -504,6 +556,13 @@ mod tests {
         path
     }
 
+    fn ready_test_agent_script(log_path: &Path) -> String {
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = test-agent ]; then\n  printf 'Probe: exit 0 (0ms)\\nStatus:  READY\\n'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            log_path.display()
+        )
+    }
+
     #[test]
     fn run_command_targets_the_repo_adapter_and_only_the_needed_delta() {
         let one = needle_run_args(Path::new("/repos/one project"), "claude-print", 1);
@@ -583,11 +642,7 @@ mod tests {
             "#!/bin/sh\necho 'no server running on test socket' >&2\nexit 1\n",
         );
         let log = dir.path().join("needle.log");
-        let needle = fake_program(
-            &dir,
-            "needle",
-            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
-        );
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
 
         reconcile_needle_workers(
             needle.to_str().unwrap(),
@@ -614,11 +669,7 @@ mod tests {
             "#!/bin/sh\nprintf 'needle-codex-alpha\\t0\\nneedle-codex-bravo\\t1\\nneedle-claude-alpha\\t0\\n'\n",
         );
         let log = dir.path().join("needle.log");
-        let needle = fake_program(
-            &dir,
-            "needle",
-            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
-        );
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
 
         reconcile_needle_workers(
             needle.to_str().unwrap(),
@@ -632,6 +683,79 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(log).unwrap(),
             "stop --identifier needle-codex-alpha\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn needle_adapter_check_requires_ready_and_a_successful_probe() {
+        let dir = TempDir::new().unwrap();
+        let ready = fake_program(
+            &dir,
+            "needle-ready",
+            "#!/bin/sh\nprintf 'Probe: exit 0 (0ms)\\nStatus:  READY\\n'\n",
+        );
+        check_needle_adapter_with_program(ready.to_str().unwrap(), "codex").unwrap();
+
+        let failed_probe = fake_program(
+            &dir,
+            "needle-failed-probe",
+            "#!/bin/sh\nprintf 'Probe: exit 127 (0ms)\\nStatus:  READY\\n'\n",
+        );
+        let error = check_needle_adapter_with_program(failed_probe.to_str().unwrap(), "codex")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("probe exited with 127"), "{error}");
+
+        let warning = fake_program(
+            &dir,
+            "needle-warning",
+            "#!/bin/sh\nprintf 'Probe: exit 0 (0ms)\\nStatus:  WARNING\\n'\n",
+        );
+        let error = check_needle_adapter_with_program(warning.to_str().unwrap(), "codex")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("status: WARNING"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn needle_adapter_failure_prevents_session_inspection_and_actuation() {
+        let dir = TempDir::new().unwrap();
+        let needle_log = dir.path().join("needle.log");
+        let needle = fake_program(
+            &dir,
+            "needle",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = test-agent ]; then exit 2; fi\n",
+                needle_log.display()
+            ),
+        );
+        let tmux_log = dir.path().join("tmux.log");
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            &format!("#!/bin/sh\ntouch '{}'\n", tmux_log.display()),
+        );
+
+        let error = reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            Path::new("/repo/project"),
+            "codex",
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("check exited"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(needle_log).unwrap(),
+            "test-agent codex\n"
+        );
+        assert!(
+            !tmux_log.exists(),
+            "tmux must not be inspected after a failed check"
         );
     }
 }

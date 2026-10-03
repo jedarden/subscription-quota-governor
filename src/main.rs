@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use subscription_governor::config::{Config, ResourceSourceConfig, SourceConfig};
+use subscription_governor::config::{ActuatorConfig, Config, ResourceSourceConfig, SourceConfig};
 use subscription_governor::controller::{evaluate, Decision};
 use subscription_governor::fleet;
 use subscription_governor::model::ResourceSnapshot;
@@ -48,6 +48,8 @@ enum Commands {
     /// Print each account's readiness classification from the last
     /// completed cycle, without inspecting credentials or live sources.
     Status,
+    /// Check that every configured NEEDLE adapter is ready to actuate.
+    Doctor,
     /// Read a no-secret inventory and reject overlapping controller ownership.
     Preflight {
         /// JSON inventory assembled from the read-only host inspection procedure.
@@ -67,6 +69,8 @@ enum GovernorError {
     Source(anyhow::Error),
     /// 5: actuation failure.
     Actuation(anyhow::Error),
+    /// 6: a configured actuator failed a doctor readiness check.
+    Doctor(anyhow::Error),
 }
 
 impl GovernorError {
@@ -76,6 +80,7 @@ impl GovernorError {
             Self::State(_) => 3,
             Self::Source(_) => 4,
             Self::Actuation(_) => 5,
+            Self::Doctor(_) => 6,
         }
     }
 
@@ -84,7 +89,8 @@ impl GovernorError {
             Self::CliOrConfig(error)
             | Self::State(error)
             | Self::Source(error)
-            | Self::Actuation(error) => error,
+            | Self::Actuation(error)
+            | Self::Doctor(error) => error,
         }
     }
 }
@@ -125,7 +131,72 @@ fn run_cli() -> Result<(), GovernorError> {
         Commands::Snapshot { account } => snapshot(&config, &account),
         Commands::Run { once, observe_only } => run(config, once, observe_only),
         Commands::Status => status(&config),
+        Commands::Doctor => doctor(&config),
         Commands::Preflight { .. } => unreachable!("preflight handled before config loading"),
+    }
+}
+
+fn doctor(config: &Config) -> Result<(), GovernorError> {
+    let mut targets = Vec::new();
+    for (account_name, account) in &config.accounts {
+        if let Some(hosts) = &account.fleet.hosts {
+            for (host_id, host) in hosts {
+                if let ActuatorConfig::NeedleRun { adapter, .. } = &host.actuator {
+                    targets.push((account_name.clone(), Some(host_id.clone()), adapter.clone()));
+                }
+            }
+        } else if let ActuatorConfig::NeedleRun { adapter, .. } = &account.fleet.actuator {
+            targets.push((account_name.clone(), None, adapter.clone()));
+        }
+    }
+
+    if targets.is_empty() {
+        println!(
+            "{}",
+            json!({
+                "event": "doctor_check",
+                "check": "needle_adapter_parity",
+                "status": "skipped",
+                "message": "no needle_run actuators are configured",
+            })
+        );
+        return Ok(());
+    }
+
+    let mut failures = 0;
+    for (account, host, adapter) in targets {
+        let result = fleet::check_needle_adapter(&adapter);
+        let (status, message) = match result {
+            Ok(()) => (
+                "pass",
+                format!("NEEDLE adapter {adapter} is ready; probe exited 0"),
+            ),
+            Err(error) => {
+                failures += 1;
+                ("fail", format!("{error:#}"))
+            }
+        };
+        println!(
+            "{}",
+            json!({
+                "event": "doctor_check",
+                "check": "needle_adapter_parity",
+                "account": account,
+                "host": host,
+                "adapter": adapter,
+                "status": status,
+                "message": message,
+                "time": Utc::now(),
+            })
+        );
+    }
+
+    if failures > 0 {
+        Err(GovernorError::Doctor(anyhow!(
+            "{failures} configured NEEDLE adapter(s) failed readiness checks"
+        )))
+    } else {
+        Ok(())
     }
 }
 

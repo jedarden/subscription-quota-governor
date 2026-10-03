@@ -164,6 +164,12 @@ detached matches. Use a dedicated adapter for each independently governed pool;
 the repo selects the launch workspace, while the adapter's session namespace
 defines the pool.
 
+Run `subgov --config governor.yaml doctor` to check each configured NEEDLE
+adapter before enabling actuation. The check runs `needle test-agent` without
+starting workers, and `needle_run` repeats the bounded readiness check before
+it inspects sessions or changes the worker count. A missing adapter, failed
+CLI probe, or timeout fails the doctor check and blocks actuation.
+
 Start with `none` or `--observe-only`. Confirm two or more same-generation
 samples and decision output before granting process-management authority.
 

@@ -94,6 +94,13 @@ pub fn actuator_for(config: &ActuatorConfig) -> Box<dyn Actuator> {
     }
 }
 
+/// Checks that NEEDLE has the configured adapter and can execute its probe.
+/// The same check is used by `subgov doctor` and immediately before a
+/// `needle_run` actuator inspects or changes workers.
+pub fn check_needle_adapter(adapter: &str) -> Result<()> {
+    needle::check_needle_adapter(adapter)
+}
+
 pub fn current_workers(config: &FleetConfig) -> Result<u32> {
     let observer_config = config
         .observer
