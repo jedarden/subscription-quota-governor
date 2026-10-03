@@ -24,10 +24,9 @@ fn observed() -> DateTime<Utc> {
 }
 
 fn load_fixture(name: &str) -> Value {
-    let path = format!(
-        "{}/tests/fixtures/anthropic-usage/{name}.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    // Cargo runs integration tests from the package root. Relative paths keep
+    // the fixture lookup valid when cached binaries run in clean extractions.
+    let path = format!("tests/fixtures/anthropic-usage/{name}.json");
     let bytes =
         std::fs::read(&path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
     serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))

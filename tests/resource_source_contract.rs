@@ -16,11 +16,9 @@ use subscription_governor::config::SourceConfig;
 use subscription_governor::source::collect_resource;
 
 fn fixture_source(name: &str) -> SourceConfig {
-    let path = format!(
-        "{}/tests/fixtures/resource-source/{name}.json",
-        env!("CARGO_MANIFEST_DIR")
-    )
-    .into();
+    // Cargo runs integration tests from the package root. Keeping fixture
+    // paths relative lets shared test binaries work across clean extractions.
+    let path = format!("tests/fixtures/resource-source/{name}.json").into();
     SourceConfig::NormalizedFile { path }
 }
 
@@ -71,7 +69,7 @@ fn mem_available_exceeding_mem_total_fails_the_snapshot() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_example_resource_probe_script_produces_a_collectible_snapshot() {
-    let script = format!("{}/examples/resource-probe", env!("CARGO_MANIFEST_DIR"));
+    let script = "examples/resource-probe".to_string();
     let source = SourceConfig::Command {
         argv: vec![script, "test-host".to_string()],
     };

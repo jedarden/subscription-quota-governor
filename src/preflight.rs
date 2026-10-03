@@ -204,9 +204,9 @@ mod tests {
     use super::{Inventory, Mode};
 
     fn fixture(name: &str) -> Inventory {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/controller-ownership")
-            .join(name);
+        // Cargo runs unit tests from the package root; resolve fixtures there
+        // at runtime so cached test binaries work across clean extractions.
+        let path = std::path::Path::new("tests/fixtures/controller-ownership").join(name);
         Inventory::load(&path).unwrap()
     }
 

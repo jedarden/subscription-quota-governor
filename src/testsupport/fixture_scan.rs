@@ -453,8 +453,10 @@ mod tests {
 
     #[test]
     fn real_fixtures_are_clean() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let findings = scan_repo_fixtures(repo_root);
+        // Resolve at runtime because shared Cargo test binaries can run from
+        // different clean archive extractions than the one that built them.
+        let repo_root = std::env::current_dir().expect("Cargo tests run from the package root");
+        let findings = scan_repo_fixtures(&repo_root);
         assert!(
             findings.is_empty(),
             "fixture-safety scan found unsafe content: {findings:#?}"
