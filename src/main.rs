@@ -35,7 +35,12 @@ enum Commands {
     /// Parse and validate the configuration.
     Check,
     /// Fetch and print one account's normalized quota snapshot.
-    Snapshot { account: String },
+    Snapshot {
+        account: String,
+        /// Fetch the configured resource snapshot for one fleet host.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Evaluate accounts, optionally actuating fleet targets.
     Run {
         /// Perform one cycle and exit.
@@ -128,7 +133,7 @@ fn run_cli() -> Result<(), GovernorError> {
             );
             Ok(())
         }
-        Commands::Snapshot { account } => snapshot(&config, &account),
+        Commands::Snapshot { account, host } => snapshot(&config, &account, host.as_deref()),
         Commands::Run { once, observe_only } => run(config, once, observe_only),
         Commands::Status => status(&config),
         Commands::Doctor => doctor(&config),
@@ -200,18 +205,51 @@ fn doctor(config: &Config) -> Result<(), GovernorError> {
     }
 }
 
-fn snapshot(config: &Config, account: &str) -> Result<(), GovernorError> {
+fn snapshot(config: &Config, account: &str, host_id: Option<&str>) -> Result<(), GovernorError> {
     let account_config = config
         .accounts
         .get(account)
         .with_context(|| format!("unknown account {account}"))
         .map_err(GovernorError::CliOrConfig)?;
+
+    if let Some(host_id) = host_id {
+        let resource_source = configured_host_resource_source(account_config, account, host_id)
+            .map_err(GovernorError::CliOrConfig)?;
+        let snapshot =
+            collect_host_resource(host_id, resource_source).map_err(GovernorError::Source)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot)
+                .map_err(|e| { GovernorError::Source(e.into()) })?
+        );
+        return Ok(());
+    }
+
     (|| -> Result<()> {
         let snapshot = source::collect(&account_config.source)?;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         Ok(())
     })()
     .map_err(GovernorError::Source)
+}
+
+fn configured_host_resource_source<'a>(
+    account_config: &'a subscription_governor::config::AccountConfig,
+    account: &str,
+    host_id: &str,
+) -> Result<&'a ResourceSourceConfig> {
+    let hosts = account_config
+        .fleet
+        .hosts
+        .as_ref()
+        .filter(|hosts| !hosts.is_empty())
+        .with_context(|| format!("account {account} does not configure fleet.hosts"))?;
+    let host = hosts
+        .get(host_id)
+        .with_context(|| format!("account {account} has no configured host {host_id}"))?;
+    host.resource_source.as_ref().with_context(|| {
+        format!("account {account} host {host_id} has no resource_source configured")
+    })
 }
 
 /// Prints one JSONL line per configured account classifying it as
@@ -761,6 +799,20 @@ fn resource_source_as_source(source: &ResourceSourceConfig) -> SourceConfig {
     }
 }
 
+fn collect_host_resource(
+    host_id: &str,
+    resource_source: &ResourceSourceConfig,
+) -> Result<ResourceSnapshot> {
+    let snapshot = source::collect_resource(&resource_source_as_source(resource_source))?;
+    if snapshot.host_id != host_id {
+        return Err(anyhow!(
+            "resource snapshot host_id {} does not match configured host {host_id}",
+            snapshot.host_id
+        ));
+    }
+    Ok(snapshot)
+}
+
 fn collect_host_resources(
     account: &str,
     account_config: &subscription_governor::config::AccountConfig,
@@ -771,17 +823,7 @@ fn collect_host_resources(
             let Some(resource_source) = &host.resource_source else {
                 continue;
             };
-            let result = source::collect_resource(&resource_source_as_source(resource_source))
-                .and_then(|snapshot| {
-                    if snapshot.host_id == *host_id {
-                        Ok(snapshot)
-                    } else {
-                        Err(anyhow!(
-                            "resource snapshot host_id {} does not match configured host {host_id}",
-                            snapshot.host_id
-                        ))
-                    }
-                });
+            let result = collect_host_resource(host_id, resource_source);
             match result {
                 Ok(snapshot) => {
                     resources.insert(host_id.clone(), snapshot);
