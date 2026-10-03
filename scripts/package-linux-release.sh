@@ -54,7 +54,6 @@ fi
 
 TARGET=x86_64-unknown-linux-gnu
 ARTIFACT="subgov-${TAG}-linux-x86_64"
-STARTED_ON=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$TAG_COMMIT")
 RUSTC_VERSION=$(rustc --version)
 export SOURCE_DATE_EPOCH
@@ -76,7 +75,6 @@ SUBGOV_BUILD_COMMIT="$TAG_COMMIT" \
 SUBGOV_BUILD_TARGET="$TARGET" \
 SUBGOV_BUILD_ARTIFACT="$ARTIFACT" \
 SUBGOV_BUILD_LOCK_SHA256="$LOCK_SHA256" \
-SUBGOV_BUILD_STARTED_ON="$STARTED_ON" \
 SUBGOV_BUILD_RUSTC_VERSION="$RUSTC_VERSION" \
 SUBGOV_BUILD_WORKFLOW_UID="${SUBGOV_BUILD_WORKFLOW_UID:-local-${TAG_COMMIT}}" \
 SUBGOV_BUILDER_ID="${SUBGOV_BUILDER_ID:-local://scripts/package-linux-release.sh}" \
@@ -86,7 +84,6 @@ python3 - <<'PY'
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
 
 
 def sha256(path):
@@ -97,7 +94,6 @@ def sha256(path):
     return digest.hexdigest()
 
 
-finished_on = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 source = "https://git.ardenone.com/jedarden/subscription-quota-governor.git"
 commit = os.environ["SUBGOV_BUILD_COMMIT"]
 artifact = os.environ["SUBGOV_BUILD_ARTIFACT"]
@@ -107,7 +103,7 @@ statement = {
     "predicateType": "https://slsa.dev/provenance/v1",
     "predicate": {
         "buildDefinition": {
-            "buildType": "https://argoproj.io/argo-workflows/v1",
+            "buildType": "https://git.ardenone.com/jedarden/subscription-quota-governor/buildtypes/package-linux-release/v1",
             "externalParameters": {
                 "repository": source,
                 "ref": f"refs/tags/{os.environ['SUBGOV_BUILD_TAG']}",
@@ -115,8 +111,7 @@ statement = {
                 "target": os.environ["SUBGOV_BUILD_TARGET"],
             },
             "internalParameters": {
-                "workflow": "subscription-quota-governor-ci",
-                "command": "cargo build --locked --release --target x86_64-unknown-linux-gnu --bin subgov",
+                "command": f"scripts/package-linux-release.sh {os.environ['SUBGOV_BUILD_TAG']} <output-directory>",
                 "rustc": os.environ["SUBGOV_BUILD_RUSTC_VERSION"],
                 "rustflags": "--remap-path-prefix=<checkout>=/workspace",
                 "sourceDateEpoch": os.environ.get("SOURCE_DATE_EPOCH", ""),
@@ -130,8 +125,6 @@ statement = {
             "builder": {"id": os.environ["SUBGOV_BUILDER_ID"]},
             "metadata": {
                 "invocationId": os.environ["SUBGOV_BUILD_WORKFLOW_UID"],
-                "startedOn": os.environ["SUBGOV_BUILD_STARTED_ON"],
-                "finishedOn": finished_on,
             },
             "byproducts": [],
         },

@@ -19,6 +19,13 @@ This restates the compatibility rules from
 A new binary release does not imply a new config `version:`, and a new config
 `version:` does not by itself imply a new major binary release.
 
+## v1.0.0-rc.1
+
+This first release candidate accepts configuration schema `version: 1` and
+does not change the schema contract. The `-rc.1` suffix marks the binary as a
+pre-release under Semantic Versioning; it does not identify a new config
+schema. Use `run --observe-only` for this rollout.
+
 ## Backward-compatible within a schema version
 
 - Adding a new **optional** field with a safe, conservative default.

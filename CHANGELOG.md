@@ -9,9 +9,12 @@ versioned config-schema contract; see
 
 ## [Unreleased]
 
-No tagged release exists yet; `v1.0.0-rc.1` is the first planned cut (§16 WP7
-of [the implementation plan](docs/plan/plan.md)). The entries below describe
-what `main` actually does today, not a diff against a prior tag.
+No unreleased changes.
+
+## [1.0.0-rc.1] - 2026-10-03
+
+First release candidate for observation-only rollout. Actuation remains a
+separately controlled step.
 
 ### Added
 
@@ -40,7 +43,10 @@ what `main` actually does today, not a diff against a prior tag.
 - Exact-pinned dependency versions and a `scripts/audit.sh` RustSec
   security-advisory check (`cargo audit`); see
   [docs/notes/dependency-policy.md](docs/notes/dependency-policy.md).
-- A §13 "planned metrics" JSONL surface: a `metrics` event emitted once per
+- Versioned Linux x86_64 release artifacts with SHA-256 checksums and an
+  in-toto provenance statement; see
+  [docs/notes/releasing.md](docs/notes/releasing.md).
+- A §13 JSONL metrics surface: a `metrics` event emitted once per
   account per cycle (source success/failure and sample age, used/target
   fraction and seconds to reset per window, current/desired workers, the
   decision reason and binding window, and whether actuation was attempted
@@ -49,7 +55,6 @@ what `main` actually does today, not a diff against a prior tag.
   scheduling drift (late/skipped cycles). See
   [schema/metrics-event.schema.json](schema/metrics-event.schema.json).
 
-This is pre-release software. See [the implementation plan](docs/plan/plan.md)
-§16 for what remains open in WP5 through WP7 -- signal-aware shutdown,
-per-source contract-test fixtures, operational runbooks, and the release
-pipeline itself.
+This prerelease uses configuration schema `version: 1`; see the
+[compatibility policy](docs/notes/compatibility.md). It is intended for
+observation-only rollout.
