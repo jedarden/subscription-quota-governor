@@ -577,6 +577,8 @@ mod tests {
     fn host(observer: WorkerObserverConfig, actuator: ActuatorConfig) -> HostConfig {
         HostConfig {
             max_workers: None,
+            max_scale_up_per_cycle: None,
+            max_scale_down_per_cycle: None,
             resource_reserve: None,
             resource_source: None,
             observer,

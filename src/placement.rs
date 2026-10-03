@@ -63,6 +63,7 @@ pub fn place(
 
     let mut current_of = BTreeMap::new();
     let mut ceiling_of = BTreeMap::new();
+    let mut step_limits_of = BTreeMap::new();
     let mut headroom_of = BTreeMap::new();
     let mut fresh_of = BTreeMap::new();
 
@@ -71,6 +72,15 @@ pub fn place(
         ceiling_of.insert(
             host_id.as_str(),
             host.max_workers.unwrap_or(config.fleet.max_workers),
+        );
+        step_limits_of.insert(
+            host_id.as_str(),
+            (
+                host.max_scale_up_per_cycle
+                    .unwrap_or(config.fleet.max_scale_up_per_cycle),
+                host.max_scale_down_per_cycle
+                    .unwrap_or(config.fleet.max_scale_down_per_cycle),
+            ),
         );
         let (fresh, headroom) = match &host.resource_source {
             // §22.2: a host with no resource_source is unconstrained --
@@ -121,8 +131,8 @@ pub fn place(
                     target,
                     current,
                     ceiling_of[id],
-                    config.fleet.max_scale_up_per_cycle,
-                    config.fleet.max_scale_down_per_cycle,
+                    step_limits_of[id].0,
+                    step_limits_of[id].1,
                 ),
             );
         }
@@ -160,8 +170,8 @@ pub fn place(
                 raw_target[id],
                 cur,
                 ceiling,
-                config.fleet.max_scale_up_per_cycle,
-                config.fleet.max_scale_down_per_cycle,
+                step_limits_of[id].0,
+                step_limits_of[id].1,
             );
             HostPlacement {
                 host_id: host_id.clone(),
@@ -304,6 +314,8 @@ mod tests {
     ) -> HostConfig {
         HostConfig {
             max_workers,
+            max_scale_up_per_cycle: None,
+            max_scale_down_per_cycle: None,
             resource_reserve,
             resource_source,
             observer: WorkerObserverConfig::Static { workers: 0 },
@@ -583,6 +595,33 @@ mod tests {
         current.insert("solo".to_string(), 0u32);
         let placements = place("acct", 20, &config, &current, &BTreeMap::new(), now).unwrap();
         assert_eq!(find(&placements, "solo").target, 2);
+    }
+
+    #[test]
+    fn host_step_limits_override_account_limits_independently() {
+        let mut constrained_up = unconstrained_host(Some(20));
+        constrained_up.max_scale_up_per_cycle = Some(1);
+        let mut constrained_down = unconstrained_host(Some(20));
+        constrained_down.max_scale_down_per_cycle = Some(1);
+        let mut hosts = BTreeMap::new();
+        hosts.insert("up".to_string(), constrained_up);
+        hosts.insert("down".to_string(), constrained_down);
+        let config = account(hosts, 20, 4, 3);
+        let now = Utc::now();
+
+        let mut current = BTreeMap::new();
+        current.insert("up".to_string(), 0);
+        current.insert("down".to_string(), 9);
+        let growing = place("acct", 10, &config, &current, &BTreeMap::new(), now).unwrap();
+        assert_eq!(find(&growing, "up").target, 1);
+        assert_eq!(find(&growing, "down").target, 8);
+
+        current.insert("up".to_string(), 4);
+        current.insert("down".to_string(), 4);
+        let shrinking = place("acct", 0, &config, &current, &BTreeMap::new(), now).unwrap();
+        // up has no host scale-down override and inherits the account's 3.
+        assert_eq!(find(&shrinking, "up").target, 1);
+        assert_eq!(find(&shrinking, "down").target, 3);
     }
 
     /// The pure function is deterministic given identical inputs.

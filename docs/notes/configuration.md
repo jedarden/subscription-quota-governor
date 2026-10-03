@@ -142,6 +142,26 @@ ignores entries older than `stale_after_seconds`. A missing heartbeat directory
 means zero workers; malformed matching heartbeats fail the observation so an
 invalid count cannot drive scaling.
 
+For a multi-host account, each entry under `fleet.hosts` can set
+`max_scale_up_per_cycle` and/or `max_scale_down_per_cycle` to override the
+account's corresponding fleet limit for that host. The fields are independent:
+an omitted host value inherits the account value, and zero prevents movement in
+that direction on that host.
+
+```yaml
+fleet:
+  max_workers: 12
+  max_scale_up_per_cycle: 2
+  max_scale_down_per_cycle: 3
+  hosts:
+    fast-host:
+      max_scale_up_per_cycle: 4
+      observer: { type: static, workers: 0 }
+    cautious-host:
+      max_scale_down_per_cycle: 1
+      observer: { type: static, workers: 0 }
+```
+
 The actuator accepts `none`, `target_file`, `command`, and `needle_run`. Target
 files are atomic handoffs to an external reconciler. Command argv is executed
 directly, with every `{desired_workers}` occurrence replaced. Shell expansion,

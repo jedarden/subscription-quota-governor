@@ -259,9 +259,11 @@
       "type": "object",
       "required": ["observer"],
       "additionalProperties": false,
-      "description": "HostConfig (plan.md §22.3). max_workers <= the account's fleet.max_workers, and resource_reserve is required whenever resource_source is set, both enforced by validate_host() and not expressible here.",
+      "description": "HostConfig (plan.md §22.3/§22.7). max_workers <= the account's fleet.max_workers, and resource_reserve is required whenever resource_source is set, both enforced by validate_host() and not expressible here. Per-host scale limits override the account's corresponding limit independently when present.",
       "properties": {
         "max_workers": { "type": "integer", "minimum": 0 },
+        "max_scale_up_per_cycle": { "type": "integer", "minimum": 0, "description": "Overrides fleet.max_scale_up_per_cycle for this host; absent inherits the account value." },
+        "max_scale_down_per_cycle": { "type": "integer", "minimum": 0, "description": "Overrides fleet.max_scale_down_per_cycle for this host; absent inherits the account value." },
         "resource_reserve": { "$ref": "#/$defs/resourceReserve" },
         "resource_source": { "$ref": "#/$defs/resourceSource" },
         "observer": { "$ref": "#/$defs/observer" },

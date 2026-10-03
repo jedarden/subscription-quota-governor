@@ -96,6 +96,12 @@ pub struct HostConfig {
     /// never exceed it.
     #[serde(default)]
     pub max_workers: Option<u32>,
+    /// Defaults to the account's `max_scale_up_per_cycle` when absent.
+    #[serde(default)]
+    pub max_scale_up_per_cycle: Option<u32>,
+    /// Defaults to the account's `max_scale_down_per_cycle` when absent.
+    #[serde(default)]
+    pub max_scale_down_per_cycle: Option<u32>,
     /// Required whenever `resource_source` is set (§22.3: "there is no safe
     /// default reserve").
     #[serde(default)]
@@ -842,6 +848,31 @@ hosts:
         let hosts = fleet.hosts.as_ref().unwrap();
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts["codinghome"].max_workers, Some(6));
+        assert_eq!(hosts["codinghome"].max_scale_up_per_cycle, None);
+        assert_eq!(hosts["codinghome"].max_scale_down_per_cycle, None);
+    }
+
+    #[test]
+    fn host_step_limits_parse_independently_and_allow_zero() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 8
+max_scale_up_per_cycle: 4
+max_scale_down_per_cycle: 5
+hosts:
+  codinghome:
+    max_scale_up_per_cycle: 0
+    observer: { type: static, workers: 1 }
+  lab:
+    max_scale_down_per_cycle: 2
+    observer: { type: static, workers: 1 }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let hosts = config.accounts["acct"].fleet.hosts.as_ref().unwrap();
+        assert_eq!(hosts["codinghome"].max_scale_up_per_cycle, Some(0));
+        assert_eq!(hosts["codinghome"].max_scale_down_per_cycle, None);
+        assert_eq!(hosts["lab"].max_scale_up_per_cycle, None);
+        assert_eq!(hosts["lab"].max_scale_down_per_cycle, Some(2));
     }
 
     #[test]

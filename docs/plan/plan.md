@@ -1081,9 +1081,9 @@ flowchart LR
 
 `placement` is a pure function of: the controller's account total, the set of
 configured hosts, each host's latest resource snapshot, each host's current
-observed worker count, and each host's `max_workers`/`resource_reserve`. It
-performs no I/O, exactly like `controller` (§9's opening constraint extends
-here verbatim).
+observed worker count, each host's `max_workers` and step limits, and each
+host's `resource_reserve`. It performs no I/O, exactly like `controller`
+(§9's opening constraint extends here verbatim).
 
 ### 22.7 Placement algorithm
 
@@ -1118,9 +1118,9 @@ else:
 
     target[h] = clamped[h]
 
-# Per-cycle step limits (§9.6) apply per host using the account's
-# max_scale_up_per_cycle / max_scale_down_per_cycle unless a host overrides
-# them explicitly (host-level override deferred — §22.7 future hardening).
+# Per-cycle step limits (§9.6) apply per host. Each host's
+# max_scale_up_per_cycle / max_scale_down_per_cycle overrides the corresponding
+# account limit independently when present; an absent host value inherits it.
 ```
 
 Invariants, mirroring §9.6/§17.2's property-test style:
@@ -1140,7 +1140,6 @@ Future placement hardening (parity with §9.8, not blocking v1.1):
   once v1.1 ships and real placement traces exist; like §9.8's evidence-gated
   bullets, there is nothing to build against yet, so this is plan text, not
   a bead, until those traces exist.
-- [ ] Per-host step-limit overrides.
 - [ ] Bounded placement history for oscillation detection, parity with §9.8's
   bursty/idle trace simulation.
 
