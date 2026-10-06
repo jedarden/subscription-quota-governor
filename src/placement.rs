@@ -232,6 +232,17 @@ fn apply_step_limit(desired: u32, current: u32, ceiling: u32, max_up: u32, max_d
     stepped.min(ceiling)
 }
 
+fn headroom_weights<'a>(
+    eligible: &[&'a str],
+    headroom_of: &BTreeMap<&'a str, f64>,
+) -> BTreeMap<&'a str, f64> {
+    let total_headroom: f64 = eligible.iter().map(|id| headroom_of[id]).sum();
+    eligible
+        .iter()
+        .map(|&id| (id, headroom_of[id] / total_headroom))
+        .collect()
+}
+
 fn distribute<'a>(
     account_target: u32,
     eligible: &[&'a str],
@@ -239,11 +250,11 @@ fn distribute<'a>(
     ceiling_of: &BTreeMap<&'a str, u32>,
     all_hosts: &[&'a str],
 ) -> BTreeMap<&'a str, u32> {
-    let total_headroom: f64 = eligible.iter().map(|id| headroom_of[id]).sum();
+    let weights = headroom_weights(eligible, headroom_of);
     let mut clamped: BTreeMap<&str, u32> = BTreeMap::new();
     for &id in all_hosts {
         if eligible.contains(&id) {
-            let weight = headroom_of[id] / total_headroom;
+            let weight = weights[id];
             // Deliberately floor (not round-half-up) each host's raw share.
             // Rounding half up can push the *sum* of independently-rounded
             // shares above account_target (e.g. two hosts at weight 0.5
@@ -805,55 +816,38 @@ mod tests {
                 prop_assert!(total <= account_target, "placed {total} workers for target {account_target}");
             }
 
-            /// A host's reported headroom comes only from its own resource
-            /// snapshot. Marking a different host stale can change eligibility
-            /// and distribution, but cannot inflate this host's own headroom.
+            /// plan.md WP10: disabling one host never raises another host's
+            /// headroom-derived weight beyond its own renormalized share. The
+            /// disabled host leaves the denominator and nothing else changes:
+            /// each remaining weight is its own headroom over the remaining
+            /// total, and every remaining weight grows by the same factor.
             #[test]
-            fn disabling_one_host_does_not_inflate_other_hosts_headroom(
-                specs in prop::collection::vec(
-                    (0.01f64..=1.0, 1u64..4096, 1u64..4096),
-                    2..6,
-                ),
+            fn disabling_one_host_only_renormalizes_remaining_weights(
+                headrooms in prop::collection::vec(0.001f64..=1.0, 2..7),
                 disabled_seed in any::<usize>(),
             ) {
-                let now = Utc::now();
-                let disabled_index = disabled_seed % specs.len();
-                let mut hosts = BTreeMap::new();
-                let mut resources = BTreeMap::new();
-                for (index, (cpu, mem_available, mem_total)) in specs.iter().enumerate() {
-                    let id = format!("h{index}");
-                    hosts.insert(id.clone(), resource_host(Some(100), 0));
-                    resources.insert(
-                        id.clone(),
-                        snapshot(now, &id, true, *cpu, (*mem_available).min(*mem_total), *mem_total),
-                    );
-                }
-                let config = account(hosts, 100, 100, 100);
-                let before = place(
-                    "acct",
-                    20,
-                    &config,
-                    &BTreeMap::new(),
-                    &resources,
-                    now,
-                ).unwrap();
-                resources.get_mut(&format!("h{disabled_index}")).unwrap().fresh = false;
-                let after = place(
-                    "acct",
-                    20,
-                    &config,
-                    &BTreeMap::new(),
-                    &resources,
-                    now,
-                ).unwrap();
+                let ids: Vec<String> = (0..headrooms.len()).map(|i| format!("h{i}")).collect();
+                let all: Vec<&str> = ids.iter().map(String::as_str).collect();
+                let headroom_of: BTreeMap<&str, f64> =
+                    all.iter().copied().zip(headrooms.iter().copied()).collect();
+                let disabled = all[disabled_seed % all.len()];
+                let remaining: Vec<&str> =
+                    all.iter().copied().filter(|id| *id != disabled).collect();
 
-                for index in 0..specs.len() {
-                    if index == disabled_index {
-                        continue;
-                    }
-                    let id = format!("h{index}");
-                    prop_assert_eq!(find(&before, &id).headroom, find(&after, &id).headroom);
-                    prop_assert!(find(&after, &id).eligible);
+                let before = headroom_weights(&all, &headroom_of);
+                let after = headroom_weights(&remaining, &headroom_of);
+                let total_before: f64 = all.iter().map(|id| headroom_of[id]).sum();
+                let total_after: f64 = remaining.iter().map(|id| headroom_of[id]).sum();
+
+                prop_assert!(!after.contains_key(disabled));
+                let total: f64 = after.values().sum();
+                prop_assert!((total - 1.0).abs() < 1e-9);
+                for id in &remaining {
+                    prop_assert!((after[id] - headroom_of[id] / total_after).abs() < 1e-9);
+                    prop_assert!(
+                        (after[id] - before[id] * total_before / total_after).abs() < 1e-9
+                    );
+                    prop_assert!(after[id] <= 1.0 + 1e-9);
                 }
             }
 
