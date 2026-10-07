@@ -388,3 +388,77 @@ journalctl --user -u claude-governor.service --since "24 hours ago" -p warning (
 systemctl --user is-active needle-zai-governor.service needle-zai-governor.timer (inactive, inactive)
 ~/claude-governor/src/poller.rs, src/governor.rs inspected directly for weekly_all usage (read-only, no credentials)
 ```
+
+### Cutover executed and a real post-cutover incident — 2026-10-07
+
+The comparison phase above ran live for ~3.5 hours (2026-10-07T17:42Z–21:13Z),
+spanning a real `five_hour` reset and a real cgov `scale UP: 0 -> 1` event
+that subgov independently corroborated via its own `needle_status` observer
+at the same timestamp. `weekly_all` and `seven_day` never diverged across the
+whole window (checked programmatically against every decision event).
+`desired_workers` never oscillated. On that evidence, cgov was cut over:
+`claude-governor-stop-watch.timer` stopped first, then
+`claude-governor.service` disabled and stopped (verified via
+`systemctl --user is-active` and `ps -p <daemon-pid>`); the preflight ran
+clean against the real live state at each stage (parallel-observe: 1
+actuating owner; the moment both were non-actuating: 0 owners, a safe gap);
+subgov's `--observe-only` drop was removed from its `ExecStart` and it began
+actuating.
+
+**A real deployment bug surfaced on the first actual scale attempt, not
+before.** `fleet::actuate_config` short-circuits to a no-op whenever
+`desired == observed`, so the first two post-cutover cycles never actually
+invoked the `needle_run` actuator at all. When a heartbeat read glitch
+dropped `current_workers` to 0, the resulting real scale-up attempt failed:
+`failed to execute needle: No such file or directory`. The systemd `--user`
+manager's own default `PATH`
+(`/run/wrappers/bin:...:/run/current-system/sw/bin`) does not include
+`~/.local/bin`, where `needle` actually lives, and `ActuatorConfig::NeedleRun`
+has no field to give it an absolute path instead — it always invokes the bare
+`needle`/`tmux` names. **Any `--user`-scope subgov unit that uses
+`needle_run` needs an explicit `Environment=PATH=...` line prepending
+wherever `needle` is installed** — a hardened unit copied from
+`deploy/systemd/subgov.service` without this will look fine until the first
+real scale change. Fixed, and verified directly (not just by re-running the
+daemon): `subgov doctor` → `needle_adapter_parity: pass`, and
+`env PATH=<fixed> needle test-agent claude-print` → `READY`.
+
+**A second, separate problem followed and was not a subgov bug.** After the
+PATH fix, three consecutive real cycles still failed:
+`NEEDLE adapter claude-print is not ready (test-agent status: WARNING)`. The
+actual worker was confirmed genuinely gone (no tmux session, no heartbeat
+file, no process — checked directly, not inferred from a stale read). At the
+same time, system load averaged ~18 and `needle status` itself hung for 3+
+minutes in a blocked, non-CPU-bound state — contention inside NEEDLE itself,
+not anything specific to this adapter. This is not a regression from the
+migration: cgov's own logs from earlier the same day, before cutover, already
+showed the identical symptom (`0 heartbeats, 1 tmux sessions,
+consistent=false`, `no workers available to stop`) for this exact pool.
+Rolling back to cgov would not fix it — cgov would hit the same NEEDLE
+contention relaunching a worker.
+
+subgov's behavior through this was correct: every failed cycle failed
+closed (`actuation_succeeded: false`, no mutation attempted beyond the
+failed readiness check), never guessed, never force-launched, and never
+produced a duplicate worker (checked directly). The decision was to leave
+subgov live rather than revert: the migration's actual objective — cgov
+retired, subgov the sole live governor, behaving safely under an adverse
+condition it did not cause — was achieved, and this pool's exposure while
+unstaffed is low (`min_workers: 0`, a subscription-spend pool with no
+deadline-critical work, already flaky under cgov before cutover). subgov
+retries on its normal 5-minute cadence without intervention; expect recovery
+once system load eases.
+
+```text
+systemctl --user stop claude-governor-stop-watch.timer
+systemctl --user disable --now claude-governor.service  -> inactive; daemon PID confirmed gone
+subgov preflight (cgov disabled, subgov observe-only)   -> PASS, 0 actuation-capable owners
+# ExecStart edited to drop --observe-only; daemon-reload; restart
+systemctl --user show --property=ExecStart --value subgov.service  -> no --observe-only present
+First actuating cycle: actuation_attempted=true, actuation_succeeded=true (no-op, already at target)
+Failure: "failed to execute needle: No such file or directory" -> Environment=PATH=... added
+subgov doctor -> needle_adapter_parity: pass
+env PATH=<fixed> needle test-agent claude-print -> Status: READY, exit 0
+Three subsequent real cycles -> actuation_succeeded=false, "test-agent status: WARNING", worker confirmed absent
+needle status -> hung 3+ min, blocked state; load average ~18; consistent with cgov's own pre-cutover symptom for this pool
+```
