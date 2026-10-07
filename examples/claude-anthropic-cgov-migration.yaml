@@ -1,0 +1,100 @@
+# Migration candidate config: replaces claude-governor (cgov)'s needle-sonnet
+# pool for the anthropic:local-subscription account. NOT yet deployed --
+# see docs/notes/migration-claude-governor-to-subgov.md for the staged
+# rollout plan, the cgov-vs-subgov model differences this config cannot
+# paper over, and the preflight evidence proving this is a safe single-owner
+# target state before any actuator is enabled.
+#
+# Mirrors the live tuning in ~/.config/claude-governor/governor.yaml's
+# needle-sonnet pool as closely as subgov's model allows (read 2026-10-07):
+#   - launch_cmd targets --agent claude-print --workspace /home/coding/pose-detection
+#   - session_pattern: needle-claude-print-cgov-sonnet-*
+#   - min_workers: 0, max_workers: 1
+#   - windows: [five_hour, seven_day] only -- weekly_scoped is deliberately
+#     excluded (it is scoped to a different model, Fable, not this pool)
+#   - target_ceiling 90.0 overridden to 0.85 on five_hour/seven_day (15% reserve)
+#   - loop_interval_secs: 300, max_scale_up/down_per_cycle: 1
+
+version: 1
+poll_interval_seconds: 300
+state_path: ~/.local/state/subscription-governor/claude-anthropic.json
+
+accounts:
+  claude-anthropic:
+    source:
+      type: anthropic_oauth
+      credentials_path: ~/.claude/.credentials.json
+      timeout_seconds: 15
+    fleet:
+      min_workers: 0
+      max_workers: 1
+      # cgov has no bootstrap_workers equivalent; it instead assumes a
+      # baseline_burn_rate (0.15 %/worker/hr) to compute an initial
+      # safe_worker_count from zero measured samples. subgov's controller has
+      # no concept of an assumed rate -- LinearToReset's "bootstrap_burn_rate"
+      # path just starts at this fixed count when current_workers == 0. With
+      # max_workers capped at 1 the two mechanisms converge on the same
+      # outcome here (start at 1, then let real measurement take over), but
+      # they arrive at it differently; see the runbook's "model differences"
+      # section.
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 1
+      observer:
+        type: needle_status
+        agent: claude-print
+        heartbeat_dir: ~/.needle/state/heartbeats
+        stale_after_seconds: 60
+      actuator:
+        type: needle_run
+        repo: /home/coding/pose-detection
+        adapter: claude-print
+    utilization:
+      # 85% ceiling / 15% reserve on five_hour and seven_day, matching cgov's
+      # daemon.windows overrides exactly.
+      reserve_fraction: 0.15
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      # Two 300s cycles must elapse before a learned rate is trusted (a loop
+      # interval short of 300s is treated as "no real delta yet").
+      minimum_sample_seconds: 240
+      windows:
+        five_hour:
+          reserve_fraction: 0.15
+        seven_day:
+          reserve_fraction: 0.15
+        # cgov's needle-sonnet pool explicitly does not consume weekly_scoped
+        # (scoped to the Fable model, not this pool's claude-print/Sonnet
+        # workers) -- disabling it here is the direct subgov equivalent of
+        # cgov's windows: [five_hour, seven_day] allow-list. Kept even though
+        # a live snapshot on 2026-10-07 did not show this window at all
+        # (see weekly_all below) -- claude-governor's own source confirms it
+        # appears intermittently, scoped to whichever model currently carries
+        # the per-model weekly cap.
+        weekly_scoped:
+          enabled: false
+        # NOT excluded, deliberately: a live snapshot on 2026-10-07 returned
+        # a THIRD window, "weekly_all", that neither this file's first draft
+        # nor claude-governor's own config vocabulary anticipated. Checked
+        # claude-governor's source directly (~/claude-governor/src/poller.rs,
+        # src/governor.rs): it parses limits[].kind=="weekly_all" into
+        # UsageLimit but never reads it in any pacing/scaling decision --
+        # only legacy five_hour/seven_day and limits[].kind=="weekly_scoped"
+        # feed governor.rs. So cgov has silently never considered this window
+        # at all, for however long the API has been reporting it.
+        #
+        # The live snapshot showed weekly_all at used_fraction 0.08 with the
+        # SAME resets_at as seven_day (0.08 that cycle too) -- strong
+        # circumstantial evidence weekly_all is the provider's generalized-
+        # schema restatement of the same 7-day limit poller.rs's own comment
+        # describes ("the generalized shape that will eventually replace the
+        # legacy top-level seven_day/five_hour/weekly_scoped fields"), not a
+        # materially distinct constraint. Left enabled at the account default
+        # (not excluded) on purpose: plan.md §6.3 says a new provider window
+        # must not be silently ignored, and if the hypothesis above is right,
+        # a duplicate binding window at an identical value changes nothing
+        # (controller::evaluate takes the minimum across windows). If it ever
+        # diverges from seven_day during the observe-only comparison phase,
+        # that is new information and a real decision, not something to
+        # silently special-case here.

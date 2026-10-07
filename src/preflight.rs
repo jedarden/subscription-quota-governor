@@ -255,6 +255,39 @@ mod tests {
         assert_eq!(inventory.controllers[0].mode, Mode::Unknown);
     }
 
+    /// claude-governor (cgov) still actuating, subgov running observe-only
+    /// on the same account/fleet during the comparison phase: observe_only
+    /// is never counted as an actuator, so this must not conflict.
+    #[test]
+    fn cgov_subgov_parallel_observe_only_has_no_conflict() {
+        let inventory = fixture("claude-anthropic-migration-parallel-observe.json");
+        let report = inventory.check();
+        assert_eq!(report.actuating_count, 1);
+        assert_eq!(report.conflicts.len(), 0);
+    }
+
+    /// The intended post-cutover state: cgov disabled, subgov actuating the
+    /// same account/fleet it takes over.
+    #[test]
+    fn cgov_disabled_subgov_actuating_is_a_clean_single_owner() {
+        let inventory = fixture("claude-anthropic-migration-cutover-target.json");
+        let report = inventory.check();
+        assert_eq!(report.actuating_count, 1);
+        assert_eq!(report.conflicts.len(), 0);
+    }
+
+    /// The specific mistake the migration must not make: enabling subgov's
+    /// actuator before cgov is stopped. Proves the preflight actually
+    /// catches this, not just that it passes the clean cases.
+    #[test]
+    fn enabling_subgov_before_stopping_cgov_conflicts() {
+        let inventory = fixture("claude-anthropic-migration-premature-dual-actuation.json");
+        let report = inventory.check();
+        assert_eq!(report.conflicts.len(), 1);
+        assert!(report.conflicts[0].shared_account);
+        assert!(report.conflicts[0].shared_fleet);
+    }
+
     #[test]
     fn account_and_fleet_ids_reject_whitespace_aliases() {
         let raw = r#"{

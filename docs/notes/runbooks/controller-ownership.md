@@ -217,3 +217,174 @@ cargo run --quiet --bin subgov -- preflight --inventory tests/fixtures/controlle
 cargo run --quiet --bin subgov -- preflight --inventory tests/fixtures/controller-ownership/two-host-shared-account.json exit=2 (expected conflict)
 cargo run --quiet --bin subgov -- preflight --inventory tests/fixtures/controller-ownership/same-fleet-different-account.json exit=2 (expected conflict)
 ```
+
+## Second migration: claude-governor (cgov) → subgov — 2026-10-07
+
+The Codex-side work above left one gap this bead's own acceptance criteria
+names: "record the intended single owner and a reversible handoff for the
+first account." The first account inventoried here was Codex; cgov's
+Anthropic pool was inventoried but never given its own target state, config,
+or handoff procedure. This section closes that gap for `anthropic:local-
+subscription`. **Nothing below was executed against live service state.** The
+only commands run were read-only inspection, `subgov check`, and
+`subgov run --once --observe-only` (which, per its own contract, cannot
+actuate).
+
+### Re-verified live state (2026-10-07, 4 days after the table above)
+
+`claude-governor.service` is still the sole actuating owner: active 4 days
+(`systemctl --user show`), cycling every 300s, zero warnings/errors in the
+last 24h, with a stop-watch timer that has not had to intervene. It is
+currently running exactly one real worker:
+
+- tmux session `needle-claude-print-cgov-sonnet-20261007124012-0`
+- process `needle-stable run --workspace /home/coding/pose-detection --agent
+  claude-print --count 1 --identifier cgov-sonnet-20261007124012-0`
+- heartbeat `~/.needle/state/heartbeats/claude-print-cgov-sonnet-20261007124012-0.json`
+
+`needle-zai-governor.service`/`.timer` and the GLM quota controller are both
+still inactive/disabled, unchanged from the table above.
+
+cgov's live pool config (`~/.config/claude-governor/governor.yaml`, pool
+`needle-sonnet`): `min_workers: 0`, `max_workers: 1`, windows restricted to
+`[five_hour, seven_day]` (weekly_scoped deliberately excluded — it is scoped
+to the Fable model, which this pool never runs), both windows at an 85%
+ceiling, `loop_interval_secs: 300`, `max_scale_up/down_per_cycle: 1`, and a
+hand-tuned `baseline_burn_rate: 0.15 %/worker/hr` for cold start. The config
+carries several incident-driven fixes (`claudego-ec6d3ae3` window affinity,
+`claudego-d64682d5` hysteresis one-way bug, a NEEDLE core-count-detection
+workaround) — this is mature, battle-tested tuning, not a toy config.
+
+### A concrete finding only a live run surfaced
+
+`subgov snapshot claude-anthropic` against the real account (2026-10-07) and
+`subgov run --once --observe-only` both returned **three** windows:
+`five_hour` (0.02–0.03), `seven_day` (0.08), and **`weekly_all`** (0.08) —
+not `weekly_scoped`, which wasn't present in this poll at all. Checked
+`~/claude-governor/src/poller.rs` and `src/governor.rs` directly: cgov parses
+`limits[].kind == "weekly_all"` into its generic struct but **never reads it
+in any pacing decision** — only the legacy `five_hour`/`seven_day` fields and
+`limits[].kind == "weekly_scoped"` feed `governor.rs`. cgov has been running
+for 4 days with a window its own API is reporting structurally invisible to
+it. `weekly_all` matched `seven_day`'s value and `resets_at` exactly in this
+poll, which is strong circumstantial evidence it is the provider's
+generalized-schema restatement of the same 7-day limit (poller.rs's own
+comment: the generalized `limits[]` shape "will eventually replace the legacy
+top-level ... fields"), not a materially distinct cap — but that is a
+hypothesis from one observation, not a proven fact. The migration config
+below leaves `weekly_all` enabled at the account default (binding) rather
+than excluding it, since excluding a real constraint is the dangerous
+direction and a duplicate binding window at an identical value changes no
+decision (`controller::evaluate` takes the minimum across windows). Watch for
+divergence between `weekly_all` and `seven_day` during the observe-only
+comparison phase below; if they ever disagree, that is new information
+requiring an explicit decision, not something to special-case silently.
+
+### Target config
+
+[`examples/claude-anthropic-cgov-migration.yaml`](../../../examples/claude-anthropic-cgov-migration.yaml)
+mirrors cgov's live tuning: `needle_status`/`needle_run` against the real
+`claude-print` adapter and `/home/coding/pose-detection` workspace,
+`max_workers: 1`, 15% reserve on `five_hour`/`seven_day`, `weekly_scoped`
+excluded (kept even though not currently present, since cgov's own source
+confirms it appears intermittently). Validated:
+
+```text
+subgov --config examples/claude-anthropic-cgov-migration.yaml check
+  -> configuration is valid (1 accounts)
+subgov --config examples/claude-anthropic-cgov-migration.yaml snapshot claude-anthropic
+  -> real snapshot, 3 windows, fresh=true
+subgov --config examples/claude-anthropic-cgov-migration.yaml run --once --observe-only
+  -> current_workers=1 (needle_status correctly found the real heartbeat above),
+     desired_workers=1, actuated=false, actuation_attempted=false
+```
+
+### Model differences this config cannot paper over
+
+- **Cold start.** cgov assumes a hand-tuned `baseline_burn_rate` to compute a
+  safe worker count from zero samples. subgov's `LinearToReset` instead starts
+  at a fixed `bootstrap_workers` when `current_workers == 0`. With
+  `max_workers: 1` both converge on "start at 1, then measure," but they get
+  there by different reasoning — worth knowing if either pool is ever raised
+  above 1 worker.
+- **No hysteresis.** cgov has an explicit `hysteresis_band` specifically
+  because flapping a worker on/off was a real observed problem
+  (`claudego-d64682d5`). subgov has no hysteresis or dwell-time damping —
+  plan.md §9.8/§21 both list it as explicitly deferred. The only damping is
+  the step limit (`max_scale_up/down_per_cycle: 1`), which bounds the *rate*
+  of oscillation but not its *frequency*. Watch specifically for flapping
+  during the observe-only comparison phase; if it appears, treat it as a
+  blocker for enabling this actuator, not a cosmetic issue.
+- **NEEDLE launch workaround not replicated.** cgov's `launch_cmd` sets
+  `NEEDLE_SKIP_LAUNCH_RESOURCE_CHECK=1` to work around a specific observed bug
+  (NEEDLE's CPU admission gate reporting 1 core instead of the host's real
+  count, refusing launches it shouldn't). subgov's `needle_run` actuator
+  spawns `needle run`/`needle stop` directly with no environment override and
+  no way to add one (`ActuatorConfig::NeedleRun` takes only `repo`/`adapter`).
+  **Unverified whether this bug is still present.** If it is, subgov's
+  actuator could see spurious launch refusals cgov no longer has. Check
+  NEEDLE's current behavior before enabling actuation; if the bug persists,
+  this needs a small subgov change (an env-passthrough field on the
+  `needle_run` actuator) before cutover, not a workaround bolted on
+  elsewhere.
+
+### Preflight evidence for three migration stages
+
+Three fixtures model the stages of this specific migration (not the Codex
+ones above, which this migration does not touch):
+
+```text
+subgov preflight --inventory tests/fixtures/controller-ownership/claude-anthropic-migration-parallel-observe.json
+  -> PASS: 3 controller records, 1 actuation-capable owner(s); no account or fleet overlap.
+     (cgov still actuating; subgov observe_only -- not counted as an actuator)
+subgov preflight --inventory tests/fixtures/controller-ownership/claude-anthropic-migration-cutover-target.json
+  -> PASS: 3 controller records, 1 actuation-capable owner(s); no account or fleet overlap.
+     (cgov disabled; subgov actuating -- the intended post-cutover state)
+subgov preflight --inventory tests/fixtures/controller-ownership/claude-anthropic-migration-premature-dual-actuation.json
+  -> CONFLICT: inventory records 1 and 2 both actuate the same account and fleet; exit 2
+     (the specific mistake this migration must not make -- proves the gate actually catches it)
+```
+
+### Staged procedure (mirrors the Codex handoff pattern above; nothing below has been executed)
+
+1. Install subgov as a user systemd service
+   ([deploy/systemd/subgov.service](../../../deploy/systemd/subgov.service)
+   adapted for `--user`, `~/.local/bin/subgov`,
+   `~/.config/subgov/claude-anthropic.yaml`) with
+   `ExecStart=... run --observe-only` from the start — do not let its first
+   start be actuating. Re-run the parallel-observe preflight fixture against
+   the real installed paths.
+2. Let it run in parallel with cgov (unchanged, still actuating) for long
+   enough to span a real usage delta on `five_hour` and at least one `cgov`
+   scale decision — the single `--once` run above only proved the wiring
+   works, not that the two controllers agree. Compare each cycle's
+   `desired_workers`/reason against cgov's own `journalctl --user -u
+   claude-governor.service` decisions for the same window. Specifically
+   check: do `weekly_all` and `seven_day` ever diverge? Does subgov flap
+   without cgov's hysteresis?
+3. Only once decisions correlate and no flapping is observed: stop
+   `claude-governor-stop-watch.timer` first (or it will restart cgov), then
+   `systemctl --user disable --now claude-governor.service`. Re-run the
+   cutover-target preflight fixture against live state to confirm cgov now
+   reads `disabled`/inactive. Then remove subgov's `--observe-only` drop-in
+   (or redeploy its unit without the flag) so it begins actuating.
+4. Rollback at any point: `scripts/rollback.sh --user previous
+   claude-governor.service subgov.service` — it stops cgov's activation
+   units, forces subgov into verified observe-only, and only then re-enables
+   `claude-governor.service`, so there is never a window with both actuating.
+
+### Recorded command results
+
+```text
+cargo build --release exit=0
+subgov --config examples/claude-anthropic-cgov-migration.yaml check exit=0
+subgov --config examples/claude-anthropic-cgov-migration.yaml snapshot claude-anthropic exit=0 (real live snapshot)
+subgov --config examples/claude-anthropic-cgov-migration.yaml run --once --observe-only exit=0 (actuated=false)
+subgov preflight --inventory tests/fixtures/controller-ownership/claude-anthropic-migration-parallel-observe.json exit=0
+subgov preflight --inventory tests/fixtures/controller-ownership/claude-anthropic-migration-cutover-target.json exit=0
+subgov preflight --inventory tests/fixtures/controller-ownership/claude-anthropic-migration-premature-dual-actuation.json exit=2 (expected conflict)
+systemctl --user show claude-governor.service (active, 4 days uptime)
+journalctl --user -u claude-governor.service --since "24 hours ago" -p warning (empty -- no errors/warnings)
+systemctl --user is-active needle-zai-governor.service needle-zai-governor.timer (inactive, inactive)
+~/claude-governor/src/poller.rs, src/governor.rs inspected directly for weekly_all usage (read-only, no credentials)
+```

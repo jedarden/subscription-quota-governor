@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "observed_at": "fixture: intended post-cutover state, not yet live",
+  "controllers": [
+    {
+      "name": "cgov-codinghome-needle-sonnet",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=claude-print",
+      "mode": "disabled",
+      "config_path": "/home/coding/.config/claude-governor/governor.yaml",
+      "state_path": "/home/coding/.config/claude-governor/governor-state.json",
+      "actuator": "claude-governor.service stopped and disabled by the cutover step",
+      "evidence": "Target state: claude-governor-stop-watch.timer must also be stopped first, or it will restart claude-governor.service."
+    },
+    {
+      "name": "subgov-codinghome-claude-anthropic",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=claude-print",
+      "mode": "actuating",
+      "config_path": "/home/coding/subscription-quota-governor/examples/claude-anthropic-cgov-migration.yaml",
+      "state_path": "/home/coding/.local/state/subscription-governor/claude-anthropic.json",
+      "actuator": "subgov.service needle_run actuator (needle run -w /home/coding/pose-detection -a claude-print)",
+      "evidence": "Target state: subgov.service installed, observe-only validated, then actuator enabled by removing the rollback.sh drop-in."
+    },
+    {
+      "name": "needle-glm-quota-controller-codinghome",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:glm-5.3-flash:local-base+lab-elastic",
+      "mode": "disabled",
+      "config_path": "/home/coding/bin/needle-glm-quota-controller",
+      "state_path": "/home/coding/.local/state/needle-glm-quota-controller/state.json",
+      "actuator": "systemd user units on codinghome and lab",
+      "evidence": "Unchanged disabled control loop; this migration does not touch it."
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "observed_at": "2026-10-07",
+  "controllers": [
+    {
+      "name": "cgov-codinghome-needle-sonnet",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=claude-print",
+      "mode": "actuating",
+      "config_path": "/home/coding/.config/claude-governor/governor.yaml",
+      "state_path": "/home/coding/.config/claude-governor/governor-state.json",
+      "actuator": "cgov daemon worker launch path for needle-sonnet (needle run --agent claude-print)",
+      "evidence": "Active claude-governor.service, 4 days uptime; re-verified 2026-10-07."
+    },
+    {
+      "name": "subgov-codinghome-claude-anthropic",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=claude-print",
+      "mode": "observe_only",
+      "config_path": "/home/coding/subscription-quota-governor/examples/claude-anthropic-cgov-migration.yaml",
+      "state_path": "/home/coding/.local/state/subscription-governor/claude-anthropic.json",
+      "actuator": null,
+      "evidence": "subgov run --once --observe-only executed 2026-10-07T16:31:45Z; actuated=false, actuation_attempted=false. Not installed as a service yet; ad hoc CLI run only."
+    },
+    {
+      "name": "needle-glm-quota-controller-codinghome",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:glm-5.3-flash:local-base+lab-elastic",
+      "mode": "disabled",
+      "config_path": "/home/coding/bin/needle-glm-quota-controller",
+      "state_path": "/home/coding/.local/state/needle-glm-quota-controller/state.json",
+      "actuator": "systemd user units on codinghome and lab",
+      "evidence": "Re-verified 2026-10-07: no matching systemd unit found; not running."
+    }
+  ]
+}

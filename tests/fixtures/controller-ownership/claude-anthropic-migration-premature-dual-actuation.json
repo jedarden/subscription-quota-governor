@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "observed_at": "fixture: the mistake this migration must not make",
+  "controllers": [
+    {
+      "name": "cgov-codinghome-needle-sonnet",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=claude-print",
+      "mode": "actuating",
+      "config_path": "/home/coding/.config/claude-governor/governor.yaml",
+      "state_path": "/home/coding/.config/claude-governor/governor-state.json",
+      "actuator": "cgov daemon worker launch path for needle-sonnet",
+      "evidence": "Still active -- not yet stopped."
+    },
+    {
+      "name": "subgov-codinghome-claude-anthropic",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=claude-print",
+      "mode": "actuating",
+      "config_path": "/home/coding/subscription-quota-governor/examples/claude-anthropic-cgov-migration.yaml",
+      "state_path": "/home/coding/.local/state/subscription-governor/claude-anthropic.json",
+      "actuator": "subgov.service needle_run actuator, enabled prematurely before cgov was stopped",
+      "evidence": "Negative-test fixture: proves the preflight actually rejects this specific mistake rather than just passing everything."
+    }
+  ]
+}
