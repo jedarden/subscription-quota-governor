@@ -462,3 +462,55 @@ env PATH=<fixed> needle test-agent claude-print -> Status: READY, exit 0
 Three subsequent real cycles -> actuation_succeeded=false, "test-agent status: WARNING", worker confirmed absent
 needle status -> hung 3+ min, blocked state; load average ~18; consistent with cgov's own pre-cutover symptom for this pool
 ```
+
+### Correction: the WARNING flake was this unit's own sandboxing, not load
+
+The "test-agent status: WARNING" above persisted for over an hour across many
+real cycles — not a transient flicker. The system-load explanation was wrong.
+Repeated manual runs of the identical `needle test-agent claude-print`
+command (including with null stdin, matching subgov's own
+`Stdio::null()`) were consistently `READY`; subgov's in-process invocation
+of that exact command kept returning `WARNING` under the same conditions.
+Since every input was identical, the only remaining difference was the
+sandbox itself.
+
+NEEDLE's own status logic (`~/NEEDLE/src/dispatch/mod.rs` ~3440–3576):
+`WARNING` fires whenever the probe/version/token-extraction checks
+accumulate any non-fatal error. `claude-print` wraps the real `claude` CLI
+directly (self-reported: "wrapping claude 2.1.293 (Claude Code)"), a
+Node.js/V8 application. `MemoryDenyWriteExecute=true` — present in the
+original hardened unit, copied verbatim from `deploy/systemd/subgov.service`
+without a Node-based child process in mind — is a well-documented way to
+break V8's JIT, which needs W+X memory mappings. Systemd sandboxing applies
+to the whole process tree a unit spawns, not just the top-level process, so
+this broke the `claude` grandchild regardless of subgov's own code being
+correct. **Any unit using `needle_run` against a Node-based CLI adapter
+needs to drop `MemoryDenyWriteExecute` (and likely review
+`SystemCallFilter`/`PrivateTmp`/`ProtectHome` for the same reason) — the
+deploy template's own comment already flags this exact class of risk for
+`codex_app_server`'s child process; it just wasn't anticipated here.**
+
+Verified directly: stripped `ProtectSystem`, `ProtectHome`, `PrivateTmp`, the
+kernel/namespace `Protect*`/`Restrict*` set, `MemoryDenyWriteExecute`,
+`SystemCallFilter`, and `RestrictAddressFamilies`; `subgov doctor` and every
+subsequent real cycle then passed `needle_adapter_parity` cleanly. (Removing
+`CapabilityBoundingSet=`/`AmbientCapabilities=` at the same time broke
+service startup entirely — `Failed to drop capabilities: Operation not
+permitted`, exit 218/CAPABILITIES — unrelated to the WARNING issue; removed
+those too rather than root-causing a second problem mid-incident.)
+
+Past the adapter check, subgov now correctly reaches NEEDLE's own CPU
+admission gate, which is working as intended, not a bug: `launch refused --
+CPU load saturated: 17.13–18.51 / 20 cores = 0.86–0.93 > threshold 0.80`.
+This correctly reports the real core count (not cgov's documented "1 core"
+detection bug) and a genuinely high, real load. Deliberately not bypassed —
+this is NEEDLE correctly protecting an already-strained host. subgov retries
+every 5 minutes and will succeed the first cycle that lands under 0.80 (it
+came within one cycle: 0.76 at a manual check, 0.93 five minutes later).
+
+**Open follow-up:** the unit currently runs with most of its originally
+intended hardening removed. It should not stay this way indefinitely — the
+next step is adding hardening back incrementally with the actual needed
+exception (most likely: skip only `MemoryDenyWriteExecute` for this unit, or
+give `claude-print`'s real cache/tmp paths explicit `ReadWritePaths` instead
+of `PrivateTmp`'s isolated tmpfs), not leaving it unhardened long-term.
