@@ -711,6 +711,7 @@ pub fn parse_anthropic_usage(payload: &Value, observed_at: DateTime<Utc>) -> Res
         observed_at,
         fresh: true,
         windows: windows.into_values().collect(),
+        eligible_backlog_capacity: None,
         reset_credits: None,
     })
 }
@@ -1283,6 +1284,7 @@ pub fn parse_codex_rate_limits(
         observed_at,
         fresh: true,
         windows,
+        eligible_backlog_capacity: None,
         reset_credits: parse_reset_credits(result),
     })
 }

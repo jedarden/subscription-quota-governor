@@ -8,6 +8,11 @@ pub struct QuotaSnapshot {
     #[serde(default = "default_true")]
     pub fresh: bool,
     pub windows: Vec<QuotaWindow>,
+    /// Number of workers supported by currently eligible queued work, when
+    /// the source can observe it. Banked-reset pacing never scales above this
+    /// capacity; when absent, it holds the current worker count as the cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_backlog_capacity: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits: Option<ResetCreditsSnapshot>,
 }
@@ -107,6 +112,25 @@ mod tests {
             mem_available_mb: 12288,
             mem_total_mb: 65536,
         }
+    }
+
+    #[test]
+    fn quota_snapshot_accepts_optional_eligible_backlog_capacity() {
+        let json = r#"{
+            "observed_at": "2026-09-28T12:00:00Z",
+            "windows": [{
+                "id": "weekly",
+                "used_fraction": 0.42,
+                "resets_at": "2026-10-03T00:00:00Z"
+            }],
+            "eligible_backlog_capacity": 3
+        }"#;
+        let snapshot: QuotaSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snapshot.eligible_backlog_capacity, Some(3));
+
+        let without_capacity = json.replace(",\n            \"eligible_backlog_capacity\": 3", "");
+        let snapshot: QuotaSnapshot = serde_json::from_str(&without_capacity).unwrap();
+        assert_eq!(snapshot.eligible_backlog_capacity, None);
     }
 
     #[test]

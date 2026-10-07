@@ -18,6 +18,11 @@
       "default": true,
       "description": "The source's own freshness judgment. Optional -- missing defaults to true, matching #[serde(default = \"default_true\")] on QuotaSnapshot::fresh. The controller separately enforces its own configured maximum age."
     },
+    "eligible_backlog_capacity": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional count of workers supported by eligible queued work. Banked-reset pacing is capped at this count; when absent, the current worker count is the cap."
+    },
     "windows": {
       "type": "array",
       "minItems": 1,
@@ -109,6 +114,7 @@
     {
       "observed_at": "2026-09-12T12:00:00Z",
       "fresh": true,
+      "eligible_backlog_capacity": 3,
       "windows": [
         {
           "id": "weekly",

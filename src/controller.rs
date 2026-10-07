@@ -1,6 +1,6 @@
 use crate::config::{AccountConfig, StaleBehavior, Strategy};
 use crate::model::{QuotaSnapshot, QuotaWindow};
-use crate::state::{AccountState, WindowSample};
+use crate::state::{AccountState, AggregateBurnSample, WindowSample};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -41,12 +41,67 @@ pub struct BankedResetDecision {
     pub governing_window: String,
     pub minimum_pace_multiplier: f64,
     pub required_burn_per_hour: f64,
+    /// Account-level burn measured over at least 24 hours and multiple
+    /// quantized samples. This includes interactive Codex sessions.
+    pub aggregate_burn_per_hour: Option<f64>,
+    /// Estimated usage attributable to governed workers after the
+    /// exogenous account component is removed.
+    pub governed_worker_burn_per_hour: Option<f64>,
+    pub exogenous_burn_per_hour: Option<f64>,
+    /// Highest pace supported by the measured worker rate and worker cap.
+    pub max_feasible_burn_per_hour: Option<f64>,
+    pub feasible: bool,
+    /// Worker ceiling derived from eligible backlog, or the current worker
+    /// count when no backlog observation is available.
+    pub eligible_backlog_capacity: u32,
     pub desired_workers: u32,
     /// A human should redeem one credit before resuming this weekly window.
     pub manual_redemption_recommended: bool,
     pub deadline_missed: bool,
     pub reason: String,
     pub known_expirations: Vec<DateTime<Utc>>,
+    pub credit_deadlines: Vec<CreditDeadlineAssessment>,
+    /// Newly crossed advisory thresholds to publish to the operator.
+    pub advisories: Vec<CreditDeadlineAdvisory>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvisorySeverity {
+    Warn,
+    Page,
+    Infeasible,
+}
+
+impl AdvisorySeverity {
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Warn => 1,
+            Self::Page => 2,
+            Self::Infeasible => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CreditDeadlineAssessment {
+    pub credit_id: String,
+    pub expires_at: DateTime<Utc>,
+    pub need: f64,
+    pub required_burn_per_hour: Option<f64>,
+    pub slack_hours: Option<f64>,
+    pub severity: Option<AdvisorySeverity>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CreditDeadlineAdvisory {
+    pub credit_id: String,
+    pub expires_at: DateTime<Utc>,
+    pub severity: AdvisorySeverity,
+    pub slack_hours: f64,
+    pub required_burn_per_hour: Option<f64>,
+    pub max_feasible_burn_per_hour: Option<f64>,
+    pub feasible: bool,
 }
 
 pub fn evaluate(
@@ -176,7 +231,8 @@ pub fn evaluate(
         .map(|decision| decision.desired_workers)
         .unwrap_or(current_workers);
     let binding_window = binding.map(|decision| decision.id.clone());
-    let banked_resets = banked_reset_decision(config, snapshot, &decisions, current_workers, now);
+    let banked_resets =
+        banked_reset_decision(config, snapshot, &decisions, prior, current_workers, now);
     let short_window_reached = decisions.iter().any(|decision| {
         decision.reason == "target_reached"
             && snapshot
@@ -191,11 +247,15 @@ pub fn evaluate(
         }
         _ => ordinary_desired,
     };
+    let stepped_desired = apply_step_limits(raw_desired, current_workers, config);
+    let desired_workers = banked_resets.as_ref().map_or(stepped_desired, |plan| {
+        stepped_desired.min(plan.eligible_backlog_capacity)
+    });
     Ok(Decision {
         account: account_name.to_owned(),
         observed_at: snapshot.observed_at,
         current_workers,
-        desired_workers: apply_step_limits(raw_desired, current_workers, config),
+        desired_workers,
         stale: false,
         windows: decisions,
         binding_window,
@@ -207,6 +267,7 @@ fn banked_reset_decision(
     config: &AccountConfig,
     snapshot: &QuotaSnapshot,
     decisions: &[WindowDecision],
+    prior: &AccountState,
     current_workers: u32,
     now: DateTime<Utc>,
 ) -> Option<BankedResetDecision> {
@@ -230,27 +291,91 @@ fn banked_reset_decision(
     let mut required_burn_per_hour =
         config.banked_resets.minimum_pace_multiplier * target / duration_hours;
 
-    let mut known_expirations: Vec<_> = credits
+    let mut known_credits: Vec<_> = credits
         .credits
         .as_deref()
         .unwrap_or_default()
         .iter()
         .filter(|credit| credit.status == "available")
-        .filter_map(|credit| credit.expires_at)
+        .filter_map(|credit| credit.expires_at.map(|expires_at| (expires_at, credit)))
         .collect();
-    known_expirations.sort();
-    let safety = Duration::seconds(config.banked_resets.deadline_safety_seconds as i64);
+    known_credits.sort_by_key(|(expires_at, credit)| (*expires_at, credit.id.clone()));
+    let known_expirations = known_credits
+        .iter()
+        .map(|(expires_at, _)| *expires_at)
+        .collect::<Vec<_>>();
+    let safety_hours = config.banked_resets.deadline_safety_seconds as f64 / 3_600.0;
+    let burn = estimate_aggregate_burn(
+        prior.aggregate_burn_history.get(&window.id),
+        window,
+        snapshot.observed_at,
+        current_workers,
+    );
+    let eligible_backlog_capacity = snapshot
+        .eligible_backlog_capacity
+        .unwrap_or(current_workers)
+        .min(config.fleet.max_workers);
+    let max_feasible_burn_per_hour = burn.as_ref().and_then(|burn| {
+        burn.exogenous_burn_per_hour
+            .zip(burn.per_worker_burn_per_hour)
+            .map(|(exogenous, per_worker)| {
+                exogenous + per_worker * f64::from(eligible_backlog_capacity)
+            })
+    });
     let mut deadline_missed = false;
-    for (index, expiration) in known_expirations.iter().enumerate() {
-        let deadline = *expiration - safety;
-        let hours = deadline.signed_duration_since(now).num_milliseconds() as f64 / 3_600_000.0;
-        let generations = (target - window.used_fraction).max(0.0) + index as f64 * target;
-        if hours > 0.0 {
-            required_burn_per_hour = required_burn_per_hour.max(generations / hours);
-        } else if generations > 0.0 {
+    let mut credit_deadlines = Vec::with_capacity(known_credits.len());
+    let mut advisories = Vec::new();
+    for (index, (expiration, credit)) in known_credits.iter().enumerate() {
+        let hours_to_expiry =
+            expiration.signed_duration_since(now).num_milliseconds() as f64 / 3_600_000.0;
+        let available_hours = hours_to_expiry - safety_hours;
+        let need = (target - window.used_fraction).max(0.0) + index as f64 * target;
+        let deadline_rate = (available_hours > 0.0).then_some(need / available_hours);
+        if let Some(rate) = deadline_rate {
+            required_burn_per_hour = required_burn_per_hour.max(rate);
+        } else if need > 0.0 {
             deadline_missed = true;
         }
+
+        let slack_hours = burn
+            .as_ref()
+            .filter(|burn| burn.aggregate_burn_per_hour > 0.0)
+            .map(|burn| hours_to_expiry - safety_hours - need / burn.aggregate_burn_per_hour);
+        let severity = slack_hours.and_then(advisory_severity);
+        let rank_before = prior
+            .credit_alerts
+            .get(&credit.id)
+            .filter(|state| state.resets_at == window.resets_at)
+            .map(|state| state.severity)
+            .unwrap_or(0);
+        let required = deadline_rate;
+        credit_deadlines.push(CreditDeadlineAssessment {
+            credit_id: credit.id.clone(),
+            expires_at: *expiration,
+            need,
+            required_burn_per_hour: required,
+            slack_hours,
+            severity,
+        });
+        if let (Some(severity), Some(slack_hours)) = (severity, slack_hours) {
+            if severity.rank() > rank_before {
+                advisories.push(CreditDeadlineAdvisory {
+                    credit_id: credit.id.clone(),
+                    expires_at: *expiration,
+                    severity,
+                    slack_hours,
+                    required_burn_per_hour: required,
+                    max_feasible_burn_per_hour,
+                    feasible: required
+                        .zip(max_feasible_burn_per_hour)
+                        .is_some_and(|(required, maximum)| maximum >= required),
+                });
+            }
+        }
     }
+
+    let feasible =
+        max_feasible_burn_per_hour.is_some_and(|maximum| maximum >= required_burn_per_hour);
 
     let manual_redemption_recommended =
         window.reached || window.used_fraction >= config.banked_resets.redeem_at_utilization;
@@ -261,26 +386,43 @@ fn banked_reset_decision(
         )
     } else if deadline_missed {
         (
-            config.fleet.max_workers,
+            eligible_backlog_capacity,
             "banked_reset_expiry_deadline_missed",
         )
-    } else if let Some(per_worker) = decision.observed_burn_per_worker_hour {
-        (
-            workers_for_rate(required_burn_per_hour, per_worker)
-                .clamp(config.fleet.min_workers, config.fleet.max_workers),
-            if known_expirations.is_empty() {
-                "minimum_banked_reset_pace"
-            } else {
-                "banked_reset_expiry_pace"
-            },
-        )
+    } else if let Some(burn) = &burn {
+        if let (Some(per_worker), Some(exogenous)) = (
+            burn.per_worker_burn_per_hour.filter(|rate| *rate > 0.0),
+            burn.exogenous_burn_per_hour,
+        ) {
+            let worker_rate = (required_burn_per_hour - exogenous).max(0.0);
+            let desired = workers_for_rate(worker_rate, per_worker).clamp(
+                config.fleet.min_workers.min(eligible_backlog_capacity),
+                eligible_backlog_capacity,
+            );
+            (
+                desired,
+                if known_expirations.is_empty() {
+                    "minimum_banked_reset_pace"
+                } else {
+                    "banked_reset_expiry_pace"
+                },
+            )
+        } else {
+            (current_workers, "learning_banked_reset_worker_split")
+        }
     } else if current_workers == 0 {
         (
-            config.fleet.bootstrap_workers,
+            config
+                .fleet
+                .bootstrap_workers
+                .min(eligible_backlog_capacity),
             "bootstrap_banked_reset_burn_rate",
         )
     } else {
-        (current_workers, "learning_banked_reset_burn_rate")
+        (
+            current_workers.min(eligible_backlog_capacity),
+            "learning_banked_reset_24h_burn_rate",
+        )
     };
 
     Some(BankedResetDecision {
@@ -288,12 +430,212 @@ fn banked_reset_decision(
         governing_window: window.id.clone(),
         minimum_pace_multiplier: config.banked_resets.minimum_pace_multiplier,
         required_burn_per_hour,
+        aggregate_burn_per_hour: burn.as_ref().map(|burn| burn.aggregate_burn_per_hour),
+        governed_worker_burn_per_hour: burn
+            .as_ref()
+            .and_then(|burn| burn.governed_worker_burn_per_hour),
+        exogenous_burn_per_hour: burn.as_ref().and_then(|burn| burn.exogenous_burn_per_hour),
+        max_feasible_burn_per_hour,
+        feasible,
+        eligible_backlog_capacity,
         desired_workers,
         manual_redemption_recommended,
         deadline_missed,
         reason: reason.to_owned(),
         known_expirations,
+        credit_deadlines,
+        advisories,
     })
+}
+
+fn advisory_severity(slack_hours: f64) -> Option<AdvisorySeverity> {
+    if slack_hours < 0.0 {
+        Some(AdvisorySeverity::Infeasible)
+    } else if slack_hours < 12.0 {
+        Some(AdvisorySeverity::Page)
+    } else if slack_hours < 48.0 {
+        Some(AdvisorySeverity::Warn)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod advisory_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn deadline_advisory_thresholds_are_strict_and_ordered() {
+        assert_eq!(
+            advisory_severity(-0.001),
+            Some(AdvisorySeverity::Infeasible)
+        );
+        assert_eq!(advisory_severity(0.0), Some(AdvisorySeverity::Page));
+        assert_eq!(advisory_severity(11.999), Some(AdvisorySeverity::Page));
+        assert_eq!(advisory_severity(12.0), Some(AdvisorySeverity::Warn));
+        assert_eq!(advisory_severity(47.999), Some(AdvisorySeverity::Warn));
+        assert_eq!(advisory_severity(48.0), None);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BurnInterval {
+    elapsed_hours: f64,
+    burned_fraction: f64,
+    governed_workers_x2: u32,
+    split_interval: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AggregateBurnEstimate {
+    aggregate_burn_per_hour: f64,
+    exogenous_burn_per_hour: Option<f64>,
+    governed_worker_burn_per_hour: Option<f64>,
+    per_worker_burn_per_hour: Option<f64>,
+}
+
+/// Measure account burn over a 24-hour-or-longer baseline using every
+/// quantized observation in the interval. Generation changes contribute the
+/// new generation's observed usage, while same-generation decreases are
+/// treated as censored/reset data and never as negative burn.
+fn estimate_aggregate_burn(
+    history: Option<&std::collections::VecDeque<AggregateBurnSample>>,
+    current: &QuotaWindow,
+    observed_at: DateTime<Utc>,
+    governed_workers: u32,
+) -> Option<AggregateBurnEstimate> {
+    let mut samples = history
+        .into_iter()
+        .flat_map(|samples| samples.iter().cloned())
+        .collect::<Vec<_>>();
+    if samples
+        .last()
+        .is_none_or(|sample| sample.observed_at < observed_at)
+    {
+        samples.push(AggregateBurnSample {
+            observed_at,
+            used_fraction: current.used_fraction,
+            resets_at: current.resets_at,
+            governed_workers,
+        });
+    }
+    samples.sort_by_key(|sample| sample.observed_at);
+    samples.dedup_by_key(|sample| sample.observed_at);
+
+    let cutoff = observed_at - Duration::hours(24);
+    let first = samples
+        .iter()
+        .rposition(|sample| sample.observed_at <= cutoff)?;
+    let samples = &samples[first..];
+    if samples.len() < 3 {
+        return None;
+    }
+    let elapsed_hours = samples
+        .last()?
+        .observed_at
+        .signed_duration_since(samples[0].observed_at)
+        .num_milliseconds() as f64
+        / 3_600_000.0;
+    if elapsed_hours < 24.0 {
+        return None;
+    }
+
+    let mut intervals = Vec::new();
+    for pair in samples.windows(2) {
+        let [previous, next] = pair else {
+            unreachable!()
+        };
+        let elapsed = next
+            .observed_at
+            .signed_duration_since(previous.observed_at)
+            .num_milliseconds() as f64
+            / 3_600_000.0;
+        if elapsed <= 0.0 {
+            continue;
+        }
+        let burned_fraction = if previous.resets_at == next.resets_at {
+            (next.used_fraction - previous.used_fraction).max(0.0)
+        } else {
+            next.used_fraction.max(0.0)
+        };
+        intervals.push(BurnInterval {
+            elapsed_hours: elapsed,
+            burned_fraction,
+            governed_workers_x2: previous.governed_workers + next.governed_workers,
+            split_interval: previous.resets_at == next.resets_at,
+        });
+    }
+    let measured = intervals
+        .iter()
+        .map(|interval| interval.burned_fraction)
+        .sum::<f64>();
+    if !measured.is_finite() || measured <= 0.0 {
+        // A flat quantized series is censored evidence, not proof of a zero
+        // burn rate, so callers must keep learning rather than divide by it.
+        return None;
+    }
+    let aggregate = measured / elapsed_hours;
+    let exogenous = estimate_exogenous_burn(&intervals, aggregate);
+    let governed = exogenous.map(|exogenous| (aggregate - exogenous).max(0.0));
+    let worker_hours = intervals
+        .iter()
+        .map(|interval| interval.elapsed_hours * f64::from(interval.governed_workers_x2) / 2.0)
+        .sum::<f64>();
+    let per_worker = governed
+        .filter(|_| worker_hours > 0.0)
+        .map(|governed| governed * elapsed_hours / worker_hours);
+    Some(AggregateBurnEstimate {
+        aggregate_burn_per_hour: aggregate,
+        exogenous_burn_per_hour: exogenous,
+        governed_worker_burn_per_hour: governed,
+        per_worker_burn_per_hour: per_worker,
+    })
+}
+
+/// Estimate the exogenous component from zero-worker intervals when they
+/// exist. Otherwise use a robust line intercept across worker-count bands.
+/// With only one nonzero worker count the split is unidentifiable, so return
+/// `None` instead of attributing interactive usage to governed workers.
+fn estimate_exogenous_burn(intervals: &[BurnInterval], aggregate: f64) -> Option<f64> {
+    let mut bands: std::collections::BTreeMap<u32, (f64, f64)> = std::collections::BTreeMap::new();
+    for interval in intervals.iter().filter(|interval| interval.split_interval) {
+        let entry = bands.entry(interval.governed_workers_x2).or_default();
+        entry.0 += interval.elapsed_hours;
+        entry.1 += interval.burned_fraction;
+    }
+    if let Some((hours, usage)) = bands.get(&0) {
+        return Some((usage / hours).clamp(0.0, aggregate));
+    }
+    let means = bands
+        .iter()
+        .filter_map(|(workers_x2, (hours, usage))| {
+            (*hours > 0.0).then_some((f64::from(*workers_x2) / 2.0, usage / hours))
+        })
+        .collect::<Vec<_>>();
+    let mut slopes = Vec::new();
+    for left in 0..means.len() {
+        for right in (left + 1)..means.len() {
+            let dx = means[right].0 - means[left].0;
+            if dx != 0.0 {
+                let slope = (means[right].1 - means[left].1) / dx;
+                if slope.is_finite() && slope > 0.0 {
+                    slopes.push(slope);
+                }
+            }
+        }
+    }
+    if slopes.is_empty() {
+        return None;
+    }
+    slopes.sort_by(f64::total_cmp);
+    let slope = slopes[slopes.len() / 2];
+    let mut intercepts = means
+        .iter()
+        .map(|(workers, rate)| rate - slope * workers)
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    intercepts.sort_by(f64::total_cmp);
+    Some(intercepts[intercepts.len() / 2].clamp(0.0, aggregate))
 }
 
 fn is_weekly_window(duration_minutes: Option<u64>) -> bool {
@@ -374,9 +716,9 @@ mod tests {
     use super::*;
     use crate::config::*;
     use crate::model::{QuotaWindow, ResetCredit, ResetCreditsSnapshot};
-    use crate::state::WindowSample;
+    use crate::state::{AggregateBurnSample, WindowSample};
     use chrono::Duration;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
 
     fn account() -> AccountConfig {
         AccountConfig {
@@ -405,6 +747,42 @@ mod tests {
         }
     }
 
+    fn add_banked_burn_history(
+        prior: &mut AccountState,
+        now: DateTime<Utc>,
+        resets_at: DateTime<Utc>,
+        final_used_fraction: f64,
+        exogenous_per_hour: f64,
+        governed_per_worker_hour: f64,
+    ) {
+        let baseline =
+            final_used_fraction - 25.0 * exogenous_per_hour - 12.0 * governed_per_worker_hour;
+        let points = [
+            (-25, baseline, 0),
+            (-13, baseline + 12.0 * exogenous_per_hour, 0),
+            (-12, baseline + 13.0 * exogenous_per_hour, 1),
+            (
+                -1,
+                baseline + 24.0 * exogenous_per_hour + 11.0 * governed_per_worker_hour,
+                1,
+            ),
+        ];
+        prior.aggregate_burn_history.insert(
+            "codex.secondary".to_owned(),
+            points
+                .into_iter()
+                .map(
+                    |(hours, used_fraction, governed_workers)| AggregateBurnSample {
+                        observed_at: now + Duration::hours(hours),
+                        used_fraction,
+                        resets_at,
+                        governed_workers,
+                    },
+                )
+                .collect::<VecDeque<_>>(),
+        );
+    }
+
     #[test]
     fn chooses_most_conservative_window() {
         let now = Utc::now();
@@ -427,6 +805,7 @@ mod tests {
                     reached: false,
                 },
             ],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         let decision = evaluate(
@@ -455,6 +834,7 @@ mod tests {
                 duration_minutes: None,
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         let decision = evaluate(
@@ -495,6 +875,7 @@ mod tests {
                     reached: false,
                 },
             ],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         let decision =
@@ -518,6 +899,7 @@ mod tests {
                 duration_minutes: None,
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         let mut prior = AccountState::default();
@@ -548,6 +930,7 @@ mod tests {
                 duration_minutes: None,
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         let decision = evaluate(
@@ -576,6 +959,7 @@ mod tests {
                 duration_minutes: None,
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         let decision = evaluate(
@@ -651,6 +1035,7 @@ mod tests {
                 duration_minutes: None,
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         let mut prior = AccountState::default();
@@ -683,6 +1068,7 @@ mod tests {
                 duration_minutes: None,
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         let mut prior = AccountState::default();
@@ -715,22 +1101,24 @@ mod tests {
             fresh: true,
             windows: vec![QuotaWindow {
                 id: "codex.secondary".into(),
-                used_fraction: 0.11,
+                used_fraction: 0.30,
                 resets_at: reset,
                 duration_minutes: Some(10_080),
                 reached: false,
             }],
+            eligible_backlog_capacity: Some(20),
             reset_credits: Some(ResetCreditsSnapshot {
                 available_count: 1,
                 credits: None,
             }),
         };
         let mut prior = AccountState::default();
+        add_banked_burn_history(&mut prior, now, reset, 0.30, 0.001, 0.01);
         prior.windows.insert(
             "codex.secondary".into(),
             WindowSample {
                 observed_at: now - Duration::hours(1),
-                used_fraction: 0.10,
+                used_fraction: 0.29,
                 resets_at: reset,
                 workers: 1,
             },
@@ -742,6 +1130,28 @@ mod tests {
         assert_eq!(banked.reason, "minimum_banked_reset_pace");
         assert_eq!(banked.desired_workers, 2);
         assert_eq!(decision.desired_workers, 2);
+
+        let no_backlog_signal = QuotaSnapshot {
+            eligible_backlog_capacity: None,
+            ..snapshot.clone()
+        };
+        let held = evaluate("test", &config, &no_backlog_signal, &prior, 1, now).unwrap();
+        assert_eq!(held.desired_workers, 1);
+        assert_eq!(
+            held.banked_resets.unwrap().eligible_backlog_capacity,
+            1,
+            "without a backlog signal the current fleet size is the scale-up cap"
+        );
+
+        let one_worker_backlog = QuotaSnapshot {
+            eligible_backlog_capacity: Some(1),
+            ..snapshot
+        };
+        let capped = evaluate("test", &config, &one_worker_backlog, &prior, 1, now).unwrap();
+        let capped_banked = capped.banked_resets.unwrap();
+        assert_eq!(capped.desired_workers, 1);
+        assert_eq!(capped_banked.eligible_backlog_capacity, 1);
+        assert!(!capped_banked.feasible);
     }
 
     #[test]
@@ -761,6 +1171,7 @@ mod tests {
                 duration_minutes: Some(10_080),
                 reached: false,
             }],
+            eligible_backlog_capacity: Some(20),
             reset_credits: Some(ResetCreditsSnapshot {
                 available_count: 1,
                 credits: Some(vec![ResetCredit {
@@ -775,6 +1186,7 @@ mod tests {
             }),
         };
         let mut prior = AccountState::default();
+        add_banked_burn_history(&mut prior, now, reset, 0.20, 0.001, 0.01);
         prior.windows.insert(
             "codex.secondary".into(),
             WindowSample {
@@ -793,6 +1205,200 @@ mod tests {
     }
 
     #[test]
+    fn codex_credit_replay_warns_before_expiry_and_rebases_after_out_of_cycle_reset() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct ReplayFixture {
+            samples: Vec<AggregateBurnSample>,
+        }
+
+        fn snapshot(
+            sample: &AggregateBurnSample,
+            reset_credits: Option<ResetCreditsSnapshot>,
+        ) -> QuotaSnapshot {
+            QuotaSnapshot {
+                observed_at: sample.observed_at,
+                fresh: true,
+                windows: vec![QuotaWindow {
+                    id: "codex.secondary".into(),
+                    used_fraction: sample.used_fraction,
+                    resets_at: sample.resets_at,
+                    duration_minutes: Some(10_080),
+                    reached: false,
+                }],
+                eligible_backlog_capacity: Some(12),
+                reset_credits,
+            }
+        }
+
+        let replay: ReplayFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-reset-credit-replay.json"
+        ))
+        .unwrap();
+        let first_poll = replay
+            .samples
+            .iter()
+            .position(|sample| sample.observed_at.to_rfc3339() == "2026-10-02T21:13:00+00:00")
+            .unwrap();
+        let reset_poll = replay
+            .samples
+            .iter()
+            .position(|sample| sample.observed_at.to_rfc3339() == "2026-10-07T03:28:00+00:00")
+            .unwrap();
+        let mut config = account();
+        config.banked_resets.enabled = true;
+        config.fleet.max_workers = 12;
+        let expiry_8a8b = "2026-10-05T04:19:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut prior = AccountState::default();
+        for sample in &replay.samples[..first_poll] {
+            prior.record(
+                &snapshot(sample, None),
+                sample.governed_workers,
+                sample.governed_workers,
+            );
+        }
+
+        let first_sample = &replay.samples[first_poll];
+        let first_snapshot = snapshot(
+            first_sample,
+            Some(ResetCreditsSnapshot {
+                available_count: 1,
+                credits: Some(vec![ResetCredit {
+                    id: "8a8b".into(),
+                    reset_type: Some("weekly".into()),
+                    status: "available".into(),
+                    granted_at: None,
+                    expires_at: Some(expiry_8a8b),
+                    title: None,
+                    description: None,
+                }]),
+            }),
+        );
+        let first = evaluate(
+            "codex",
+            &config,
+            &first_snapshot,
+            &prior,
+            first_sample.governed_workers,
+            first_sample.observed_at,
+        )
+        .unwrap();
+        let first_banked = first.banked_resets.as_ref().unwrap();
+        assert!(first_banked.aggregate_burn_per_hour.unwrap() > 0.004);
+        assert!(first_banked.aggregate_burn_per_hour.unwrap() < 0.006);
+        assert_eq!(first_banked.advisories.len(), 1);
+        assert_eq!(first_banked.advisories[0].credit_id, "8a8b");
+        assert_eq!(
+            first_banked.advisories[0].severity,
+            AdvisorySeverity::Infeasible
+        );
+        assert!(first_banked.advisories[0].slack_hours < 0.0);
+        assert!(first_banked.advisories[0]
+            .required_burn_per_hour
+            .is_some_and(|pace| pace > 0.02));
+        assert!(first_banked.advisories[0]
+            .max_feasible_burn_per_hour
+            .is_some_and(|pace| pace < 0.01));
+        assert!(!first_banked.advisories[0].feasible);
+        assert!(
+            expiry_8a8b
+                .signed_duration_since(first_sample.observed_at)
+                .num_hours()
+                >= 48
+        );
+
+        prior.record(
+            &first_snapshot,
+            first_sample.governed_workers,
+            first.desired_workers,
+        );
+        let first_generation = first_banked
+            .credit_deadlines
+            .first()
+            .map(|_| first_sample.resets_at)
+            .unwrap();
+        prior.record_credit_alerts(
+            first_generation,
+            first_banked.credit_deadlines.iter().map(|deadline| {
+                (
+                    deadline.credit_id.clone(),
+                    deadline.severity.map_or(0, AdvisorySeverity::rank),
+                )
+            }),
+        );
+        let repeated = evaluate(
+            "codex",
+            &config,
+            &first_snapshot,
+            &prior,
+            first_sample.governed_workers,
+            first_sample.observed_at,
+        )
+        .unwrap();
+        assert!(repeated.banked_resets.unwrap().advisories.is_empty());
+        for sample in &replay.samples[(first_poll + 1)..reset_poll] {
+            prior.record(
+                &snapshot(sample, None),
+                sample.governed_workers,
+                sample.governed_workers,
+            );
+        }
+
+        let reset_sample = &replay.samples[reset_poll];
+        let future_expiry_one = "2026-10-22T20:35:00Z".parse::<DateTime<Utc>>().unwrap();
+        let future_expiry_two = "2026-10-29T18:53:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reset_snapshot = snapshot(
+            reset_sample,
+            Some(ResetCreditsSnapshot {
+                available_count: 2,
+                credits: Some(vec![
+                    ResetCredit {
+                        id: "credit-oct-22".into(),
+                        reset_type: Some("weekly".into()),
+                        status: "available".into(),
+                        granted_at: None,
+                        expires_at: Some(future_expiry_one),
+                        title: None,
+                        description: None,
+                    },
+                    ResetCredit {
+                        id: "credit-oct-29".into(),
+                        reset_type: Some("weekly".into()),
+                        status: "available".into(),
+                        granted_at: None,
+                        expires_at: Some(future_expiry_two),
+                        title: None,
+                        description: None,
+                    },
+                ]),
+            }),
+        );
+        let rebased = evaluate(
+            "codex",
+            &config,
+            &reset_snapshot,
+            &prior,
+            reset_sample.governed_workers,
+            reset_sample.observed_at,
+        )
+        .unwrap();
+        let reset_banked = rebased.banked_resets.unwrap();
+        assert_ne!(first_generation, reset_sample.resets_at);
+        assert_eq!(reset_banked.credit_deadlines[0].need, 0.99);
+        assert_eq!(reset_banked.credit_deadlines[1].need, 1.99);
+        let expected_slack = future_expiry_one
+            .signed_duration_since(reset_sample.observed_at)
+            .num_milliseconds() as f64
+            / 3_600_000.0
+            - 6.0
+            - 0.99 / reset_banked.aggregate_burn_per_hour.unwrap();
+        assert!(
+            (reset_banked.credit_deadlines[0].slack_hours.unwrap() - expected_slack).abs() < 1e-9
+        );
+    }
+
+    #[test]
     fn recommends_redemption_at_the_configured_threshold() {
         let now = Utc::now();
         let mut config = account();
@@ -807,6 +1413,7 @@ mod tests {
                 duration_minutes: Some(10_080),
                 reached: true,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: Some(ResetCreditsSnapshot {
                 available_count: 1,
                 credits: None,
@@ -835,6 +1442,7 @@ mod tests {
                 duration_minutes: Some(10_080),
                 reached: false,
             }],
+            eligible_backlog_capacity: Some(10),
             reset_credits: Some(ResetCreditsSnapshot {
                 available_count: 1,
                 credits: Some(vec![ResetCredit {
@@ -1012,6 +1620,7 @@ mod tests {
                     duration_minutes: Some(10_080),
                     reached: case.reached_flag,
                 }],
+                eligible_backlog_capacity: None,
                 reset_credits: None,
             };
 
@@ -1073,6 +1682,7 @@ mod tests {
                     reached: false,
                 },
             ],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
 
@@ -1106,6 +1716,7 @@ mod tests {
                 duration_minutes: Some(10_080),
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
 
@@ -1189,6 +1800,7 @@ mod tests {
                     duration_minutes: Some(300),
                     reached,
                 }],
+                eligible_backlog_capacity: None,
                 reset_credits: None,
             }
         }
@@ -1257,6 +1869,7 @@ mod tests {
                         duration_minutes: Some(10_080),
                         reached: false,
                     }],
+                    eligible_backlog_capacity: None,
                     reset_credits: None,
                 };
                 let decision = evaluate(
@@ -1310,12 +1923,14 @@ mod tests {
                     observed_at: now,
                     fresh: true,
                     windows: vec![window_a.clone()],
+                    eligible_backlog_capacity: None,
                     reset_credits: None,
                 };
                 let snapshot_two = QuotaSnapshot {
                     observed_at: now,
                     fresh: true,
                     windows: vec![window_a, window_b],
+                    eligible_backlog_capacity: None,
                     reset_credits: None,
                 };
                 let decision_one = evaluate(
@@ -1438,6 +2053,7 @@ mod tests {
                         duration_minutes: Some(10_080),
                         reached: false,
                     }],
+                    eligible_backlog_capacity: None,
                     reset_credits: None,
                 };
                 let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
@@ -1492,6 +2108,7 @@ mod tests {
                         duration_minutes: Some(10_080),
                         reached: used_fraction >= 1.0,
                     }],
+                    eligible_backlog_capacity: None,
                     reset_credits: None,
                 };
                 let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
@@ -1565,6 +2182,7 @@ mod tests {
                             duration_minutes: Some(300),
                             reached: used_fraction >= 1.0,
                         }],
+                        eligible_backlog_capacity: None,
                         reset_credits: None,
                     };
                     let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
@@ -1598,6 +2216,7 @@ mod tests {
                         duration_minutes: Some(300),
                         reached: used_fraction >= 1.0,
                     }],
+                    eligible_backlog_capacity: None,
                     reset_credits: None,
                 };
                 let decision = step(&config, &mut prior, workers, &pending_rollover, clock.now());

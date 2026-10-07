@@ -84,9 +84,11 @@ interactive, human-controlled Codex surface.
 credit balance. It does not itself authorize redemption. For weekly windows:
 
 ```text
-minimum required burn = minimum_pace_multiplier * target / window duration
-deadline required burn = remaining generations / time to credit expiry
-effective required burn = max(minimum required burn, each known deadline rate)
+natural pace floor = minimum_pace_multiplier * target / window duration
+credit need_i = max(target - used, 0) + i * target  # credits sorted by expiry
+deadline pace_i = need_i / (hours_to_expiry_i - safety)
+required burn = max(natural pace floor, each known deadline pace_i)
+slack_i = hours_to_expiry_i - safety - need_i / measured aggregate burn
 ```
 
 The default multiplier is `2.0`. When a banked reset exists, the effective
@@ -96,9 +98,32 @@ human to redeem.
 Shorter windows continue to constrain the final worker target.
 
 Detailed credit rows may be absent. In that case the governor still enforces
-the minimum pace from the authoritative balance, but cannot calculate an
-expiry deadline. `deadline_safety_seconds` (default six hours) advances each
-known deadline to leave operational margin.
+the natural pace floor from the authoritative balance, but cannot calculate a
+credit-specific deadline. `deadline_safety_seconds` (default six hours)
+advances each known deadline to leave operational margin.
+
+Deadline slack uses aggregate account burn measured across a baseline of at
+least 24 hours and multiple quantized samples. The samples are accumulated
+across `resets_at` generations, so an out-of-cycle reset re-bases need and
+slack on the next poll. A two-sample delta is never used for this estimate.
+Governed-worker burn is estimated only after removing exogenous account use
+from interactive/operator sessions. When the split cannot be identified from
+the observed worker history, the controller reports the split and maximum
+feasible pace as unknown, sets `feasible: false`, and does not infer a
+per-worker rate from the aggregate number.
+
+The decision publishes `aggregate_burn_per_hour`,
+`governed_worker_burn_per_hour`, `exogenous_burn_per_hour`,
+`required_burn_per_hour`, `max_feasible_burn_per_hour`, and `feasible`.
+Per-credit `slack_hours` is reported with its current severity. A newly crossed
+48-hour threshold emits a `banked_reset_advisory` JSONL event at `warn`; below
+12 hours it emits `page`, and negative slack emits `infeasible`, including the
+required and maximum feasible rates when known. The event is de-duplicated at
+each severity and re-armed after recovery or a `resets_at` generation change.
+
+Banked-reset worker targets are capped by `eligible_backlog_capacity` from a
+normalized quota snapshot. If no backlog capacity is available, the current
+worker count is the cap, so quota headroom alone cannot scale up the fleet.
 
 At the threshold, the controller sets
 `manual_redemption_recommended: true`, reports the reason

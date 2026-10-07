@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.ardenone.com/jedarden/subscription-quota-governor/raw/branch/main/schema/banked-reset-advisory-event.schema.json",
+  "title": "Banked reset advisory event (JSONL, stdout)",
+  "description": "A newly crossed credit-deadline threshold printed by run_cycle for the operator. A credit may emit warn, page, and infeasible as its slack worsens; state de-duplicates repeated events at the same severity and re-arms after recovery or a reset-generation change. This is advisory only; redemption remains a human action.",
+  "type": "object",
+  "required": ["event", "time", "account", "advisory"],
+  "additionalProperties": true,
+  "properties": {
+    "event": { "const": "banked_reset_advisory" },
+    "time": { "$ref": "decision-event.schema.json#/$defs/timestamp" },
+    "account": { "type": "string", "minLength": 1 },
+    "advisory": {
+      "$ref": "decision-event.schema.json#/$defs/creditDeadlineAdvisory"
+    }
+  }
+}

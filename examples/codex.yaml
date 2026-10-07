@@ -38,6 +38,9 @@ accounts:
     banked_resets:
       # Detect banked resets and consume ordinary quota at no less than twice
       # the weekly-window pace. Known credit expirations can require more.
+      # Scale-up is capped by eligible_backlog_capacity in normalized source
+      # snapshots; this native Codex source has no backlog signal, so it holds
+      # at the current worker count instead of scaling on quota headroom alone.
       enabled: true
       minimum_pace_multiplier: 2.0
       redeem_at_utilization: 1.0

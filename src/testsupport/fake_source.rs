@@ -71,6 +71,7 @@ mod tests {
                 duration_minutes: Some(300),
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         }
     }

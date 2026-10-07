@@ -174,14 +174,22 @@
         "governing_window",
         "minimum_pace_multiplier",
         "required_burn_per_hour",
+        "aggregate_burn_per_hour",
+        "governed_worker_burn_per_hour",
+        "exogenous_burn_per_hour",
+        "max_feasible_burn_per_hour",
+        "feasible",
+        "eligible_backlog_capacity",
         "desired_workers",
         "manual_redemption_recommended",
         "deadline_missed",
         "reason",
-        "known_expirations"
+        "known_expirations",
+        "credit_deadlines",
+        "advisories"
       ],
       "additionalProperties": true,
-      "description": "Present only when config.banked_resets.enabled and the snapshot reports at least one available reset credit (§9.7). Every field is always present together -- unlike `windowDecision.observed_burn_per_worker_hour`, none of these are independently optional.",
+      "description": "Present only when config.banked_resets.enabled and the snapshot reports at least one available reset credit (§9.7). All fields are present; rate estimates serialize as null until their required baseline or worker/exogenous split is available.",
       "properties": {
         "available_count": {
           "type": "integer",
@@ -203,6 +211,35 @@
           "minimum": 0,
           "description": "The larger of the minimum banked-pace rate and every known credit's expiry-deadline pace (§9.7)."
         },
+        "aggregate_burn_per_hour": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "description": "Measured account-level burn across a baseline of at least 24 hours and multiple quantized samples. Null until a usable baseline exists."
+        },
+        "governed_worker_burn_per_hour": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "description": "Measured portion attributable to governed workers after estimating exogenous account use."
+        },
+        "exogenous_burn_per_hour": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "description": "Estimated account usage from operator/interactive sessions, removed before deriving per-worker burn."
+        },
+        "max_feasible_burn_per_hour": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "description": "Maximum measured pace using the estimated worker rate and eligible backlog capacity."
+        },
+        "feasible": {
+          "type": "boolean",
+          "description": "Whether max_feasible_burn_per_hour meets required_burn_per_hour; false when the rate is unknown."
+        },
+        "eligible_backlog_capacity": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Worker cap from the snapshot's eligible backlog count, or current_workers when the source has no backlog signal."
+        },
         "desired_workers": {
           "type": "integer",
           "minimum": 0,
@@ -223,14 +260,54 @@
             "minimum_banked_reset_pace",
             "banked_reset_expiry_pace",
             "bootstrap_banked_reset_burn_rate",
-            "learning_banked_reset_burn_rate"
+            "learning_banked_reset_worker_split",
+            "learning_banked_reset_24h_burn_rate"
           ]
         },
         "known_expirations": {
           "type": "array",
           "description": "Every known available credit's expires_at, sorted ascending. May be empty when the provider reports available_count without per-credit detail.",
           "items": { "$ref": "#/$defs/timestamp" }
+        },
+        "credit_deadlines": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/creditDeadlineAssessment" }
+        },
+        "advisories": {
+          "type": "array",
+          "description": "Newly crossed severity thresholds to be emitted as banked_reset_advisory JSONL events.",
+          "items": { "$ref": "#/$defs/creditDeadlineAdvisory" }
         }
+      }
+    },
+    "advisorySeverity": {
+      "enum": ["warn", "page", "infeasible"]
+    },
+    "creditDeadlineAssessment": {
+      "type": "object",
+      "required": ["credit_id", "expires_at", "need", "required_burn_per_hour", "slack_hours", "severity"],
+      "additionalProperties": true,
+      "properties": {
+        "credit_id": { "type": "string", "minLength": 1 },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "need": { "type": "number", "minimum": 0 },
+        "required_burn_per_hour": { "type": ["number", "null"], "minimum": 0 },
+        "slack_hours": { "type": ["number", "null"] },
+        "severity": { "oneOf": [{ "$ref": "#/$defs/advisorySeverity" }, { "type": "null" }] }
+      }
+    },
+    "creditDeadlineAdvisory": {
+      "type": "object",
+      "required": ["credit_id", "expires_at", "severity", "slack_hours", "required_burn_per_hour", "max_feasible_burn_per_hour", "feasible"],
+      "additionalProperties": true,
+      "properties": {
+        "credit_id": { "type": "string", "minLength": 1 },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "severity": { "$ref": "#/$defs/advisorySeverity" },
+        "slack_hours": { "type": "number" },
+        "required_burn_per_hour": { "type": ["number", "null"], "minimum": 0 },
+        "max_feasible_burn_per_hour": { "type": ["number", "null"], "minimum": 0 },
+        "feasible": { "type": "boolean" }
       }
     },
     "timestamp": {

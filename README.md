@@ -111,6 +111,7 @@ Quota sources normalize to this JSON contract:
 {
   "observed_at": "2026-09-12T12:00:00Z",
   "fresh": true,
+  "eligible_backlog_capacity": 3,
   "windows": [
     {
       "id": "weekly",
@@ -136,6 +137,10 @@ Quota sources normalize to this JSON contract:
 
 `reset_credits` is optional for generic sources. `available_count` is the
 authoritative balance; providers may omit or cap the optional detail list.
+`eligible_backlog_capacity` is also optional and gives the number of workers
+that current eligible queued work can use. While banked reset credits are
+available, this caps the requested fleet size; if absent, the current worker
+count is the cap and quota headroom alone does not scale up the fleet.
 
 Use `source.type: command` for another observer; the command must emit exactly
 one normalized object on stdout. Commands are argument arrays and never passed

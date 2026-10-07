@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// read. A file with no `schema_version` at all predates versioning and is
 /// read with the current version. Earlier versions are migrated by defaulting
 /// fields added to account and host state, then advancing the version on load.
-pub const STATE_SCHEMA_VERSION: u32 = 3;
+pub const STATE_SCHEMA_VERSION: u32 = 4;
 
 fn current_schema_version() -> u32 {
     STATE_SCHEMA_VERSION
@@ -49,6 +49,11 @@ impl Default for State {
 /// that bounds memory and disk without deciding the final number.
 const MAX_HISTORY_SAMPLES_PER_GENERATION: usize = 16;
 
+/// More than two days at the one-minute aggregate-sample interval below, or
+/// over ten days at the default five-minute poll interval.
+const MAX_AGGREGATE_BURN_SAMPLES: usize = 3_072;
+const MIN_AGGREGATE_SAMPLE_INTERVAL_SECONDS: i64 = 60;
+
 /// Maximum number of recent per-host placement decisions retained on disk.
 pub const MAX_PLACEMENT_HISTORY_SAMPLES: usize = 16;
 
@@ -63,6 +68,15 @@ pub struct AccountState {
     /// generation cannot inform this generation's slope.
     #[serde(default)]
     pub history: BTreeMap<String, WindowHistory>,
+    /// Aggregate usage samples retained across reset generations. These are
+    /// used for conservative long-baseline banked-credit pacing; unlike
+    /// `history`, an out-of-cycle reset does not discard earlier intervals.
+    #[serde(default)]
+    pub aggregate_burn_history: BTreeMap<String, VecDeque<AggregateBurnSample>>,
+    /// Last advisory severity emitted for each credit in the current weekly
+    /// reset generation, to avoid repeating an alert on every poll.
+    #[serde(default)]
+    pub credit_alerts: BTreeMap<String, CreditAlertState>,
 }
 
 /// Quota samples associated with one host in one account. `workers` in each
@@ -112,10 +126,51 @@ pub struct HistorySample {
     pub workers: u32,
 }
 
+/// One account-level quota reading for burn-rate estimation. The worker count
+/// is the governed fleet count at that observation; it is used to distinguish
+/// worker burn from exogenous account usage when the history supports it.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct AggregateBurnSample {
+    pub observed_at: DateTime<Utc>,
+    pub used_fraction: f64,
+    pub resets_at: DateTime<Utc>,
+    pub governed_workers: u32,
+}
+
+/// Severity rank retained for event de-duplication: zero is clear, followed
+/// by warn, page, and infeasible.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct CreditAlertState {
+    pub resets_at: DateTime<Utc>,
+    pub severity: u8,
+}
+
 impl AccountState {
     pub fn record(&mut self, snapshot: &QuotaSnapshot, workers: u32, target: u32) {
         record_samples(&mut self.windows, &mut self.history, snapshot, workers);
+        record_aggregate_burn_samples(&mut self.aggregate_burn_history, snapshot, workers);
         self.last_target = Some(target);
+    }
+
+    /// Replace the current alert levels with the latest per-credit levels.
+    /// A changed reset timestamp starts a fresh advisory generation.
+    pub fn record_credit_alerts(
+        &mut self,
+        resets_at: DateTime<Utc>,
+        levels: impl IntoIterator<Item = (String, u8)>,
+    ) {
+        self.credit_alerts = levels
+            .into_iter()
+            .map(|(credit_id, severity)| {
+                (
+                    credit_id,
+                    CreditAlertState {
+                        resets_at,
+                        severity,
+                    },
+                )
+            })
+            .collect();
     }
 }
 
@@ -253,6 +308,39 @@ fn record_samples(
     *history = next_history;
 }
 
+fn record_aggregate_burn_samples(
+    histories: &mut BTreeMap<String, VecDeque<AggregateBurnSample>>,
+    snapshot: &QuotaSnapshot,
+    governed_workers: u32,
+) {
+    let mut next = BTreeMap::new();
+    for window in &snapshot.windows {
+        let mut samples = histories.remove(&window.id).unwrap_or_default();
+        let sample = AggregateBurnSample {
+            observed_at: snapshot.observed_at,
+            used_fraction: window.used_fraction,
+            resets_at: window.resets_at,
+            governed_workers,
+        };
+        let should_record = samples.back().is_none_or(|previous| {
+            previous.resets_at != sample.resets_at
+                || sample
+                    .observed_at
+                    .signed_duration_since(previous.observed_at)
+                    .num_seconds()
+                    >= MIN_AGGREGATE_SAMPLE_INTERVAL_SECONDS
+        });
+        if should_record {
+            samples.push_back(sample);
+        }
+        while samples.len() > MAX_AGGREGATE_BURN_SAMPLES {
+            samples.pop_front();
+        }
+        next.insert(window.id.clone(), samples);
+    }
+    *histories = next;
+}
+
 /// A state file exists but does not parse as a `State` at all (bad JSON,
 /// wrong shape) — as opposed to parsing fine with an unsupported
 /// `schema_version`, which stays a hard load failure since misreading a
@@ -324,11 +412,18 @@ impl State {
             );
         }
         // Version 2 adds the independent per-(account, host) sample map.
-        // Version 3 adds per-host placement target history. Both additions
-        // default empty when loading an older file, so migration only needs
-        // to advance the in-memory version before the next save.
+        // Version 3 adds per-host placement target history. Version 4 adds
+        // reset-spanning aggregate burn samples and advisory de-duplication
+        // state. All additions default empty when loading an older file.
         if state.schema_version < STATE_SCHEMA_VERSION {
             state.schema_version = STATE_SCHEMA_VERSION;
+        }
+        for account in state.accounts.values_mut() {
+            for samples in account.aggregate_burn_history.values_mut() {
+                while samples.len() > MAX_AGGREGATE_BURN_SAMPLES {
+                    samples.pop_front();
+                }
+            }
         }
         // Keep the in-memory bound even if a file was written by an older
         // development build or manually edited with an oversized history.
@@ -473,6 +568,7 @@ mod tests {
                 duration_minutes: None,
                 reached: false,
             }],
+            eligible_backlog_capacity: None,
             reset_credits: None,
         }
     }
@@ -520,6 +616,31 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_burn_history_keeps_samples_across_reset_generations() {
+        let mut account = AccountState::default();
+        let start = Utc::now();
+        let first_generation = start + chrono::Duration::hours(5);
+        let second_generation = start + chrono::Duration::days(1);
+
+        let mut first = snapshot_with_one_window("weekly", 0.92, first_generation);
+        first.observed_at = start;
+        account.record(&first, 6, 6);
+
+        let mut second = snapshot_with_one_window("weekly", 0.01, second_generation);
+        second.observed_at = start + chrono::Duration::hours(6);
+        account.record(&second, 6, 6);
+
+        let aggregate = &account.aggregate_burn_history["weekly"];
+        assert_eq!(aggregate.len(), 2);
+        assert_eq!(aggregate[0].resets_at, first_generation);
+        assert_eq!(aggregate[1].resets_at, second_generation);
+
+        let generation_local = &account.history["weekly"];
+        assert_eq!(generation_local.resets_at, second_generation);
+        assert_eq!(generation_local.samples.len(), 1);
+    }
+
+    #[test]
     fn record_drops_history_for_windows_no_longer_in_the_snapshot() {
         let mut account = AccountState::default();
         let resets_at = Utc::now() + chrono::Duration::hours(5);
@@ -530,6 +651,7 @@ mod tests {
             observed_at: Utc::now(),
             fresh: true,
             windows: Vec::new(),
+            eligible_backlog_capacity: None,
             reset_credits: None,
         };
         account.record(&empty_snapshot, 1, 3);
@@ -547,8 +669,12 @@ mod tests {
 
         let mut state = State::default();
         let account = state.accounts.entry("acct".to_string()).or_default();
-        account.record(&snapshot_with_one_window("5h", 0.2, resets_at), 2, 3);
-        account.record(&snapshot_with_one_window("5h", 0.3, resets_at), 2, 3);
+        let mut first = snapshot_with_one_window("5h", 0.2, resets_at);
+        first.observed_at = Utc::now();
+        let mut second = snapshot_with_one_window("5h", 0.3, resets_at);
+        second.observed_at = first.observed_at + chrono::Duration::minutes(5);
+        account.record(&first, 2, 3);
+        account.record(&second, 2, 3);
         state.save(&path).unwrap();
 
         let (loaded, quarantined) = State::load(&path).unwrap();
@@ -556,6 +682,10 @@ mod tests {
         let history = loaded.accounts["acct"].history.get("5h").unwrap();
         assert_eq!(history.samples.len(), 2);
         assert_eq!(history.samples.back().unwrap().used_fraction, 0.3);
+        assert_eq!(
+            loaded.accounts["acct"].aggregate_burn_history["5h"].len(),
+            2
+        );
     }
 
     #[test]

@@ -1,0 +1,20 @@
+{
+  "samples": [
+    {"observed_at":"2026-10-01T21:13:00Z","used_fraction":0.300,"resets_at":"2026-10-08T12:42:00Z","governed_workers":15},
+    {"observed_at":"2026-10-02T00:13:00Z","used_fraction":0.314,"resets_at":"2026-10-08T12:42:00Z","governed_workers":15},
+    {"observed_at":"2026-10-02T03:13:00Z","used_fraction":0.328,"resets_at":"2026-10-08T12:42:00Z","governed_workers":15},
+    {"observed_at":"2026-10-02T06:13:00Z","used_fraction":0.342,"resets_at":"2026-10-08T12:42:00Z","governed_workers":15},
+    {"observed_at":"2026-10-02T09:13:00Z","used_fraction":0.356,"resets_at":"2026-10-08T12:42:00Z","governed_workers":15},
+    {"observed_at":"2026-10-02T12:13:00Z","used_fraction":0.370,"resets_at":"2026-10-08T12:42:00Z","governed_workers":15},
+    {"observed_at":"2026-10-02T12:42:00Z","used_fraction":0.010,"resets_at":"2026-10-09T12:42:00Z","governed_workers":6},
+    {"observed_at":"2026-10-02T15:13:00Z","used_fraction":0.0175,"resets_at":"2026-10-09T12:42:00Z","governed_workers":6},
+    {"observed_at":"2026-10-02T18:13:00Z","used_fraction":0.0265,"resets_at":"2026-10-09T12:42:00Z","governed_workers":6},
+    {"observed_at":"2026-10-02T21:00:00Z","used_fraction":0.035,"resets_at":"2026-10-09T12:42:00Z","governed_workers":6},
+    {"observed_at":"2026-10-02T21:13:00Z","used_fraction":0.010,"resets_at":"2026-10-09T21:13:00Z","governed_workers":6},
+    {"observed_at":"2026-10-06T03:28:00Z","used_fraction":0.020,"resets_at":"2026-10-14T12:42:00Z","governed_workers":6},
+    {"observed_at":"2026-10-06T12:28:00Z","used_fraction":0.065,"resets_at":"2026-10-14T12:42:00Z","governed_workers":6},
+    {"observed_at":"2026-10-06T21:28:00Z","used_fraction":0.110,"resets_at":"2026-10-14T12:42:00Z","governed_workers":6},
+    {"observed_at":"2026-10-07T03:27:00Z","used_fraction":0.920,"resets_at":"2026-10-14T12:42:00Z","governed_workers":6},
+    {"observed_at":"2026-10-07T03:28:00Z","used_fraction":0.010,"resets_at":"2026-10-14T03:28:00Z","governed_workers":6}
+  ]
+}

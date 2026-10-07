@@ -163,7 +163,7 @@ accounts:
     assert_eq!(metrics["actuation_attempted"], false);
 
     let saved_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    assert_eq!(saved_state["schema_version"], 3);
+    assert_eq!(saved_state["schema_version"], 4);
     assert_eq!(
         saved_state["host_states"]["acct"]["east"]["placement_history"][0]["target_workers"],
         4

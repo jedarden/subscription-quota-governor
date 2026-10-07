@@ -159,6 +159,7 @@ fn single_window_snapshot(
             duration_minutes: Some(300),
             reached: used_fraction >= 1.0,
         }],
+        eligible_backlog_capacity: None,
         reset_credits: None,
     }
 }

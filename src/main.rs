@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use subscription_governor::config::{ActuatorConfig, Config, ResourceSourceConfig, SourceConfig};
-use subscription_governor::controller::{evaluate, Decision};
+use subscription_governor::controller::{evaluate, CreditDeadlineAdvisory, Decision};
 use subscription_governor::fleet;
 use subscription_governor::model::ResourceSnapshot;
 use subscription_governor::placement::{self, HostPlacement};
@@ -864,6 +864,19 @@ fn host_decision_records(
         .collect()
 }
 
+fn banked_reset_advisory_event(
+    account: &str,
+    time: DateTime<Utc>,
+    advisory: &CreditDeadlineAdvisory,
+) -> serde_json::Value {
+    json!({
+        "event": "banked_reset_advisory",
+        "time": time,
+        "account": account,
+        "advisory": advisory,
+    })
+}
+
 fn run_cycle(
     config: &Config,
     state: &mut State,
@@ -912,6 +925,21 @@ fn run_cycle(
                 .map_err(AccountFailure::Observation)?;
             let readiness = readiness_for_decision(&decision);
             metrics.apply_decision(&decision, readiness.reason.clone(), now);
+            if let Some(banked) = &decision.banked_resets {
+                for advisory in &banked.advisories {
+                    let advisory_event = banked_reset_advisory_event(name, now, advisory);
+                    println!(
+                        "{}",
+                        serde_json::to_string(&advisory_event)
+                            .map_err(|error| AccountFailure::Observation(error.into()))?
+                    );
+                }
+                if !banked.advisories.is_empty() {
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|error| AccountFailure::Observation(error.into()))?;
+                }
+            }
 
             if let Some(current) = &host_current {
                 let resources = collect_host_resources(name, account_config);
@@ -972,6 +1000,25 @@ fn run_cycle(
                     workers
                 };
                 account_state.record(&snapshot, sample_workers, decision.desired_workers);
+                if let Some(banked) = &decision.banked_resets {
+                    let reset_generation = decision
+                        .windows
+                        .iter()
+                        .find(|window| window.id == banked.governing_window)
+                        .map(|window| window.resets_at)
+                        .unwrap_or(snapshot.observed_at);
+                    account_state.record_credit_alerts(
+                        reset_generation,
+                        banked.credit_deadlines.iter().map(|deadline| {
+                            (
+                                deadline.credit_id.clone(),
+                                deadline.severity.map_or(0, |severity| severity.rank()),
+                            )
+                        }),
+                    );
+                } else {
+                    account_state.credit_alerts.clear();
+                }
                 if let (Some(current), Some(placements)) = (&host_current, &host_placements) {
                     for placement in placements {
                         let sample_workers = if host_actuation
@@ -1412,7 +1459,9 @@ mod exit_code_tests {
 #[cfg(test)]
 mod status_tests {
     use super::*;
-    use subscription_governor::controller::{BankedResetDecision, WindowDecision};
+    use subscription_governor::controller::{
+        AdvisorySeverity, BankedResetDecision, WindowDecision,
+    };
 
     fn decision(stale: bool, windows: Vec<WindowDecision>) -> Decision {
         let binding_window = windows.first().map(|window| window.id.clone());
@@ -1460,14 +1509,47 @@ mod status_tests {
             governing_window: "weekly".to_owned(),
             minimum_pace_multiplier: 2.0,
             required_burn_per_hour: 0.1,
+            aggregate_burn_per_hour: None,
+            governed_worker_burn_per_hour: None,
+            exogenous_burn_per_hour: None,
+            max_feasible_burn_per_hour: None,
+            feasible: false,
+            eligible_backlog_capacity: 0,
             desired_workers: 0,
             manual_redemption_recommended: true,
             deadline_missed: false,
             reason: "weekly_window_awaiting_manual_redemption".to_owned(),
             known_expirations: Vec::new(),
+            credit_deadlines: Vec::new(),
+            advisories: Vec::new(),
         });
         let readiness = readiness_for_decision(&d);
         assert_eq!(readiness.state, ReadinessState::IntentionalHold);
+    }
+
+    #[test]
+    fn credit_deadline_advisory_is_emitted_as_a_standalone_operator_event() {
+        let expires_at = "2026-10-05T04:19:00Z".parse().unwrap();
+        let time = "2026-10-02T21:13:00Z".parse().unwrap();
+        let advisory = CreditDeadlineAdvisory {
+            credit_id: "8a8b".into(),
+            expires_at,
+            severity: AdvisorySeverity::Infeasible,
+            slack_hours: -148.0,
+            required_burn_per_hour: Some(0.0202),
+            max_feasible_burn_per_hour: Some(0.005),
+            feasible: false,
+        };
+
+        let event = banked_reset_advisory_event("codex", time, &advisory);
+        assert_eq!(event["event"], "banked_reset_advisory");
+        assert_eq!(event["account"], "codex");
+        assert_eq!(event["advisory"]["credit_id"], "8a8b");
+        assert_eq!(event["advisory"]["severity"], "infeasible");
+        assert_eq!(event["advisory"]["required_burn_per_hour"], 0.0202);
+        assert_eq!(event["advisory"]["max_feasible_burn_per_hour"], 0.005);
+        assert!(event.get("redeem").is_none());
+        serde_json::to_string(&event).unwrap();
     }
 
     #[test]
