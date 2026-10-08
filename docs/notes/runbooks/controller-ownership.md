@@ -514,3 +514,39 @@ next step is adding hardening back incrementally with the actual needed
 exception (most likely: skip only `MemoryDenyWriteExecute` for this unit, or
 give `claude-print`'s real cache/tmp paths explicit `ReadWritePaths` instead
 of `PrivateTmp`'s isolated tmpfs), not leaving it unhardened long-term.
+
+### A second PATH gap masked recovery after the sandboxing fix
+
+After the sandboxing fix above, subgov's `needle_run` actuator started
+succeeding every cycle — `needle run` exited 0 and logged `[1/1] Started
+worker 'alpha'` — but the launched worker crashed within milliseconds of
+every single boot, invisibly to both subgov and `needle run`'s own exit
+code. Only the worker's own stderr log
+(`~/.needle/logs/needle-claude-print-alpha.stderr.log`) showed why:
+
+```text
+Error: failed to open configured bead store
+Caused by:
+    0: failed to resolve bead_cli.backend for workspace /home/coding/pose-detection
+    1: bead CLI not found (checked PATH, ~/.local/bin/bead, /usr/local/cargo/bin/bead)
+    2: bead not found
+```
+
+`bead` lives at `~/.cargo/bin/bead` here — a fourth location none of
+NEEDLE's own checked paths covered. This repeated across at least 8
+launch-and-immediate-crash cycles (20:34–21:16 UTC) before being caught.
+Added `~/.cargo/bin` to the unit's `Environment=PATH=` alongside
+`~/.local/bin`, reloaded, restarted.
+
+**Verified live, not just via a log line:** the resulting worker's
+heartbeat (`~/.needle/state/heartbeats/claude-print-alpha.json`) showed
+`state: EXECUTING`, a real `current_bead`, and a heartbeat timestamp 12
+seconds old at the time of the check; `tmux list-sessions` and `pgrep` both
+confirmed the real session and PIDs. The pool has a genuinely running
+worker under subgov, matching its configured target.
+
+**Migration status: complete and stable.** `claude-governor.service` is
+retired (stopped and disabled). `subgov.service` is the sole live governor
+for `anthropic:local-subscription`, correctly actuating, with a real worker
+running under it. The hardening re-add noted above remains the only open
+follow-up.
