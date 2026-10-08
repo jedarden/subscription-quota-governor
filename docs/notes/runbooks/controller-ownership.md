@@ -550,3 +550,50 @@ retired (stopped and disabled). `subgov.service` is the sole live governor
 for `anthropic:local-subscription`, correctly actuating, with a real worker
 running under it. The hardening re-add noted above remains the only open
 follow-up.
+
+### Re-hardening, staged and tested against the live worker — 2026-10-08
+
+Re-added hardening incrementally, batch by batch, verifying after each one
+with a disposable test unit (mirroring the real unit's directives, running
+only `needle test-agent claude-print`) and then against the real service
+with its actual worker running — never assuming a probe-only pass meant the
+full worker runtime was safe.
+
+**A real, separate bug surfaced during this: `KillMode=control-group`
+(systemd's default) kills the whole unit's cgroup on every restart.** The
+`needle_run` actuator's spawned tmux session — and the real autonomous
+coding worker running inside it — stays in `subgov.service`'s own cgroup
+(confirmed via `systemd-cgls --user`: the worker's tmux process appeared
+directly under `subgov.service`, not under its own `needle-worker@.service`
+unit, which exists as a template but isn't what this launch path uses).
+This means **every `systemctl restart subgov.service`** — for routine
+maintenance, a crash-restart, or exactly this re-hardening work — silently
+killed whatever the dispatched worker was mid-task on. It killed a real,
+20-minute-old, productively-executing worker once during this exact
+re-hardening session before being caught. Fixed with `KillMode=process`;
+verified directly by checking the worker's PID was identical before and
+after a real restart.
+
+A second false-positive trap: a probe-only test (`needle test-agent`) can
+pass clean while a batch still breaks the full worker runtime. `PrivateTmp`
+passed its probe test, but a freshly-launched worker under it crashed
+immediately — `Error: failed to create temp dir: /tmp/needle ... No such
+file or directory` — because NEEDLE expects a real, shared `/tmp/needle`,
+not an isolated tmpfs. The earlier "survived" observation was watching the
+*same* worker process that had started before any hardening existed —
+namespace/mount settings apply at exec time, not retroactively — not
+evidence the setting was actually safe.
+
+**Final state**, verified by a fresh worker surviving 15+ minutes of real
+execution (`EXECUTING` → `HANDLING`, same PID throughout, zero errors) under
+the full configuration:
+
+| Restored | Deliberately excluded, with reason |
+| --- | --- |
+| `KillMode=process` (new; not in the original template) | `CapabilityBoundingSet=`/`AmbientCapabilities=` — this host's container/session context does not grant `CAP_SETPCAP` to unprivileged user units; fails the whole unit to start (`Failed to drop capabilities: Operation not permitted`, exit 218/CAPABILITIES), not just under-provisioned |
+| `ProtectKernelTunables/Modules/Logs/ControlGroups/Clock/Hostname`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictRealtime`, `LockPersonality`, `SystemCallArchitectures=native` | `MemoryDenyWriteExecute` — breaks the Node.js/V8-based real `claude` CLI's JIT (the original incident) |
+| `SystemCallFilter=@system-service`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` | `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp` — the spawned worker is a roaming autonomous coding agent that writes across however many repos under `$HOME` it roams into in a cycle (observed: agent-archivist, FABRIC, claude-print, shephrd, ROTA, ai-code-battle, and more in one cycle) and needs the real shared `/tmp/needle`; these are structural exceptions for this deployment, not gaps to patch with more `ReadWritePaths` |
+| `RestrictSUIDSGID`, `RemoveIPC`, `UMask=0077`, `NoNewPrivileges` | |
+
+The disposable `subgov-sandbox-test.service` used for probe-only checks has
+been removed; it was never part of the deployment.
