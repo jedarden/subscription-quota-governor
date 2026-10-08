@@ -95,6 +95,47 @@ impl ResourceSnapshot {
     }
 }
 
+/// Two `resets_at` values that differ by no more than this are treated as
+/// the same reset generation, not a new one.
+///
+/// The Anthropic usage API computes `resets_at` dynamically per request
+/// rather than returning a fixed, stored absolute timestamp: polling the
+/// *same* live five-hour window a few minutes apart returns values like
+/// `2026-10-08T06:50:00.051247Z`, then `.130047Z`, then `.995687Z`, then
+/// `.771238Z` -- sub-second jitter on every single call (confirmed live,
+/// 2026-10-08, across ten consecutive real polls). Comparing `resets_at` for
+/// exact equality -- as every cross-cycle "same generation" check in this
+/// codebase originally did -- therefore never matches two real samples of
+/// the same generation. That silently defeated burn-rate learning
+/// (`controller::evaluate`'s `LinearToReset` pacing stayed on
+/// `learning_burn_rate` forever against the live account), banked-reset
+/// credit alert de-duplication (every poll re-evaluated as a fresh
+/// generation), the long-baseline aggregate burn estimator (every interval
+/// misclassified as spanning a reset, inflating the learned rate), and
+/// bounded per-generation sample history (discarded and restarted every
+/// single cycle). It went undetected because every existing unit test and
+/// trace simulation constructs `resets_at` as a fixed `DateTime` literal
+/// reused byte-for-byte across synthetic samples, which matches trivially
+/// by construction -- this is the first time any of this logic ran against
+/// the real, live API.
+///
+/// 60 seconds is generous relative to the observed sub-second jitter and
+/// tiny relative to the shortest real reset interval this codebase handles
+/// (`five_hour`, 18,000 seconds) -- nothing resembling a genuine reset can
+/// occur within it, so it cannot cause two truly different generations to
+/// be treated as one.
+pub const RESET_GENERATION_JITTER_TOLERANCE_SECONDS: i64 = 60;
+
+/// Whether `a` and `b` identify the same reset generation, tolerant of the
+/// live API's sub-second `resets_at` jitter (see
+/// [`RESET_GENERATION_JITTER_TOLERANCE_SECONDS`]). Use this everywhere two
+/// `resets_at` values from separate polls are compared; exact `DateTime`
+/// equality will not reliably match two samples of the same real-world
+/// generation.
+pub fn same_reset_generation(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
+    a.signed_duration_since(b).num_seconds().abs() <= RESET_GENERATION_JITTER_TOLERANCE_SECONDS
+}
+
 fn default_true() -> bool {
     true
 }

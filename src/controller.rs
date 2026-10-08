@@ -1,5 +1,5 @@
 use crate::config::{AccountConfig, StaleBehavior, Strategy};
-use crate::model::{QuotaSnapshot, QuotaWindow};
+use crate::model::{same_reset_generation, QuotaSnapshot, QuotaWindow};
 use crate::state::{AccountState, AggregateBurnSample, WindowSample};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -172,7 +172,7 @@ pub fn evaluate(
                 Strategy::CeilingOnly => (fleet.max_workers, "below_ceiling"),
                 Strategy::LinearToReset => {
                     match prior.windows.get(&window.id).filter(|sample| {
-                        sample.resets_at == window.resets_at
+                        same_reset_generation(sample.resets_at, window.resets_at)
                             && snapshot
                                 .observed_at
                                 .signed_duration_since(sample.observed_at)
@@ -345,7 +345,7 @@ fn banked_reset_decision(
         let rank_before = prior
             .credit_alerts
             .get(&credit.id)
-            .filter(|state| state.resets_at == window.resets_at)
+            .filter(|state| same_reset_generation(state.resets_at, window.resets_at))
             .map(|state| state.severity)
             .unwrap_or(0);
         let required = deadline_rate;
@@ -553,7 +553,8 @@ fn estimate_aggregate_burn(
         if elapsed <= 0.0 {
             continue;
         }
-        let burned_fraction = if previous.resets_at == next.resets_at {
+        let same_generation = same_reset_generation(previous.resets_at, next.resets_at);
+        let burned_fraction = if same_generation {
             (next.used_fraction - previous.used_fraction).max(0.0)
         } else {
             next.used_fraction.max(0.0)
@@ -562,7 +563,7 @@ fn estimate_aggregate_burn(
             elapsed_hours: elapsed,
             burned_fraction,
             governed_workers_x2: previous.governed_workers + next.governed_workers,
-            split_interval: previous.resets_at == next.resets_at,
+            split_interval: same_generation,
         });
     }
     let measured = intervals
@@ -915,6 +916,89 @@ mod tests {
         let decision = evaluate("test", &account(), &snapshot, &prior, 2, now).unwrap();
         assert_eq!(decision.desired_workers, 1);
         assert_eq!(decision.windows[0].reason, "paced_to_reset");
+    }
+
+    /// Regression for the live 2026-10-08 incident: the Anthropic usage API
+    /// computes `resets_at` dynamically per request, so two real polls of
+    /// the *same* reset generation return sub-second-different timestamps
+    /// (observed live: `.051247Z`, `.130047Z`, `.995687Z`, ... across
+    /// consecutive polls). Before `same_reset_generation` replaced exact
+    /// `DateTime` equality, this prior sample's `resets_at` (300ms off from
+    /// the current window's) would never match, pacing would never leave
+    /// `learning_burn_rate`, and this is exactly why: every existing test
+    /// up to this one used a byte-identical `resets_at` literal, which
+    /// can't exercise the real API's jitter at all.
+    #[test]
+    fn learns_per_worker_burn_and_paces_despite_resets_at_jitter() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(8);
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.5,
+                resets_at: reset,
+                duration_minutes: None,
+                reached: false,
+            }],
+            eligible_backlog_capacity: None,
+            reset_credits: None,
+        };
+        let mut prior = AccountState::default();
+        prior.windows.insert(
+            "weekly".into(),
+            WindowSample {
+                observed_at: now - Duration::hours(1),
+                used_fraction: 0.4,
+                // Same real generation, jittered by well under the
+                // tolerance -- not the byte-identical value every other
+                // test in this file uses.
+                resets_at: reset + Duration::milliseconds(300),
+                workers: 2,
+            },
+        );
+        let decision = evaluate("test", &account(), &snapshot, &prior, 2, now).unwrap();
+        assert_eq!(decision.desired_workers, 1);
+        assert_eq!(decision.windows[0].reason, "paced_to_reset");
+    }
+
+    /// The jitter tolerance must not be so wide that a genuinely different
+    /// generation gets treated as the same one. A real reset is always
+    /// hours away, so even a generous multi-minute gap must still count as
+    /// a different generation and fall back to learning, not pace off a
+    /// stale prior-generation sample.
+    #[test]
+    fn a_genuinely_different_generation_is_not_treated_as_jitter() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(8);
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.5,
+                resets_at: reset,
+                duration_minutes: None,
+                reached: false,
+            }],
+            eligible_backlog_capacity: None,
+            reset_credits: None,
+        };
+        let mut prior = AccountState::default();
+        prior.windows.insert(
+            "weekly".into(),
+            WindowSample {
+                observed_at: now - Duration::hours(1),
+                used_fraction: 0.9,
+                // A different generation (the prior reset), far outside the
+                // jitter tolerance -- must not be mistaken for the same one.
+                resets_at: reset - Duration::hours(1),
+                workers: 2,
+            },
+        );
+        let decision = evaluate("test", &account(), &snapshot, &prior, 2, now).unwrap();
+        assert_eq!(decision.windows[0].reason, "learning_burn_rate");
     }
 
     #[test]

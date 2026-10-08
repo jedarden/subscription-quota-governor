@@ -1,6 +1,6 @@
-use crate::model::QuotaSnapshot;
 #[cfg(test)]
 use crate::model::QuotaWindow;
+use crate::model::{same_reset_generation, QuotaSnapshot};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -290,7 +290,9 @@ fn record_samples(
     for window in &snapshot.windows {
         let mut entry = history
             .remove(&window.id)
-            .filter(|existing: &WindowHistory| existing.resets_at == window.resets_at)
+            .filter(|existing: &WindowHistory| {
+                same_reset_generation(existing.resets_at, window.resets_at)
+            })
             .unwrap_or_else(|| WindowHistory {
                 resets_at: window.resets_at,
                 samples: VecDeque::new(),
@@ -589,6 +591,32 @@ mod tests {
         assert_eq!(
             last.used_fraction,
             (MAX_HISTORY_SAMPLES_PER_GENERATION + 4) as f64 * 0.01
+        );
+    }
+
+    /// Regression for the live 2026-10-08 incident: the real Anthropic
+    /// usage API computes `resets_at` dynamically per request, so
+    /// consecutive polls of the *same* generation return sub-second-jittered
+    /// timestamps, never byte-identical ones. Before `same_reset_generation`
+    /// replaced exact equality here, every single poll looked like a new
+    /// generation and history never accumulated past one sample --
+    /// `record_bounds_history_length_per_generation` above couldn't catch
+    /// this because it reuses one exact `resets_at` literal across every
+    /// call, which is not what the real API does.
+    #[test]
+    fn record_accumulates_history_despite_resets_at_jitter() {
+        let mut account = AccountState::default();
+        let base = Utc::now() + chrono::Duration::hours(5);
+        for i in 0..5 {
+            let jittered = base + chrono::Duration::milliseconds(i as i64 * 100);
+            let snapshot = snapshot_with_one_window("5h", i as f64 * 0.01, jittered);
+            account.record(&snapshot, 1, 3);
+        }
+        let history = account.history.get("5h").unwrap();
+        assert_eq!(
+            history.samples.len(),
+            5,
+            "sub-second jitter in resets_at must not be mistaken for a new generation each cycle"
         );
     }
 
