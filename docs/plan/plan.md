@@ -230,7 +230,7 @@ Build requirements:
 
 ### 7.3 Claude Code with Z.AI
 
-Baseline: `[x]` provider-neutral boundary; `[ ]` production collector contract.
+Baseline: `[x]` provider-neutral boundary; `[x]` collector contract; `[ ]` production rollout.
 
 No private endpoint or deployment component is part of this repository. A
 site-local collector must emit the normalized contract through one of:
@@ -244,12 +244,33 @@ Build requirements:
 - [x] Provide a `claude-zai` example using a generic command.
 - [x] Keep provider credentials outside `subgov` and outside command arguments.
 - [x] Apply exactly the same freshness and window validation as native sources.
-- [ ] Publish a standalone JSON Schema for collector authors.
-- [ ] Add contract tests that run an anonymous fixture-producing helper.
-- [ ] Document secure HTTP deployment options; the v1 governor will not add
+- [x] Publish a standalone JSON Schema for collector authors.
+- [x] Add contract tests that run an anonymous fixture-producing helper.
+- [x] Document secure HTTP deployment options; the v1 governor will not add
   arbitrary secret headers to configuration.
-- [ ] Verify reset-generation transitions and percentage/absolute-usage
+- [x] Verify reset-generation transitions and percentage/absolute-usage
   normalization in the site-local collector before production rollout.
+
+Collector normalization rules (locked):
+
+- A site-local collector may read the quota gauges that a Z.AI proxy already
+  exports rather than call the provider itself. Its `used_fraction`,
+  `resets_at`, and freshness come from that sample; `observed_at` is the
+  sample's own time (now minus the sample age), not the collector's run time.
+- Z.AI windows start on first use. An idle account reports the previous,
+  lapsed reset. Because the controller holds the current count on a lapsed
+  reset (§9.3, reason `reset_due`), a lapsed window would block bootstrap
+  from zero workers. The collector therefore projects a lapsed window with
+  `used_fraction == 0` forward to `now + duration`. A lapsed window with
+  usage above zero is passed through unchanged, so §9.3 still holds the count
+  while the provider has not published the new generation. The contract and
+  controller are unchanged by this rule.
+- The proxy path exposes only the five-hour window. No weekly window is
+  emitted until the provider quota response supplies one; a missing weekly
+  window is a known gap, not unlimited weekly capacity, and the operator
+  decides whether to run without a weekly bound.
+- Upstream 429 rates are not part of this contract. Consuming them requires a
+  separate plan revision (§21).
 
 ### 7.4 Generic source behavior
 
