@@ -27,9 +27,14 @@ dependency change and before a release tag:
 ./scripts/audit.sh
 ```
 
-This is a local, repo-level check today; wiring it into the Argo `iad-ci`
-workflow is the remaining part of §16 WP7 ("verify ... in the configured Argo
-workflow"), tracked separately from dependency pinning itself.
+The same script is a required gate in the `iad-ci` Argo WorkflowTemplate
+`subscription-quota-governor-ci` (declarative-config,
+`k8s/iad-ci/argo-workflows/subscription-quota-governor-ci-workflowtemplate.yml`).
+The workflow installs `cargo-audit` 0.22.1 (pinned, `--locked`) and runs
+`./scripts/audit.sh` after `cargo doc` in the single fail-fast verify script,
+so any advisory against `Cargo.lock` fails the workflow before the schema and
+secret-scan steps. Bump the pinned `cargo-audit` version in that template
+deliberately, like any other dependency.
 
 `cargo-audit` checks published RustSec security advisories; it does not check
 license compatibility. `serde_yaml` 0.9.34 is the crate's final release
