@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "observed_at": "2026-10-11",
+  "controllers": [
+    {
+      "name": "subgov-claude-anthropic",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=claude-print:prefix=none",
+      "mode": "actuating",
+      "config_path": "/home/coding/.config/subgov/claude-anthropic.yaml",
+      "state_path": "/home/coding/.local/state/subscription-governor/claude-anthropic.json",
+      "actuator": "subgov needle_run for claude-print",
+      "evidence": "subgov.service active; claude-governor.service and its stop-watch timer disabled 2026-10-10."
+    },
+    {
+      "name": "cgov-codinghome",
+      "host": "codinghome",
+      "account_id": "anthropic:local-subscription",
+      "fleet_id": "needle:agent=claude-print:prefix=none",
+      "mode": "disabled",
+      "config_path": "/home/coding/.config/claude-governor/governor.yaml",
+      "state_path": "/home/coding/.config/claude-governor/governor-state.json",
+      "actuator": "cgov daemon worker launch path",
+      "evidence": "claude-governor.service inactive and disabled; stop-watch timer disabled."
+    },
+    {
+      "name": "subgov-codex-elastic",
+      "host": "codinghome",
+      "account_id": "codex:local-profile",
+      "fleet_id": "needle:agent=codex-gpt-5.6-luna-xhigh:prefix=sg-codex-",
+      "mode": "observe_only",
+      "config_path": "/home/coding/.config/subgov/codex.yaml",
+      "state_path": "/home/coding/.local/state/subgov/codex.json",
+      "actuator": "subgov needle_run, suppressed by --observe-only",
+      "evidence": "subgov-codex.service runs with --observe-only."
+    },
+    {
+      "name": "subgov-claude-zai-elastic",
+      "host": "codinghome",
+      "account_id": "zai:proxy-quota",
+      "fleet_id": "needle:agent=claude-code-glm-5.3-flash:prefix=sg-zai-",
+      "mode": "observe_only",
+      "config_path": "/home/coding/.config/subgov/claude-zai.yaml",
+      "state_path": "/home/coding/.local/state/subgov/claude-zai.json",
+      "actuator": "subgov needle_run, suppressed by --observe-only",
+      "evidence": "subgov-claude-zai.service runs with --observe-only."
+    },
+    {
+      "name": "needle-zai-governor-codinghome",
+      "host": "codinghome",
+      "account_id": "zai:proxy-quota",
+      "fleet_id": "needle:glm-roam-pool",
+      "mode": "disabled",
+      "config_path": "/home/coding/.local/bin/needle-zai-governor",
+      "state_path": "/home/coding/.local/state/needle-zai-governor/desired_count-v3",
+      "actuator": "systemd user units needle-worker@glm-*",
+      "evidence": "needle-zai-governor service inactive and timer not active."
+    }
+  ]
+}

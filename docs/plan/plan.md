@@ -1480,10 +1480,11 @@ Dependencies: WP15, WP2.
 
 Dependencies: WP15, WP16, §7.3.
 
-- [ ] Account config and systemd unit for `codex` and `claude-zai`, observe-only
-  first, running alongside `claude-anthropic` in one or separate processes with
-  the preflight (§10) passing for every pair.
-- [ ] `subgov doctor` passes the NEEDLE adapter parity check for each adapter.
+- [x] Account config and systemd unit for `codex` and `claude-zai`, observe-only
+  first, running alongside `claude-anthropic` in separate processes with the
+  preflight (§10) passing for every pair (`examples/elastic-*.yaml`,
+  `tests/fixtures/controller-ownership/elastic-tier-observe-only.json`).
+- [x] `subgov doctor` passes the NEEDLE adapter parity check for each adapter.
 
 #### WP18: staged elastic rollout
 

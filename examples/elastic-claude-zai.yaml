@@ -1,0 +1,34 @@
+version: 1
+poll_interval_seconds: 300
+state_path: /home/coding/.local/state/subgov/claude-zai.json
+# Plan §23: elastic tier over the roster. Observe-only until the staged rollout.
+accounts:
+  claude-zai:
+    source:
+      type: command
+      argv: [/home/coding/.local/bin/subgov-zai-quota]
+    fleet:
+      min_workers: 0
+      max_workers: 2
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 1
+      observer:
+        type: needle_status
+        agent: claude-code-glm-5.3-flash
+        identifier_prefix: sg-zai-
+        stale_after_seconds: 60
+      actuator:
+        type: needle_run
+        repo: /home/coding/SEAM
+        adapter: claude-code-glm-5.3-flash
+        identifier_prefix: sg-zai-
+    utilization:
+      reserve_fraction: 0.10
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      minimum_sample_seconds: 240
+      windows:
+        five_hour:
+          reserve_fraction: 0.15
