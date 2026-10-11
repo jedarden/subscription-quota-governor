@@ -21,6 +21,36 @@ pub struct Decision {
     pub binding_window: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub banked_resets: Option<BankedResetDecision>,
+    /// Plan §23.4: fresh same-adapter workers the governor does not own (the
+    /// roster floor). Zero, and omitted from events, for an unscoped account.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unowned_workers: u32,
+    /// Plan §23.4: the pool-wide target the elastic `desired_workers` was
+    /// derived from. Present only when `unowned_workers` is non-zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_total: Option<u32>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+impl Decision {
+    /// Re-expresses a decision made over the whole pool (owned plus unowned
+    /// workers) in terms of the elastic tier the governor actually controls
+    /// (plan §23.4): `desired_elastic = desired_total - unowned`, floored at
+    /// zero. The governor never stops unowned workers to make room, so a
+    /// floor at or above target yields zero elastic workers.
+    pub fn into_elastic(mut self, unowned: u32) -> Self {
+        if unowned == 0 {
+            return self;
+        }
+        self.desired_total = Some(self.desired_workers);
+        self.unowned_workers = unowned;
+        self.current_workers = self.current_workers.saturating_sub(unowned);
+        self.desired_workers = self.desired_workers.saturating_sub(unowned);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -104,6 +134,37 @@ pub struct CreditDeadlineAdvisory {
     pub feasible: bool,
 }
 
+/// Plan §23.4: sizes the whole pool (owned plus unowned workers, since both
+/// spend the same quota) and returns the result in elastic terms. The fleet
+/// range is shifted by `unowned`, so `min_workers`/`max_workers` bound only the
+/// elastic tier, and the governor never asks for fewer workers than the floor
+/// already provides. With `unowned == 0` this is exactly [`evaluate`].
+pub fn evaluate_pool(
+    account_name: &str,
+    config: &AccountConfig,
+    snapshot: &QuotaSnapshot,
+    prior: &AccountState,
+    owned: u32,
+    unowned: u32,
+    now: DateTime<Utc>,
+) -> Result<Decision> {
+    if unowned == 0 {
+        return evaluate(account_name, config, snapshot, prior, owned, now);
+    }
+    let mut pooled = config.clone();
+    pooled.fleet.min_workers = pooled.fleet.min_workers.saturating_add(unowned);
+    pooled.fleet.max_workers = pooled.fleet.max_workers.saturating_add(unowned);
+    evaluate(
+        account_name,
+        &pooled,
+        snapshot,
+        prior,
+        owned.saturating_add(unowned),
+        now,
+    )
+    .map(|decision| decision.into_elastic(unowned))
+}
+
 pub fn evaluate(
     account_name: &str,
     config: &AccountConfig,
@@ -138,6 +199,8 @@ pub fn evaluate(
             windows: Vec::new(),
             binding_window: None,
             banked_resets: None,
+            unowned_workers: 0,
+            desired_total: None,
         });
     }
 
@@ -260,6 +323,8 @@ pub fn evaluate(
         windows: decisions,
         binding_window,
         banked_resets,
+        unowned_workers: 0,
+        desired_total: None,
     })
 }
 
@@ -820,6 +885,112 @@ mod tests {
         .unwrap();
         assert_eq!(decision.desired_workers, 0);
         assert_eq!(decision.binding_window.as_deref(), Some("weekly"));
+    }
+
+    #[test]
+    fn pool_evaluation_with_no_unowned_workers_equals_plain_evaluation() {
+        let now = Utc::now();
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.9,
+                resets_at: now + Duration::days(2),
+                duration_minutes: Some(10080),
+                reached: false,
+            }],
+            eligible_backlog_capacity: None,
+            reset_credits: None,
+        };
+        let plain = evaluate("t", &account(), &snapshot, &AccountState::default(), 4, now).unwrap();
+        let pooled = evaluate_pool(
+            "t",
+            &account(),
+            &snapshot,
+            &AccountState::default(),
+            4,
+            0,
+            now,
+        )
+        .unwrap();
+        assert_eq!(pooled.desired_workers, plain.desired_workers);
+        assert_eq!(pooled.current_workers, plain.current_workers);
+        assert_eq!(pooled.unowned_workers, 0);
+        assert_eq!(pooled.desired_total, None);
+    }
+
+    #[test]
+    fn a_floor_at_or_above_target_yields_zero_elastic_workers_not_a_negative_count() {
+        let now = Utc::now();
+        // Weekly is past target, so the pool wants its minimum. With 3 roster
+        // workers already running, the elastic tier must drop to zero and the
+        // governor must not try to stop the roster to get below the floor.
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.99,
+                resets_at: now + Duration::days(2),
+                duration_minutes: Some(10080),
+                reached: true,
+            }],
+            eligible_backlog_capacity: None,
+            reset_credits: None,
+        };
+        let decision = evaluate_pool(
+            "t",
+            &account(),
+            &snapshot,
+            &AccountState::default(),
+            2,
+            3,
+            now,
+        )
+        .unwrap();
+        assert_eq!(decision.unowned_workers, 3);
+        assert_eq!(decision.current_workers, 2);
+        assert_eq!(decision.desired_total, Some(3));
+        assert_eq!(decision.desired_workers, 0);
+    }
+
+    #[test]
+    fn elastic_ceiling_bounds_only_the_elastic_tier() {
+        let now = Utc::now();
+        let mut config = account();
+        config.fleet.max_workers = 2;
+        config.fleet.max_scale_up_per_cycle = 10;
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                used_fraction: 0.0,
+                resets_at: now + Duration::days(2),
+                duration_minutes: Some(10080),
+                reached: false,
+            }],
+            eligible_backlog_capacity: None,
+            reset_credits: None,
+        };
+        for unowned in [0_u32, 1, 5, 20] {
+            let decision = evaluate_pool(
+                "t",
+                &config,
+                &snapshot,
+                &AccountState::default(),
+                0,
+                unowned,
+                now,
+            )
+            .unwrap();
+            assert!(
+                decision.desired_workers <= config.fleet.max_workers,
+                "unowned={unowned}: {} > max",
+                decision.desired_workers
+            );
+        }
     }
 
     #[test]
@@ -1916,6 +2087,52 @@ mod tests {
                     prop_assert!(window.desired_workers >= config.fleet.min_workers);
                     prop_assert!(window.desired_workers <= config.fleet.max_workers);
                 }
+            }
+
+            /// §23.4 / WP16: the elastic result never exceeds `max_workers`,
+            /// never goes negative, and a floor at or above the pool target
+            /// yields `min_workers` -- for any owned/unowned mix and any usage.
+            #[test]
+            fn elastic_decision_respects_the_elastic_ceiling_and_the_floor(
+                config in arb_account(),
+                owned in 0u32..20,
+                unowned in 1u32..20,
+                used_fraction in 0.0f64..=1.0,
+            ) {
+                // Owned workers must already lie inside the elastic range, as
+                // `fleet::current_workers` enforces before evaluation.
+                let owned = owned.min(config.fleet.max_workers).max(config.fleet.min_workers);
+                let now = Utc::now();
+                let snapshot = QuotaSnapshot {
+                    observed_at: now,
+                    fresh: true,
+                    windows: vec![QuotaWindow {
+                        id: "weekly".into(),
+                        used_fraction,
+                        resets_at: now + Duration::hours(4),
+                        duration_minutes: Some(10_080),
+                        reached: false,
+                    }],
+                    eligible_backlog_capacity: None,
+                    reset_credits: None,
+                };
+                let decision = evaluate_pool(
+                    "prop",
+                    &config,
+                    &snapshot,
+                    &AccountState::default(),
+                    owned,
+                    unowned,
+                    now,
+                )
+                .unwrap();
+                prop_assert!(decision.desired_workers <= config.fleet.max_workers);
+                prop_assert!(decision.desired_workers >= config.fleet.min_workers);
+                prop_assert_eq!(decision.unowned_workers, unowned);
+                prop_assert_eq!(
+                    decision.desired_total,
+                    Some(decision.desired_workers + unowned)
+                );
             }
 
             /// §9.1 / §17.2: "stale decisions never exceed current workers" -- true for

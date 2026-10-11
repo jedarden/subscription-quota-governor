@@ -125,6 +125,15 @@ pub fn current_workers(config: &FleetConfig) -> Result<u32> {
     reconcile_observed_range(observed, config)
 }
 
+/// Fresh same-adapter workers the governor does not own (plan §23.3), or zero
+/// when no observer is configured or it has no ownership notion.
+pub fn unowned_workers(config: &FleetConfig) -> Result<u32> {
+    match config.observer.as_ref() {
+        Some(observer_config) => observer_for(observer_config).unowned_workers(),
+        None => Ok(0),
+    }
+}
+
 /// Reads the worker count from each configured host's observer.
 ///
 /// Host counts stay keyed by host id so callers can pass them directly to

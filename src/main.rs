@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use subscription_governor::config::{ActuatorConfig, Config, ResourceSourceConfig, SourceConfig};
-use subscription_governor::controller::{evaluate, CreditDeadlineAdvisory, Decision};
+use subscription_governor::controller::{evaluate_pool, CreditDeadlineAdvisory, Decision};
 use subscription_governor::fleet;
 use subscription_governor::model::ResourceSnapshot;
 use subscription_governor::placement::{self, HostPlacement};
@@ -921,8 +921,26 @@ fn run_cycle(
             };
             metrics.current_workers = Some(workers);
             let prior = state.accounts.get(name).cloned().unwrap_or_default();
-            let decision = evaluate(name, account_config, &snapshot, &prior, workers, now)
-                .map_err(AccountFailure::Observation)?;
+            // Plan §23.4: unowned (roster) workers spend the same quota, so the
+            // controller sizes the whole pool. Its fleet range is shifted by the
+            // unowned count so `max_workers`/`min_workers` bound the elastic
+            // tier only, and the result is converted back to elastic terms.
+            let unowned = if host_current.is_some() {
+                0
+            } else {
+                fleet::unowned_workers(&account_config.fleet)
+                    .map_err(AccountFailure::Observation)?
+            };
+            let decision = evaluate_pool(
+                name,
+                account_config,
+                &snapshot,
+                &prior,
+                workers,
+                unowned,
+                now,
+            )
+            .map_err(AccountFailure::Observation)?;
             let readiness = readiness_for_decision(&decision);
             metrics.apply_decision(&decision, readiness.reason.clone(), now);
             if let Some(banked) = &decision.banked_resets {
@@ -992,14 +1010,20 @@ fn run_cycle(
             );
             let account_state = state.accounts.entry(name.clone()).or_default();
             if decision.stale {
-                account_state.last_target = Some(decision.desired_workers);
+                account_state.last_target = Some(decision.desired_workers + unowned);
             } else {
+                // Burn is attributed to the whole pool (§23.4), so samples and
+                // the recorded target carry the unowned floor as well.
                 let sample_workers = if actuated {
                     decision.desired_workers
                 } else {
                     workers
-                };
-                account_state.record(&snapshot, sample_workers, decision.desired_workers);
+                } + unowned;
+                account_state.record(
+                    &snapshot,
+                    sample_workers,
+                    decision.desired_workers + unowned,
+                );
                 if let Some(banked) = &decision.banked_resets {
                     let reset_generation = decision
                         .windows
@@ -1474,6 +1498,8 @@ mod status_tests {
             windows,
             binding_window,
             banked_resets: None,
+            unowned_workers: 0,
+            desired_total: None,
         }
     }
 
@@ -1642,6 +1668,8 @@ mod metrics_tests {
             windows,
             binding_window: Some("weekly".to_owned()),
             banked_resets: None,
+            unowned_workers: 0,
+            desired_total: None,
         }
     }
 

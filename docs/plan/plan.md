@@ -1470,9 +1470,10 @@ Dependencies: WP4.
 
 Dependencies: WP15, WP2.
 
-- [ ] Implement §23.4 and extend the decision event with `owned`, `unowned`,
-  `desired_total`, `desired_elastic`.
-- [ ] Property test: `desired_elastic` never exceeds `max_workers`, and a
+- [x] Implement §23.4 (`controller::evaluate_pool`) and extend the decision
+  event: `current_workers` is owned, `desired_workers` is the elastic target,
+  and `unowned_workers`/`desired_total` appear when a floor exists.
+- [x] Property test: `desired_elastic` never exceeds `max_workers`, and a
   floor at or above target yields `min_workers`.
 
 #### WP17: per-pool accounts
