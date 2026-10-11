@@ -108,6 +108,71 @@ fn an_insufficient_attempt_fixture_preserves_the_missing_fraction() {
 
 #[cfg(unix)]
 #[test]
+fn per_replica_delta_fixtures_keep_the_throttling_fraction_bounded_and_responsive() {
+    let collect_backpressure = |name: &str| {
+        let snapshot = collect_via_command(&load_fixture(name))
+            .unwrap_or_else(|error| panic!("{name} fixture should collect: {error:#}"));
+        snapshot
+            .backpressure
+            .expect("counter-delta fixture should carry a backpressure sample")
+    };
+
+    let high = collect_backpressure("backpressure_delta_high");
+    let low = collect_backpressure("backpressure_delta_low");
+    let high_fraction = high
+        .upstream_429_fraction
+        .expect("the high-throttling sample has enough attempts");
+    let low_fraction = low
+        .upstream_429_fraction
+        .expect("the low-throttling sample has enough attempts");
+
+    assert!((0.0..=1.0).contains(&high_fraction));
+    assert!((0.0..=1.0).contains(&low_fraction));
+    assert!(high_fraction > low_fraction);
+    assert_eq!(high.attempts, 50);
+    assert_eq!(low.attempts, 200);
+    assert_eq!(high.window_seconds, 60);
+    assert_eq!(low.window_seconds, 60);
+}
+
+#[cfg(unix)]
+#[test]
+fn first_seen_restarted_and_reset_replica_fixtures_are_insufficient_not_zero_pressure() {
+    for name in [
+        "backpressure_first_seen",
+        "backpressure_restart",
+        "backpressure_counter_reset",
+    ] {
+        let snapshot = collect_via_command(&load_fixture(name))
+            .unwrap_or_else(|error| panic!("{name} fixture should collect: {error:#}"));
+        let backpressure = snapshot
+            .backpressure
+            .unwrap_or_else(|| panic!("{name} should preserve sample metadata"));
+        assert_eq!(
+            backpressure.upstream_429_fraction, None,
+            "{name} must not turn a missing delta into zero pressure"
+        );
+        assert_eq!(backpressure.attempts, 0);
+        assert_eq!(backpressure.window_seconds, 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_counter_delta_below_min_attempts_omits_the_fraction() {
+    let snapshot = collect_via_command(&load_fixture("backpressure_min_attempts"))
+        .expect("the under-threshold counter-delta fixture is a valid snapshot");
+    let backpressure = snapshot
+        .backpressure
+        .expect("the low-attempt sample should retain its denominator");
+
+    assert_eq!(backpressure.upstream_429_fraction, None);
+    assert_eq!(backpressure.attempts, 29);
+    assert_eq!(backpressure.window_seconds, 60);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_near_limit_fixture_preserves_the_reached_flag() {
     let fixture = load_fixture("near_limit");
     let snapshot =

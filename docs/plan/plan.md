@@ -1529,8 +1529,12 @@ scheduling (§3), and any change to roster workers.
 - The signal is the **upstream 429 fraction** over a trailing window:
   `upstream_429 / attempts`, where `upstream_429` is the increase of the
   proxy's `zai_proxy_upstream_errors_total{error_type="429"}` and `attempts`
-  is the increase of `zai_proxy_requests_total` (all statuses) plus
-  `zai_proxy_retry_attempts_total` (each retry is a further upstream attempt).
+  is the increase of `zai_proxy_requests_total` (all statuses), minus the
+  increase of `zai_proxy_rate_limit_rejections_total`, plus the increase of
+  `zai_proxy_retry_attempts_total{reason="retry"}`. The request counter
+  includes local capacity-gate 503s, while only the `reason="retry"` series
+  records an additional upstream attempt; other retry-counter reason series
+  record the triggering failure and must not be added to the denominator.
 - The proxy's own capacity-gate rejections are excluded. They are local
   admission, not provider pressure.
 - Client-visible 429s (`requests_total{status_code="429"}`) are not used: the
