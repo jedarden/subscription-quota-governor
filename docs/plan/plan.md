@@ -1379,3 +1379,124 @@ mid-build:
 6. v1 (quota-only) and v1.1 (resource-aware placement) are separate
    acceptance gates (§22.14); v1.1 for a given account depends on that
    account already meeting the relevant v1 criteria.
+
+## 23. Elastic Tier over the NEEDLE Roster
+
+Status: plan locked 2026-10-10; no item below is implemented yet.
+
+### 23.1 Purpose
+
+The v1/v1.1 governor manages one pool (`claude-print`, `max_workers: 1`). The
+codinghome fleet is about 40 systemd-managed `needle-worker@` units from the
+source-controlled roster (`NEEDLE/fleet/ex44/workers.tsv`): roughly 22 GLM
+(Z.AI), 18 Codex, and one Claude pool. subgov must manage the elastic part of
+that fleet: workers launched and retired by the governor, paced against each
+provider's quota, on top of the roster's fixed floor.
+
+### 23.2 Ownership model (locked)
+
+1. **The roster is the floor.** subgov never starts, stops, restarts, or
+   edits any `needle-worker@*` unit, and never stops a NEEDLE process it did
+   not launch. The roster remains owned by `apply-ex44-fleet.sh`.
+2. **Elastic workers are the governor's.** They are launched by the
+   `needle_run` actuator and carry a fixed identifier prefix
+   (`sg-<account>-`, overridable with `identifier_prefix`). Anything without
+   the prefix is not owned, whatever its adapter.
+3. **One adapter per account.** An account owns one quota source and one
+   NEEDLE adapter. A second adapter on the same provider quota (for example
+   Codex Luna and Sol) is a separate roster concern and is not governed in
+   this tier; two accounts sharing one quota would double-book it, the failure
+   shape §10 already forbids.
+4. **One host.** This tier governs codinghome only. The lab is a separate
+   governor instance with its own accounts; cross-host elastic placement stays
+   with §22 and is out of scope here.
+
+### 23.3 Observer scoping (locked)
+
+The `needle_status` observer currently counts every fresh heartbeat for an
+adapter (§11.1). With roster workers on the same adapter this overstates the
+governor's own fleet, and §11.2 `needle_run` reconciles only tmux sessions, so
+observer and actuator disagree and the account never converges.
+
+- `needle_status` gains `identifier_prefix`. It reports two counts:
+  `owned` (heartbeats whose worker id starts with the prefix) and
+  `unowned` (fresh heartbeats for the same adapter without it).
+- `needle_run` launches with `--identifier <prefix><n>` and reconciles only
+  sessions carrying the prefix.
+- With no `identifier_prefix`, behaviour is byte-for-byte today's. The
+  existing `claude-anthropic` account keeps working unchanged until it opts in.
+
+### 23.4 Pacing with a floor (locked)
+
+Unowned workers spend the same quota, so they must be inside the burn
+estimate or pacing undercounts. Per cycle:
+
+- the controller sizes `desired_total` from `owned + unowned` observed workers
+  exactly as it sizes a pool today (§9);
+- `desired_elastic = clamp(desired_total - unowned, min_workers, max_workers)`,
+  and `max_workers` bounds only the elastic tier;
+- placement (§22) and the actuator see `desired_elastic` only.
+
+A floor that alone reaches the target drives `desired_elastic` to
+`min_workers`; the governor never stops roster workers to make room.
+
+### 23.5 Provider specifics (locked)
+
+- **claude-anthropic:** existing source; opt in to `identifier_prefix` and raise
+  `max_workers` from 1 only after the observe-only comparison in §23.7.
+- **codex:** `codex_app_server` source. When the weekly window is at its limit,
+  pacing holds the elastic tier at `min_workers`. Redeeming banked reset
+  credits stays a human handoff (§9.7).
+- **claude-zai:** `command` source reading the proxy's quota gauges (§7.3).
+  Proxy saturation, not quota, is the observed binding constraint for GLM, so
+  `max_workers` is set conservatively and raised on evidence. 429 backpressure
+  is not an input to this tier; it needs its own plan revision (§21).
+
+### 23.6 Work packages
+
+#### WP15: ownership-scoped observer and actuator
+
+Dependencies: WP4.
+
+- [ ] `identifier_prefix` on `needle_status` and `needle_run`, with `owned` and
+  `unowned` counts, and an unchanged path when it is absent.
+- [ ] Scale-down selects only prefixed sessions, and a prefix matched by a
+  longer unrelated session fails closed, as in §11.2 today.
+- [ ] Tests: a roster heartbeat on the same adapter is never counted as owned
+  and never stopped.
+
+#### WP16: floor-aware controller
+
+Dependencies: WP15, WP2.
+
+- [ ] Implement §23.4 and extend the decision event with `owned`, `unowned`,
+  `desired_total`, `desired_elastic`.
+- [ ] Property test: `desired_elastic` never exceeds `max_workers`, and a
+  floor at or above target yields `min_workers`.
+
+#### WP17: per-pool accounts
+
+Dependencies: WP15, WP16, §7.3.
+
+- [ ] Account config and systemd unit for `codex` and `claude-zai`, observe-only
+  first, running alongside `claude-anthropic` in one or separate processes with
+  the preflight (§10) passing for every pair.
+- [ ] `subgov doctor` passes the NEEDLE adapter parity check for each adapter.
+
+#### WP18: staged elastic rollout
+
+Dependencies: WP17, WP8.
+
+- [ ] Observe-only run per account across one quota reset, then actuation on
+  one account at a time, with the roster unchanged throughout.
+- [ ] Definition of done: all three accounts actuate for seven consecutive
+  days with no roster unit touched, no duplicate claim, and no account over
+  its configured ceiling.
+
+### 23.7 Acceptance criteria
+
+- [ ] Starting or stopping elastic workers leaves every roster unit's state
+  and PID unchanged (checked from `systemctl` before and after).
+- [ ] An account without `identifier_prefix` is regression-tested unchanged.
+- [ ] The cgov/subgov preflight reports zero actuation-capable owners for any
+  pool other than the one subgov governs.
