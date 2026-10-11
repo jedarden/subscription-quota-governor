@@ -632,3 +632,75 @@ The first attempt to use `scripts/rollback.sh --user observe-only` exposed a
 recursive `systemctl` shell wrapper when `SYSTEMCTL_BIN` was the default name
 `systemctl`. The wrapper now invokes the configured executable with Bash's
 `command` builtin, and `tests/rollback_script.sh` covers that default lookup.
+
+### Prefix cutover executed and verified actuating — 2026-10-11
+
+The observe-only comparison above ran through 13:07:34Z with the same shape
+every cycle: owned 0 / unowned 1, total target 1, elastic target 0. The
+five-hour window reset at 13:10:00Z; the `zzzz-subgov-rollback.conf`
+observe-only drop-in was removed and the service restarted in actuating mode
+at 13:10:31Z, 31 seconds into the new five-hour generation. The first
+actuating cycle therefore read brand-new window data (five-hour 0.0,
+`resets_at` 18:09:59Z) and still held the pool-wide target at 1 on the
+seven-day and weekly_all windows (0.87, both `target_reached`) — the fresh
+generation changed nothing, which is the outcome a safe cutover needs. The
+restart landed exactly on the first attempt's timeout boundary; the follow-up
+session verified the resulting live state directly instead of repeating the
+step: `ExecStart` carries no `--observe-only`, the drop-in directory is
+empty, and every decision event logs `observe_only: false`.
+
+Twenty-eight actuating cycles ran between 13:10:31Z and 15:25:44Z:
+
+- Twenty-seven cycles reported `actuation_attempted: true` and
+  `actuation_succeeded: true`, and all were no-ops: desired owned workers
+  0 == observed owned 0, because the unowned `claude-print-alpha` worker
+  still occupies the pool's one-worker budget as its retained floor.
+  `actuation_failures` stayed 0 and no cycle was `late`.
+- The one remaining cycle (15:10:48Z) failed closed: the Anthropic OAuth
+  token refresh returned HTTP 400, `source_success: false`,
+  `observation_failures: 1`, and **no actuation was attempted on the stale
+  source** — the `stale_behavior: hold` contract doing exactly its job. The
+  next cycle at 15:16:00Z was fresh again. A single-cycle blip, not a
+  pattern.
+- Ownership accounting never moved: owned 0 / unowned 1 / total target 1 on
+  every cycle, zero scale events, no oscillation. The no-hysteresis risk
+  flagged in the model-differences section cannot flap a decision that is
+  pinned at one total worker, and did not.
+- The binding window alternated between five_hour and seven_day as five-hour
+  burn climbed 0% → 25% (`paced_to_reset`, per-window target 2), but the
+  minimum across windows — and therefore the decision — never left 1: the
+  weekly windows stayed binding at `target_reached`, 1. Binding-window
+  alternation is bookkeeping, not behavior change.
+- `weekly_all` and `seven_day` reported identical values and identical
+  `resets_at` on every single cycle (0.87 → 0.93 together). The divergence
+  watch from the migration section is still clear after 2+ further hours.
+- The unowned `claude-print-alpha` worker stayed alive the whole window
+  (heartbeat `EXECUTING` on a real bead); no `sg-claude-anthropic-*` worker
+  was launched, because none was needed.
+
+`max_workers` stays 1: nearly 2.5 hours of actuating data under a real burn
+rate still target exactly one total worker. The prefixed actuator's real
+launch path has not fired yet — there was nothing to launch while the
+unowned floor holds the budget — so the first prefixed launch remains the
+one unexercised step; the adapter is verified ready for it and config
+validation rejects any observer/actuator prefix mismatch.
+
+```text
+systemctl --user show subgov.service --property=ExecStart
+  -> no --observe-only; started 2026-10-11 13:10:31Z
+ls ~/.config/systemd/user/subgov.service.d/          -> empty (rollback drop-in removed)
+systemctl --user is-active / is-enabled claude-governor.service
+  claude-governor-stop-watch.timer                    -> inactive / disabled (both)
+journalctl --user -u subgov.service since 13:10:31Z   -> 28 cycles: 27
+  actuation_attempted=true actuation_succeeded=true (all no-ops);
+  15:10:48Z source_success=false observation_failures=1 (OAuth refresh 400),
+  no actuation attempted; actuation_failures=0 throughout
+unowned claude-print-alpha heartbeat                  -> EXECUTING, real bead, fresh
+tmux list-sessions | grep sg-claude-anthropic         -> none (expected)
+diff <(live ~/.config/subgov/claude-anthropic.yaml) examples/claude-anthropic-cgov-migration.yaml
+  (comments stripped)                                 -> identical
+subgov --config ~/.config/subgov/claude-anthropic.yaml doctor
+  -> needle_adapter_parity: pass, claude-print ready; probe exited 0 (exit 0)
+subgov --config ~/.config/subgov/claude-anthropic.yaml status
+  -> intentional_hold, current 0 / desired 0, observed_at 15:25:44Z (fresh)
+```
