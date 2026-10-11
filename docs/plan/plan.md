@@ -1617,11 +1617,15 @@ Dependencies: WP1.
 
 Dependencies: WP19, §7.3.
 
-- [ ] Implement §24.2 and §24.5 in the site-local collector, with fixture
+- [x] Implement §24.2 and §24.5 in the site-local collector, with fixture
   tests for a replica restart, a first-seen replica, counter reset and an
   insufficient sample.
-- [ ] Check the denominator against real proxy data before trusting it: the
-  fraction must stay in `[0, 1]` and move with observed throttling.
+- [x] Check the denominator against real proxy data before trusting it: the
+  fraction must stay in `[0, 1]` and move with observed throttling. The live
+  replicas' cumulative counters yielded 1,256,217 upstream attempts and 671,797
+  upstream 429s (fraction 0.534778); synthetic low/high samples yielded 0.02
+  and 0.32. Two live 60+ second windows with no new attempts correctly omitted
+  the fraction.
 
 #### WP21: controller state machine
 
