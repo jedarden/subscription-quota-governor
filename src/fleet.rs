@@ -38,6 +38,14 @@ const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// integration tests.
 pub trait Observer {
     fn current_workers(&self) -> Result<u32>;
+
+    /// Plan §23.3: fresh workers on the same adapter that the governor did
+    /// not launch (the roster floor). They are never counted by
+    /// `current_workers` when an identifier prefix is configured. Observers
+    /// without an ownership notion report none.
+    fn unowned_workers(&self) -> Result<u32> {
+        Ok(0)
+    }
 }
 
 /// Applies a desired worker count to an account's fleet.
@@ -73,10 +81,12 @@ pub fn observer_for(config: &WorkerObserverConfig) -> Box<dyn Observer> {
             agent,
             heartbeat_dir,
             stale_after_seconds,
+            identifier_prefix,
         } => Box::new(needle::NeedleStatusObserver {
             agent: agent.clone(),
             heartbeat_dir: heartbeat_dir.clone(),
             stale_after_seconds: *stale_after_seconds,
+            identifier_prefix: identifier_prefix.clone(),
         }),
     }
 }
@@ -87,9 +97,14 @@ pub fn actuator_for(config: &ActuatorConfig) -> Box<dyn Actuator> {
         ActuatorConfig::None => Box::new(NoneActuator),
         ActuatorConfig::TargetFile { path } => Box::new(TargetFileActuator { path: path.clone() }),
         ActuatorConfig::Command { argv } => Box::new(CommandActuator { argv: argv.clone() }),
-        ActuatorConfig::NeedleRun { repo, adapter } => Box::new(needle::NeedleRunActuator {
+        ActuatorConfig::NeedleRun {
+            repo,
+            adapter,
+            identifier_prefix,
+        } => Box::new(needle::NeedleRunActuator {
             repo: repo.clone(),
             adapter: adapter.clone(),
+            identifier_prefix: identifier_prefix.clone(),
         }),
     }
 }

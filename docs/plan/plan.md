@@ -1399,8 +1399,8 @@ provider's quota, on top of the roster's fixed floor.
    edits any `needle-worker@*` unit, and never stops a NEEDLE process it did
    not launch. The roster remains owned by `apply-ex44-fleet.sh`.
 2. **Elastic workers are the governor's.** They are launched by the
-   `needle_run` actuator and carry a fixed identifier prefix
-   (`sg-<account>-`, overridable with `identifier_prefix`). Anything without
+   `needle_run` actuator and carry an explicit `identifier_prefix` (by
+   convention `sg-<account>-`; opting in requires setting it). Anything without
    the prefix is not owned, whatever its adapter.
 3. **One adapter per account.** An account owns one quota source and one
    NEEDLE adapter. A second adapter on the same provider quota (for example
@@ -1418,11 +1418,12 @@ adapter (§11.1). With roster workers on the same adapter this overstates the
 governor's own fleet, and §11.2 `needle_run` reconciles only tmux sessions, so
 observer and actuator disagree and the account never converges.
 
-- `needle_status` gains `identifier_prefix`. It reports two counts:
+- `needle_status` gains `identifier_prefix` (explicit; no default). It reports two counts:
   `owned` (heartbeats whose worker id starts with the prefix) and
   `unowned` (fresh heartbeats for the same adapter without it).
-- `needle_run` launches with `--identifier <prefix><n>` and reconciles only
-  sessions carrying the prefix.
+- `needle_run` takes the same prefix (config validation requires observer and
+  actuator to match), launches one worker per `--identifier <prefix><n>` and
+  reconciles only sessions carrying the prefix.
 - With no `identifier_prefix`, behaviour is byte-for-byte today's. The
   existing `claude-anthropic` account keeps working unchanged until it opts in.
 
@@ -1458,12 +1459,12 @@ A floor that alone reaches the target drives `desired_elastic` to
 
 Dependencies: WP4.
 
-- [ ] `identifier_prefix` on `needle_status` and `needle_run`, with `owned` and
+- [x] `identifier_prefix` on `needle_status` and `needle_run`, with `owned` and
   `unowned` counts, and an unchanged path when it is absent.
-- [ ] Scale-down selects only prefixed sessions, and a prefix matched by a
+- [x] Scale-down selects only prefixed sessions, and a prefix matched by a
   longer unrelated session fails closed, as in §11.2 today.
-- [ ] Tests: a roster heartbeat on the same adapter is never counted as owned
-  and never stopped.
+- [x] Tests: a roster heartbeat on the same adapter is never counted as owned
+  and a same-adapter session outside the prefix is never stopped.
 
 #### WP16: floor-aware controller
 

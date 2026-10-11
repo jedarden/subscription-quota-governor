@@ -179,6 +179,11 @@ pub enum WorkerObserverConfig {
         /// Ignore heartbeats older than this many seconds.
         #[serde(default = "default_needle_stale_after_seconds")]
         stale_after_seconds: u64,
+        /// Plan §23.3: when set, only heartbeats whose worker id starts with
+        /// this prefix are the governor's own; the rest are reported as
+        /// unowned (roster) workers and never counted or stopped.
+        #[serde(default)]
+        identifier_prefix: Option<String>,
     },
 }
 
@@ -206,6 +211,10 @@ pub enum ActuatorConfig {
     NeedleRun {
         repo: PathBuf,
         adapter: String,
+        /// Plan §23.3: launch workers as `<prefix><n>` and reconcile only
+        /// sessions carrying the prefix. Absent = unscoped (v1 behaviour).
+        #[serde(default)]
+        identifier_prefix: Option<String>,
     },
 }
 
@@ -508,6 +517,7 @@ fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
         agent,
         heartbeat_dir,
         stale_after_seconds,
+        ..
     }) = &fleet.observer
     {
         validate_needle_status(
@@ -520,11 +530,40 @@ fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
     if let ActuatorConfig::Command { argv } = &fleet.actuator {
         validate_argv(argv, &format!("account {account} actuator command"), true)?;
     }
-    if let ActuatorConfig::NeedleRun { repo, adapter } = &fleet.actuator {
+    if let ActuatorConfig::NeedleRun {
+        repo,
+        adapter,
+        identifier_prefix,
+    } = &fleet.actuator
+    {
         validate_needle_run(
             repo,
             adapter,
             &format!("account {account} actuator needle_run"),
+        )?;
+        validate_identifier_prefix(
+            identifier_prefix.as_deref(),
+            &format!("account {account} actuator needle_run"),
+        )?;
+        if let Some(WorkerObserverConfig::NeedleStatus {
+            identifier_prefix: observer_prefix,
+            ..
+        }) = &fleet.observer
+        {
+            if observer_prefix != identifier_prefix {
+                bail!(
+                    "account {account}: needle_status observer and needle_run actuator must use the same identifier_prefix"
+                );
+            }
+        }
+    }
+    if let Some(WorkerObserverConfig::NeedleStatus {
+        identifier_prefix, ..
+    }) = &fleet.observer
+    {
+        validate_identifier_prefix(
+            identifier_prefix.as_deref(),
+            &format!("account {account} observer needle_status"),
         )?;
     }
     if let Some(hosts) = &fleet.hosts {
@@ -570,6 +609,7 @@ fn validate_host(
         agent,
         heartbeat_dir,
         stale_after_seconds,
+        ..
     } = &host.observer
     {
         validate_needle_status(
@@ -586,7 +626,7 @@ fn validate_host(
             true,
         )?;
     }
-    if let ActuatorConfig::NeedleRun { repo, adapter } = &host.actuator {
+    if let ActuatorConfig::NeedleRun { repo, adapter, .. } = &host.actuator {
         validate_needle_run(
             repo,
             adapter,
@@ -741,6 +781,25 @@ fn default_redeem_at_utilization() -> f64 {
 }
 fn default_deadline_safety_seconds() -> u64 {
     6 * 60 * 60
+}
+
+/// Plan §23.3: an identifier prefix becomes part of a tmux session name and
+/// a heartbeat filename, so it is restricted to a conservative character set
+/// and must be non-empty when present.
+fn validate_identifier_prefix(prefix: Option<&str>, context: &str) -> Result<()> {
+    let Some(prefix) = prefix else {
+        return Ok(());
+    };
+    if prefix.is_empty() || prefix.len() > 32 {
+        bail!("{context}: identifier_prefix must be 1-32 characters");
+    }
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        bail!("{context}: identifier_prefix may contain only a-z, 0-9, '-' and '_'");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -918,7 +977,8 @@ actuator: { type: needle_run, repo: "~/work/project", adapter: claude-print }"#,
         config.validate().unwrap();
         let Config { mut accounts, .. } = config;
         accounts.get_mut("acct").unwrap().fleet.expand_paths();
-        let ActuatorConfig::NeedleRun { repo, adapter } = &accounts["acct"].fleet.actuator else {
+        let ActuatorConfig::NeedleRun { repo, adapter, .. } = &accounts["acct"].fleet.actuator
+        else {
             panic!("expected needle_run actuator");
         };
         assert_eq!(repo, &expand_tilde(Path::new("~/work/project")));
@@ -957,6 +1017,7 @@ observer:
             agent,
             heartbeat_dir,
             stale_after_seconds,
+            ..
         }) = accounts["acct"].fleet.observer.as_ref()
         else {
             panic!("expected needle_status observer");
@@ -1243,5 +1304,23 @@ hosts:
             err.contains("resource_source timeout_seconds must be positive"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn identifier_prefix_must_be_conservative_and_match_between_observer_and_actuator() {
+        for bad in ["", "Sg-", "sg codex", "sg/x"] {
+            assert!(validate_identifier_prefix(Some(bad), "t").is_err(), "{bad}");
+        }
+        assert!(validate_identifier_prefix(Some("sg-codex-"), "t").is_ok());
+        assert!(validate_identifier_prefix(None, "t").is_ok());
+
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: needle_status, agent: codex, identifier_prefix: sg-a- }
+actuator: { type: needle_run, repo: /r, adapter: codex, identifier_prefix: sg-b- }"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("same identifier_prefix"), "{err}");
     }
 }

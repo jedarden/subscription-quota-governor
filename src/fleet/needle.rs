@@ -23,17 +23,38 @@ pub(super) struct NeedleStatusObserver {
     pub(super) agent: String,
     pub(super) heartbeat_dir: PathBuf,
     pub(super) stale_after_seconds: u64,
+    pub(super) identifier_prefix: Option<String>,
 }
 
-impl Observer for NeedleStatusObserver {
-    fn current_workers(&self) -> Result<u32> {
+impl NeedleStatusObserver {
+    fn counts(&self) -> Result<HeartbeatCounts> {
         count_needle_heartbeats(
             &self.heartbeat_dir,
             &self.agent,
+            self.identifier_prefix.as_deref(),
             self.stale_after_seconds,
             Utc::now(),
         )
     }
+}
+
+impl Observer for NeedleStatusObserver {
+    fn current_workers(&self) -> Result<u32> {
+        Ok(self.counts()?.owned)
+    }
+
+    fn unowned_workers(&self) -> Result<u32> {
+        Ok(self.counts()?.unowned)
+    }
+}
+
+/// Fresh heartbeats for one adapter, split by the governor's identifier
+/// prefix (plan §23.3). Without a prefix every worker is `owned`, which is
+/// the v1 behaviour.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HeartbeatCounts {
+    owned: u32,
+    unowned: u32,
 }
 
 #[derive(Deserialize)]
@@ -51,15 +72,18 @@ struct NeedleHeartbeat {
 fn count_needle_heartbeats(
     heartbeat_dir: &Path,
     agent: &str,
+    identifier_prefix: Option<&str>,
     stale_after_seconds: u64,
     now: DateTime<Utc>,
-) -> Result<u32> {
+) -> Result<HeartbeatCounts> {
     let stale_after_seconds = i64::try_from(stale_after_seconds)
         .context("needle_status stale_after_seconds exceeds the supported range")?;
     let prefix = format!("{agent}-");
     let entries = match fs::read_dir(heartbeat_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HeartbeatCounts::default())
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
@@ -70,7 +94,7 @@ fn count_needle_heartbeats(
         }
     };
 
-    let mut workers = 0_u32;
+    let mut counts = HeartbeatCounts::default();
     for entry in entries {
         let entry = entry.with_context(|| {
             format!(
@@ -119,23 +143,39 @@ fn count_needle_heartbeats(
             || age_seconds < stale_after_seconds
             || (age_seconds == stale_after_seconds && age.subsec_nanos() == 0);
         if is_fresh {
-            workers = workers
+            let owned = identifier_prefix
+                .map(|prefix| heartbeat.worker_id.starts_with(prefix))
+                .unwrap_or(true);
+            let slot = if owned {
+                &mut counts.owned
+            } else {
+                &mut counts.unowned
+            };
+            *slot = slot
                 .checked_add(1)
                 .context("NEEDLE heartbeat count exceeds u32::MAX")?;
         }
     }
 
-    Ok(workers)
+    Ok(counts)
 }
 
 pub(super) struct NeedleRunActuator {
     pub(super) repo: PathBuf,
     pub(super) adapter: String,
+    pub(super) identifier_prefix: Option<String>,
 }
 
 impl Actuator for NeedleRunActuator {
     fn actuate(&self, desired: u32) -> Result<()> {
-        reconcile_needle_workers("needle", "tmux", &self.repo, &self.adapter, desired)
+        reconcile_needle_workers(
+            "needle",
+            "tmux",
+            &self.repo,
+            &self.adapter,
+            self.identifier_prefix.as_deref(),
+            desired,
+        )
     }
 }
 
@@ -150,11 +190,15 @@ fn reconcile_needle_workers(
     tmux_program: &str,
     repo: &Path,
     adapter: &str,
+    identifier_prefix: Option<&str>,
     desired: u32,
 ) -> Result<()> {
     check_needle_adapter_with_program(needle_program, adapter)?;
     let sessions = list_sessions(tmux_program)?;
-    let prefix = session_prefix(adapter);
+    let prefix = match identifier_prefix {
+        Some(identifier_prefix) => format!("{}{identifier_prefix}", session_prefix(adapter)),
+        None => session_prefix(adapter),
+    };
     let mut matching: Vec<_> = sessions
         .iter()
         .filter(|session| session.name.starts_with(&prefix))
@@ -166,8 +210,28 @@ fn reconcile_needle_workers(
         std::cmp::Ordering::Equal => Ok(()),
         std::cmp::Ordering::Greater => {
             let delta = desired - matching.len() as u32;
-            let args = needle_run_args(repo, adapter, delta);
-            run_needle(needle_program, &args)
+            let Some(identifier_prefix) = identifier_prefix else {
+                return run_needle(needle_program, &needle_run_args(repo, adapter, delta));
+            };
+            // Plan §23.3: one launch per worker, each with a distinct
+            // `<prefix><n>` identifier so the worker is recognisably ours.
+            let mut taken: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+            let mut next = 1_u32;
+            for _ in 0..delta {
+                let (identifier, session) = loop {
+                    let identifier = format!("{identifier_prefix}{next}");
+                    let session = format!("{}{identifier}", session_prefix(adapter));
+                    next += 1;
+                    if !taken.contains(&session) {
+                        break (identifier, session);
+                    }
+                };
+                let mut args = needle_run_args(repo, adapter, 1);
+                args.extend([OsString::from("--identifier"), OsString::from(identifier)]);
+                run_needle(needle_program, &args)?;
+                taken.push(session);
+            }
+            Ok(())
         }
         std::cmp::Ordering::Less => {
             let count = (matching.len() as u32 - desired) as usize;
@@ -477,7 +541,9 @@ mod tests {
         fs::write(dir.path().join("other-agent-worker-4.json"), "not json").unwrap();
 
         assert_eq!(
-            count_needle_heartbeats(dir.path(), "claude-print", 60, now).unwrap(),
+            count_needle_heartbeats(dir.path(), "claude-print", None, 60, now)
+                .unwrap()
+                .owned,
             2
         );
     }
@@ -490,6 +556,7 @@ mod tests {
             agent: "codex".to_string(),
             heartbeat_dir: dir.path().to_path_buf(),
             stale_after_seconds: 60,
+            identifier_prefix: None,
         };
         let observer = crate::fleet::observer_for(&config);
 
@@ -514,7 +581,9 @@ mod tests {
         );
 
         assert_eq!(
-            count_needle_heartbeats(dir.path(), "codex", 60, now).unwrap(),
+            count_needle_heartbeats(dir.path(), "codex", None, 60, now)
+                .unwrap()
+                .owned,
             1
         );
     }
@@ -525,7 +594,9 @@ mod tests {
         let missing = dir.path().join("missing");
 
         assert_eq!(
-            count_needle_heartbeats(&missing, "codex", 60, Utc::now()).unwrap(),
+            count_needle_heartbeats(&missing, "codex", None, 60, Utc::now())
+                .unwrap()
+                .owned,
             0
         );
     }
@@ -540,7 +611,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = count_needle_heartbeats(dir.path(), "codex", 60, Utc::now()).unwrap_err();
+        let error = count_needle_heartbeats(dir.path(), "codex", None, 60, Utc::now()).unwrap_err();
         assert!(error.to_string().contains("invalid NEEDLE heartbeat"));
     }
 
@@ -649,6 +720,7 @@ mod tests {
             tmux.to_str().unwrap(),
             Path::new("/repo/project"),
             "codex",
+            None,
             2,
         )
         .unwrap();
@@ -676,6 +748,7 @@ mod tests {
             tmux.to_str().unwrap(),
             Path::new("/repo/project"),
             "codex",
+            None,
             1,
         )
         .unwrap();
@@ -684,6 +757,35 @@ mod tests {
             std::fs::read_to_string(log).unwrap(),
             "stop --identifier needle-codex-alpha\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefixed_scale_down_never_stops_a_session_outside_the_prefix() {
+        let dir = TempDir::new().unwrap();
+        // Two governor sessions and one same-adapter session it did not launch.
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            "#!/bin/sh\nprintf 'needle-codex-sg-codex-1\\t0\\nneedle-codex-sg-codex-2\\t0\\nneedle-codex-roster-a\\t0\\n'\n",
+        );
+        let log = dir.path().join("needle.log");
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
+
+        reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            Path::new("/repo/project"),
+            "codex",
+            Some("sg-codex-"),
+            0,
+        )
+        .unwrap();
+
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("needle-codex-sg-codex-1"), "{logged}");
+        assert!(logged.contains("needle-codex-sg-codex-2"), "{logged}");
+        assert!(!logged.contains("roster-a"), "{logged}");
     }
 
     #[cfg(unix)]
@@ -743,6 +845,7 @@ mod tests {
             tmux.to_str().unwrap(),
             Path::new("/repo/project"),
             "codex",
+            None,
             2,
         )
         .unwrap_err()
@@ -757,5 +860,63 @@ mod tests {
             !tmux_log.exists(),
             "tmux must not be inspected after a failed check"
         );
+    }
+
+    #[test]
+    fn identifier_prefix_splits_owned_from_roster_heartbeats() {
+        let dir = TempDir::new().unwrap();
+        let now = Utc::now();
+        write_heartbeat(dir.path(), "codex", "sg-codex-1", now);
+        write_heartbeat(dir.path(), "codex", "sg-codex-2", now);
+        write_heartbeat(dir.path(), "codex", "luna-roster-01", now);
+        write_heartbeat(dir.path(), "codex", "luna-roster-02", now);
+        write_heartbeat(dir.path(), "codex", "luna-roster-03", now);
+
+        let counts =
+            count_needle_heartbeats(dir.path(), "codex", Some("sg-codex-"), 60, now).unwrap();
+        assert_eq!(
+            counts,
+            HeartbeatCounts {
+                owned: 2,
+                unowned: 3
+            }
+        );
+
+        let unscoped = count_needle_heartbeats(dir.path(), "codex", None, 60, now).unwrap();
+        assert_eq!(
+            unscoped,
+            HeartbeatCounts {
+                owned: 5,
+                unowned: 0
+            }
+        );
+    }
+
+    #[test]
+    fn prefixed_scale_up_launches_one_uniquely_identified_worker_each() {
+        let dir = TempDir::new().unwrap();
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            "#!/bin/sh\nprintf 'needle-codex-sg-codex-1\\t0\\nneedle-codex-roster-a\\t0\\n'\n",
+        );
+        let log = dir.path().join("needle.log");
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
+
+        reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            Path::new("/repo/project"),
+            "codex",
+            Some("sg-codex-"),
+            3,
+        )
+        .unwrap();
+
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("--identifier sg-codex-2"), "{logged}");
+        assert!(logged.contains("--identifier sg-codex-3"), "{logged}");
+        assert!(!logged.contains("--identifier sg-codex-1\n"), "{logged}");
+        assert_eq!(logged.matches("run -w").count(), 2, "{logged}");
     }
 }
