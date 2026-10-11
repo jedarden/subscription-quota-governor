@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// read. A file with no `schema_version` at all predates versioning and is
 /// read with the current version. Earlier versions are migrated by defaulting
 /// fields added to account and host state, then advancing the version on load.
-pub const STATE_SCHEMA_VERSION: u32 = 4;
+pub const STATE_SCHEMA_VERSION: u32 = 5;
 
 fn current_schema_version() -> u32 {
     STATE_SCHEMA_VERSION
@@ -77,6 +77,39 @@ pub struct AccountState {
     /// reset generation, to avoid repeating an alert on every poll.
     #[serde(default)]
     pub credit_alerts: BTreeMap<String, CreditAlertState>,
+    /// Persisted provider backpressure state. Omitted while pristine to keep
+    /// accounts that do not enable the policy byte-for-byte stable.
+    #[serde(default, skip_serializing_if = "BackpressureState::is_default")]
+    pub backpressure: BackpressureState,
+}
+
+/// Backpressure phase retained between controller cycles (§24.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureMode {
+    #[default]
+    Normal,
+    Hold,
+    StepDown,
+}
+
+/// State required to resume the backpressure state machine after restart.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct BackpressureState {
+    #[serde(default)]
+    pub mode: BackpressureMode,
+    #[serde(default)]
+    pub quiet_cycles: u32,
+    #[serde(default)]
+    pub last_usable_sample_at: Option<DateTime<Utc>>,
+}
+
+impl BackpressureState {
+    pub fn is_default(&self) -> bool {
+        self.mode == BackpressureMode::Normal
+            && self.quiet_cycles == 0
+            && self.last_usable_sample_at.is_none()
+    }
 }
 
 /// Quota samples associated with one host in one account. `workers` in each
@@ -416,7 +449,8 @@ impl State {
         // Version 2 adds the independent per-(account, host) sample map.
         // Version 3 adds per-host placement target history. Version 4 adds
         // reset-spanning aggregate burn samples and advisory de-duplication
-        // state. All additions default empty when loading an older file.
+        // state. Version 5 adds persisted backpressure phase/recovery state.
+        // All additions default empty when loading an older file.
         if state.schema_version < STATE_SCHEMA_VERSION {
             state.schema_version = STATE_SCHEMA_VERSION;
         }
@@ -847,6 +881,43 @@ mod tests {
     fn missing_history_field_defaults_to_empty() {
         let account: AccountState = serde_json::from_str("{}").unwrap();
         assert!(account.history.is_empty());
+        assert!(account.backpressure.is_default());
+        assert!(serde_json::to_value(account)
+            .unwrap()
+            .get("backpressure")
+            .is_none());
+    }
+
+    #[test]
+    fn backpressure_state_round_trips_through_persisted_account_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let observed_at = Utc::now();
+        let mut state = State::default();
+        state.accounts.insert(
+            "acct".into(),
+            AccountState {
+                backpressure: BackpressureState {
+                    mode: BackpressureMode::StepDown,
+                    quiet_cycles: 2,
+                    last_usable_sample_at: Some(observed_at),
+                },
+                ..Default::default()
+            },
+        );
+        state.save(&path).unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.accounts["acct"].backpressure,
+            BackpressureState {
+                mode: BackpressureMode::StepDown,
+                quiet_cycles: 2,
+                last_usable_sample_at: Some(observed_at),
+            }
+        );
     }
 
     #[test]

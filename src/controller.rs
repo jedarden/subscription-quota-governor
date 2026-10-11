@@ -1,6 +1,8 @@
-use crate::config::{AccountConfig, StaleBehavior, Strategy};
+use crate::config::{AccountConfig, BackpressureConfig, StaleBehavior, Strategy};
 use crate::model::{same_reset_generation, QuotaSnapshot, QuotaWindow};
-use crate::state::{AccountState, AggregateBurnSample, WindowSample};
+use crate::state::{
+    AccountState, AggregateBurnSample, BackpressureMode, BackpressureState, WindowSample,
+};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -21,6 +23,9 @@ pub struct Decision {
     pub binding_window: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub banked_resets: Option<BankedResetDecision>,
+    /// Present only when utilization.backpressure is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backpressure: Option<BackpressureDecision>,
     /// Plan §23.4: fresh same-adapter workers the governor does not own (the
     /// roster floor). Zero, and omitted from events, for an unscoped account.
     #[serde(skip_serializing_if = "is_zero")]
@@ -29,6 +34,16 @@ pub struct Decision {
     /// derived from. Present only when `unowned_workers` is non-zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desired_total: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BackpressureDecision {
+    pub state: BackpressureMode,
+    pub fraction: Option<f64>,
+    /// Whether the cap lowered the quota controller's desired worker count.
+    pub brake_changed: bool,
+    /// True when signal loss timed out an active phase during this cycle.
+    pub released_on_signal_loss: bool,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -165,6 +180,92 @@ pub fn evaluate_pool(
     .map(|decision| decision.into_elastic(unowned))
 }
 
+/// Applies the optional provider-pressure brake after pool evaluation, while
+/// the decision is already expressed in elastic (owned-worker) terms.
+pub fn apply_backpressure(
+    decision: &mut Decision,
+    policy: &BackpressureConfig,
+    prior: &BackpressureState,
+    snapshot: &QuotaSnapshot,
+    min_workers: u32,
+    now: DateTime<Utc>,
+) -> BackpressureState {
+    let fraction = snapshot
+        .backpressure
+        .as_ref()
+        .and_then(|sample| sample.upstream_429_fraction);
+    let usable_fraction = (!decision.stale).then_some(fraction).flatten();
+    let mut state = prior.clone();
+    let mut released_on_signal_loss = false;
+
+    if let Some(fraction) = usable_fraction {
+        state.last_usable_sample_at = Some(snapshot.observed_at);
+        match state.mode {
+            BackpressureMode::Normal => {
+                if fraction > policy.hold_above {
+                    state.mode = BackpressureMode::Hold;
+                }
+                state.quiet_cycles = 0;
+            }
+            BackpressureMode::Hold => {
+                if fraction > policy.step_down_above {
+                    state.mode = BackpressureMode::StepDown;
+                    state.quiet_cycles = 0;
+                } else if fraction < policy.recover_below {
+                    state.quiet_cycles = state.quiet_cycles.saturating_add(1);
+                    if state.quiet_cycles >= policy.quiet_cycles {
+                        state.mode = BackpressureMode::Normal;
+                        state.quiet_cycles = 0;
+                    }
+                } else {
+                    state.quiet_cycles = 0;
+                }
+            }
+            BackpressureMode::StepDown => {
+                if fraction < policy.recover_below {
+                    state.quiet_cycles = state.quiet_cycles.saturating_add(1);
+                    if state.quiet_cycles >= policy.quiet_cycles {
+                        state.mode = BackpressureMode::Hold;
+                        state.quiet_cycles = 0;
+                    }
+                } else {
+                    state.quiet_cycles = 0;
+                }
+            }
+        }
+    } else if state.mode != BackpressureMode::Normal {
+        let signal_age_seconds = state
+            .last_usable_sample_at
+            .map(|last| now.signed_duration_since(last).num_seconds().max(0) as u64);
+        if signal_age_seconds.is_none_or(|age| age >= policy.signal_loss_release_seconds) {
+            state = BackpressureState::default();
+            released_on_signal_loss = true;
+        }
+    }
+
+    let cap = match state.mode {
+        BackpressureMode::Normal => decision.desired_workers,
+        BackpressureMode::Hold => decision.current_workers.max(min_workers),
+        BackpressureMode::StepDown => decision.current_workers.saturating_sub(1).max(min_workers),
+    };
+    let before = decision.desired_workers;
+    decision.desired_workers = before.min(cap);
+    if decision.unowned_workers > 0 {
+        decision.desired_total = Some(
+            decision
+                .desired_workers
+                .saturating_add(decision.unowned_workers),
+        );
+    }
+    decision.backpressure = Some(BackpressureDecision {
+        state: state.mode,
+        fraction,
+        brake_changed: decision.desired_workers < before,
+        released_on_signal_loss,
+    });
+    state
+}
+
 pub fn evaluate(
     account_name: &str,
     config: &AccountConfig,
@@ -199,6 +300,7 @@ pub fn evaluate(
             windows: Vec::new(),
             binding_window: None,
             banked_resets: None,
+            backpressure: None,
             unowned_workers: 0,
             desired_total: None,
         });
@@ -323,6 +425,7 @@ pub fn evaluate(
         windows: decisions,
         binding_window,
         banked_resets,
+        backpressure: None,
         unowned_workers: 0,
         desired_total: None,
     })
@@ -807,6 +910,7 @@ mod tests {
                 stale_after_seconds: 900,
                 stale_behavior: StaleBehavior::Hold,
                 minimum_sample_seconds: 60,
+                backpressure: None,
                 windows: BTreeMap::new(),
             },
             banked_resets: BankedResetConfig::default(),
@@ -2001,6 +2105,279 @@ mod tests {
         assert!(error.to_string().contains("no enabled quota windows"));
     }
 
+    fn decision_for_backpressure(
+        current_workers: u32,
+        desired_workers: u32,
+        stale: bool,
+    ) -> Decision {
+        Decision {
+            account: "test".to_owned(),
+            observed_at: Utc::now(),
+            current_workers,
+            desired_workers,
+            stale,
+            windows: Vec::new(),
+            binding_window: None,
+            banked_resets: None,
+            backpressure: None,
+            unowned_workers: 0,
+            desired_total: None,
+        }
+    }
+
+    fn backpressure_snapshot(
+        observed_at: DateTime<Utc>,
+        fresh: bool,
+        fraction: Option<f64>,
+    ) -> QuotaSnapshot {
+        QuotaSnapshot {
+            observed_at,
+            fresh,
+            windows: Vec::new(),
+            eligible_backlog_capacity: None,
+            reset_credits: None,
+            backpressure: Some(crate::model::BackpressureSnapshot {
+                upstream_429_fraction: fraction,
+                attempts: fraction.map_or(0, |_| 30),
+                window_seconds: 300,
+            }),
+        }
+    }
+
+    #[test]
+    fn backpressure_transitions_and_quiet_recovery_follow_the_configured_cycles() {
+        let now = Utc::now();
+        let policy = BackpressureConfig::default();
+        let mut state = BackpressureState::default();
+        let mut decision = decision_for_backpressure(5, 8, false);
+        state = apply_backpressure(
+            &mut decision,
+            &policy,
+            &state,
+            &backpressure_snapshot(now, true, Some(0.3)),
+            1,
+            now,
+        );
+        assert_eq!(state.mode, BackpressureMode::Hold);
+        assert_eq!(decision.desired_workers, 5);
+        assert!(decision.backpressure.as_ref().unwrap().brake_changed);
+
+        let mut decision = decision_for_backpressure(5, 8, false);
+        state = apply_backpressure(
+            &mut decision,
+            &policy,
+            &state,
+            &backpressure_snapshot(now + Duration::seconds(1), true, Some(0.6)),
+            1,
+            now + Duration::seconds(1),
+        );
+        assert_eq!(state.mode, BackpressureMode::StepDown);
+        assert_eq!(decision.desired_workers, 4);
+
+        for quiet_cycle in 1..=policy.quiet_cycles {
+            let at = now + Duration::seconds(quiet_cycle as i64 + 1);
+            let mut decision = decision_for_backpressure(5, 8, false);
+            state = apply_backpressure(
+                &mut decision,
+                &policy,
+                &state,
+                &backpressure_snapshot(at, true, Some(0.05)),
+                1,
+                at,
+            );
+            assert_eq!(
+                state.mode,
+                if quiet_cycle < policy.quiet_cycles {
+                    BackpressureMode::StepDown
+                } else {
+                    BackpressureMode::Hold
+                }
+            );
+        }
+        for quiet_cycle in 0..policy.quiet_cycles {
+            let at = now + Duration::seconds(policy.quiet_cycles as i64 + quiet_cycle as i64 + 2);
+            let mut decision = decision_for_backpressure(5, 8, false);
+            state = apply_backpressure(
+                &mut decision,
+                &policy,
+                &state,
+                &backpressure_snapshot(at, true, Some(0.05)),
+                1,
+                at,
+            );
+        }
+        assert_eq!(state.mode, BackpressureMode::Normal);
+    }
+
+    #[test]
+    fn absent_insufficient_or_stale_backpressure_signal_does_not_advance_state() {
+        let now = Utc::now();
+        let policy = BackpressureConfig::default();
+        let prior = BackpressureState {
+            mode: BackpressureMode::Hold,
+            quiet_cycles: 1,
+            last_usable_sample_at: Some(now),
+        };
+        for snapshot in [
+            QuotaSnapshot {
+                backpressure: None,
+                ..backpressure_snapshot(now + Duration::seconds(30), true, None)
+            },
+            backpressure_snapshot(now + Duration::seconds(30), true, None),
+        ] {
+            let mut decision = decision_for_backpressure(5, 8, false);
+            let updated = apply_backpressure(
+                &mut decision,
+                &policy,
+                &prior,
+                &snapshot,
+                1,
+                now + Duration::seconds(30),
+            );
+            assert_eq!(updated.mode, BackpressureMode::Hold);
+            assert_eq!(updated.quiet_cycles, 1);
+            assert_eq!(decision.backpressure.as_ref().unwrap().fraction, None);
+        }
+
+        let mut stale_decision = decision_for_backpressure(5, 8, true);
+        let updated = apply_backpressure(
+            &mut stale_decision,
+            &policy,
+            &prior,
+            &backpressure_snapshot(now + Duration::seconds(30), true, Some(0.9)),
+            1,
+            now + Duration::seconds(30),
+        );
+        assert_eq!(updated.mode, BackpressureMode::Hold);
+        assert_eq!(updated.quiet_cycles, 1);
+        assert_eq!(
+            stale_decision.backpressure.as_ref().unwrap().fraction,
+            Some(0.9)
+        );
+    }
+
+    #[test]
+    fn backpressure_caps_elastic_workers_without_changing_the_unowned_roster_floor() {
+        let now = Utc::now();
+        let policy = BackpressureConfig::default();
+        let prior = BackpressureState::default();
+        let mut decision = decision_for_backpressure(5, 8, false);
+        decision.unowned_workers = 3;
+        decision.desired_total = Some(11);
+        let updated = apply_backpressure(
+            &mut decision,
+            &policy,
+            &prior,
+            &backpressure_snapshot(now, true, Some(0.3)),
+            1,
+            now,
+        );
+
+        assert_eq!(updated.mode, BackpressureMode::Hold);
+        assert_eq!(decision.current_workers, 5);
+        assert_eq!(decision.desired_workers, 5);
+        assert_eq!(decision.unowned_workers, 3);
+        assert_eq!(decision.desired_total, Some(8));
+    }
+
+    #[test]
+    fn serialized_decision_exposes_backpressure_fields_only_when_policy_runs() {
+        let now = Utc::now();
+        let mut decision = decision_for_backpressure(5, 8, false);
+        let _ = apply_backpressure(
+            &mut decision,
+            &BackpressureConfig::default(),
+            &BackpressureState::default(),
+            &backpressure_snapshot(now, true, Some(0.3)),
+            1,
+            now,
+        );
+        let event_decision = serde_json::to_value(&decision).unwrap();
+        assert_eq!(event_decision["backpressure"]["state"], "hold");
+        assert_eq!(event_decision["backpressure"]["fraction"], 0.3);
+        assert_eq!(event_decision["backpressure"]["brake_changed"], true);
+
+        let without_policy = serde_json::to_value(decision_for_backpressure(5, 8, false)).unwrap();
+        assert!(without_policy.get("backpressure").is_none());
+    }
+
+    mod backpressure_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn brake_is_monotone_and_never_crosses_the_worker_floor(
+                min_workers in 0u32..10,
+                current_extra in 0u32..20,
+                desired_extra in 0u32..20,
+                step_down in any::<bool>(),
+            ) {
+                let now = Utc::now();
+                let current_workers = min_workers + current_extra;
+                let original_desired = min_workers + desired_extra;
+                let mode = if step_down { BackpressureMode::StepDown } else { BackpressureMode::Hold };
+                let prior = BackpressureState {
+                    mode,
+                    quiet_cycles: 0,
+                    last_usable_sample_at: Some(now),
+                };
+                let snapshot = backpressure_snapshot(now, true, Some(0.25));
+                let mut decision = decision_for_backpressure(current_workers, original_desired, false);
+                let _ = apply_backpressure(
+                    &mut decision,
+                    &BackpressureConfig::default(),
+                    &prior,
+                    &snapshot,
+                    min_workers,
+                    now,
+                );
+
+                prop_assert!(decision.desired_workers <= original_desired);
+                prop_assert!(decision.desired_workers >= min_workers);
+                prop_assert_eq!(
+                    decision.backpressure.as_ref().unwrap().brake_changed,
+                    decision.desired_workers < original_desired,
+                );
+            }
+
+            #[test]
+            fn a_no_signal_run_releases_by_the_configured_timeout(
+                release_seconds in 1u64..300,
+                elapsed_seconds in 0u64..600,
+            ) {
+                let now = Utc::now();
+                let policy = BackpressureConfig {
+                    signal_loss_release_seconds: release_seconds,
+                    ..BackpressureConfig::default()
+                };
+                let prior = BackpressureState {
+                    mode: BackpressureMode::StepDown,
+                    quiet_cycles: 2,
+                    last_usable_sample_at: Some(now),
+                };
+                let snapshot = backpressure_snapshot(now + Duration::seconds(elapsed_seconds as i64), true, None);
+                let mut decision = decision_for_backpressure(5, 4, false);
+                let updated = apply_backpressure(
+                    &mut decision,
+                    &policy,
+                    &prior,
+                    &snapshot,
+                    1,
+                    now + Duration::seconds(elapsed_seconds as i64),
+                );
+
+                if elapsed_seconds >= release_seconds {
+                    prop_assert_eq!(updated.mode, BackpressureMode::Normal);
+                    prop_assert!(decision.backpressure.as_ref().unwrap().released_on_signal_loss);
+                } else {
+                    prop_assert_eq!(updated.mode, BackpressureMode::StepDown);
+                    prop_assert!(!decision.backpressure.as_ref().unwrap().released_on_signal_loss);
+                }
+            }
+        }
+    }
+
     // --- §17.2 property tests: clamping and monotonic safety ---
 
     mod proptests {
@@ -2052,6 +2429,7 @@ mod tests {
                         stale_after_seconds,
                         stale_behavior: StaleBehavior::Hold,
                         minimum_sample_seconds,
+                        backpressure: None,
                         windows: BTreeMap::new(),
                     },
                     banked_resets: BankedResetConfig::default(),

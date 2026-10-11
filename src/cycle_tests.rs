@@ -137,6 +137,7 @@ fn account_config(strategy: Strategy, target: f64, fleet: FleetConfig) -> Accoun
             stale_after_seconds: 900,
             stale_behavior: StaleBehavior::Hold,
             minimum_sample_seconds: 60,
+            backpressure: None,
             windows: BTreeMap::new(),
         },
         banked_resets: BankedResetConfig::default(),

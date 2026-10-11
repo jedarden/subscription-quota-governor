@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use subscription_governor::config::{ActuatorConfig, Config, ResourceSourceConfig, SourceConfig};
-use subscription_governor::controller::{evaluate_pool, CreditDeadlineAdvisory, Decision};
+use subscription_governor::controller::{
+    apply_backpressure, evaluate_pool, CreditDeadlineAdvisory, Decision,
+};
 use subscription_governor::fleet;
 use subscription_governor::model::ResourceSnapshot;
 use subscription_governor::placement::{self, HostPlacement};
@@ -931,7 +933,7 @@ fn run_cycle(
                 fleet::unowned_workers(&account_config.fleet)
                     .map_err(AccountFailure::Observation)?
             };
-            let decision = evaluate_pool(
+            let mut decision = evaluate_pool(
                 name,
                 account_config,
                 &snapshot,
@@ -941,6 +943,17 @@ fn run_cycle(
                 now,
             )
             .map_err(AccountFailure::Observation)?;
+            if let Some(policy) = &account_config.utilization.backpressure {
+                let next_backpressure = apply_backpressure(
+                    &mut decision,
+                    policy,
+                    &prior.backpressure,
+                    &snapshot,
+                    account_config.fleet.min_workers,
+                    now,
+                );
+                state.accounts.entry(name.clone()).or_default().backpressure = next_backpressure;
+            }
             let readiness = readiness_for_decision(&decision);
             metrics.apply_decision(&decision, readiness.reason.clone(), now);
             if let Some(banked) = &decision.banked_resets {
@@ -1224,6 +1237,7 @@ mod shutdown_tests {
                 stale_after_seconds: 900,
                 stale_behavior: StaleBehavior::Hold,
                 minimum_sample_seconds: 60,
+                backpressure: None,
                 windows: BTreeMap::new(),
             },
             banked_resets: BankedResetConfig::default(),
@@ -1343,6 +1357,7 @@ mod exit_code_tests {
                 stale_after_seconds: 900,
                 stale_behavior: StaleBehavior::Hold,
                 minimum_sample_seconds: 60,
+                backpressure: None,
                 windows: BTreeMap::new(),
             },
             banked_resets: BankedResetConfig::default(),
@@ -1498,6 +1513,7 @@ mod status_tests {
             windows,
             binding_window,
             banked_resets: None,
+            backpressure: None,
             unowned_workers: 0,
             desired_total: None,
         }
@@ -1668,6 +1684,7 @@ mod metrics_tests {
             windows,
             binding_window: Some("weekly".to_owned()),
             banked_resets: None,
+            backpressure: None,
             unowned_workers: 0,
             desired_total: None,
         }

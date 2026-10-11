@@ -1631,9 +1631,9 @@ Dependencies: WP19, §7.3.
 
 Dependencies: WP19, WP16.
 
-- [ ] Implement §24.4 with persisted state, the event fields, and config
+- [x] Implement §24.4 with persisted state, the event fields, and config
   validation (thresholds ordered, `quiet_cycles >= 1`).
-- [ ] Property tests: the brake never raises `desired_workers`, never goes below
+- [x] Property tests: the brake never raises `desired_workers`, never goes below
   `min_workers`, and a run of no-signal samples releases within
   `signal_loss_release_seconds`.
 

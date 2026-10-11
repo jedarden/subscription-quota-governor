@@ -233,8 +233,38 @@ pub struct UtilizationConfig {
     pub stale_behavior: StaleBehavior,
     #[serde(default = "default_min_sample")]
     pub minimum_sample_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backpressure: Option<BackpressureConfig>,
     #[serde(default)]
     pub windows: BTreeMap<String, WindowPolicy>,
+}
+
+/// Policy for applying provider throttling feedback after quota evaluation (§24.4).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackpressureConfig {
+    #[serde(default = "default_backpressure_hold_above")]
+    pub hold_above: f64,
+    #[serde(default = "default_backpressure_step_down_above")]
+    pub step_down_above: f64,
+    #[serde(default = "default_backpressure_recover_below")]
+    pub recover_below: f64,
+    #[serde(default = "default_backpressure_quiet_cycles")]
+    pub quiet_cycles: u32,
+    #[serde(default = "default_backpressure_signal_loss_release_seconds")]
+    pub signal_loss_release_seconds: u64,
+}
+
+impl Default for BackpressureConfig {
+    fn default() -> Self {
+        Self {
+            hold_above: default_backpressure_hold_above(),
+            step_down_above: default_backpressure_step_down_above(),
+            recover_below: default_backpressure_recover_below(),
+            quiet_cycles: default_backpressure_quiet_cycles(),
+            signal_loss_release_seconds: default_backpressure_signal_loss_release_seconds(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -342,6 +372,9 @@ impl Config {
                 &format!("account {name}"),
                 true,
             )?;
+            if let Some(backpressure) = &account.utilization.backpressure {
+                validate_backpressure(backpressure, name)?;
+            }
             for (window, policy) in &account.utilization.windows {
                 validate_target(
                     policy.target_utilization,
@@ -471,6 +504,29 @@ fn validate_target(
         }
     }
     Ok(())
+}
+
+fn validate_backpressure(policy: &BackpressureConfig, account: &str) -> Result<()> {
+    let thresholds = [
+        ("recover_below", policy.recover_below),
+        ("hold_above", policy.hold_above),
+        ("step_down_above", policy.step_down_above),
+    ];
+    for (field, value) in thresholds {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            bail!("account {account}: utilization.backpressure.{field} must be in [0, 1]");
+        }
+    }
+    if !(policy.recover_below < policy.hold_above && policy.hold_above < policy.step_down_above) {
+        bail!("account {account}: utilization.backpressure thresholds must satisfy recover_below < hold_above < step_down_above");
+    }
+    if policy.quiet_cycles == 0 {
+        bail!("account {account}: utilization.backpressure.quiet_cycles must be >= 1");
+    }
+    validate_duration(
+        policy.signal_loss_release_seconds,
+        &format!("account {account}: utilization.backpressure.signal_loss_release_seconds"),
+    )
 }
 
 fn validate_source(source: &SourceConfig, account: &str) -> Result<()> {
@@ -755,6 +811,21 @@ fn default_stale_after() -> u64 {
 fn default_min_sample() -> u64 {
     300
 }
+fn default_backpressure_hold_above() -> f64 {
+    0.20
+}
+fn default_backpressure_step_down_above() -> f64 {
+    0.50
+}
+fn default_backpressure_recover_below() -> f64 {
+    0.10
+}
+fn default_backpressure_quiet_cycles() -> u32 {
+    3
+}
+fn default_backpressure_signal_loss_release_seconds() -> u64 {
+    1_800
+}
 fn default_step() -> u32 {
     1
 }
@@ -815,6 +886,7 @@ mod tests {
             stale_after_seconds: 900,
             stale_behavior: StaleBehavior::Hold,
             minimum_sample_seconds: 300,
+            backpressure: None,
             windows: BTreeMap::new(),
         };
         assert_eq!(config.policy_for("weekly").unwrap().target, 0.85);
@@ -1250,6 +1322,51 @@ accounts:
             err.contains("utilization.minimum_sample_seconds must be positive"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn backpressure_policy_uses_plan_defaults() {
+        let yaml = config_with_utilization(&indent("reserve_fraction: 0.1\nbackpressure: {}"));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let policy = config.accounts["acct"]
+            .utilization
+            .backpressure
+            .as_ref()
+            .unwrap();
+        assert_eq!(policy.hold_above, 0.20);
+        assert_eq!(policy.step_down_above, 0.50);
+        assert_eq!(policy.recover_below, 0.10);
+        assert_eq!(policy.quiet_cycles, 3);
+        assert_eq!(policy.signal_loss_release_seconds, 1_800);
+    }
+
+    #[test]
+    fn backpressure_policy_rejects_invalid_threshold_order_and_recovery_settings() {
+        for (extra, expected) in [
+            ("recover_below: 0.20", "thresholds must satisfy"),
+            ("step_down_above: 0.15", "thresholds must satisfy"),
+            ("quiet_cycles: 0", "quiet_cycles must be >= 1"),
+            (
+                "signal_loss_release_seconds: 0",
+                "signal_loss_release_seconds must be positive",
+            ),
+        ] {
+            let yaml = config_with_utilization(&indent(&format!(
+                "reserve_fraction: 0.1\nbackpressure:\n  {extra}"
+            )));
+            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{extra}: {error}");
+        }
+    }
+
+    #[test]
+    fn absent_backpressure_policy_is_omitted_from_serialized_utilization() {
+        let yaml = config_with_utilization(&indent("reserve_fraction: 0.1"));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let serialized = serde_json::to_value(&config.accounts["acct"].utilization).unwrap();
+        assert!(serialized.get("backpressure").is_none());
     }
 
     /// examples/all-three.yaml relies on a deliberately huge stale_after_seconds
