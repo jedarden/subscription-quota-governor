@@ -269,8 +269,8 @@ Collector normalization rules (locked):
   emitted until the provider quota response supplies one; a missing weekly
   window is a known gap, not unlimited weekly capacity, and the operator
   decides whether to run without a weekly bound.
-- Upstream 429 rates are not part of this contract. Consuming them requires a
-  separate plan revision (§21).
+- Upstream 429 pressure is an optional, separate contract extension defined
+  in §24; a collector that does not emit it is still conforming.
 
 ### 7.4 Generic source behavior
 
@@ -1450,8 +1450,8 @@ A floor that alone reaches the target drives `desired_elastic` to
   credits stays a human handoff (§9.7).
 - **claude-zai:** `command` source reading the proxy's quota gauges (§7.3).
   Proxy saturation, not quota, is the observed binding constraint for GLM, so
-  `max_workers` is set conservatively and raised on evidence. 429 backpressure
-  is not an input to this tier; it needs its own plan revision (§21).
+  `max_workers` is set conservatively (at most 2) and raised on evidence once
+  the §24 backpressure input is live and validated.
 
 ### 23.6 Work packages
 
@@ -1503,3 +1503,146 @@ Dependencies: WP17, WP8.
 - [ ] An account without `identifier_prefix` is regression-tested unchanged.
 - [ ] The cgov/subgov preflight reports zero actuation-capable owners for any
   pool other than the one subgov governs.
+
+## 24. Provider Backpressure Input (Z.AI 429)
+
+Status: plan locked 2026-10-11; nothing below is implemented yet. This is the
+explicit plan revision §21 requires for a normalized-contract change, and it
+resolves the 429 exclusion recorded in §7.3 and §23.5.
+
+### 24.1 Purpose and scope
+
+Quota windows say how much budget is left; they do not say whether the
+provider is currently refusing work. Z.AI throttles with 429 while quota
+remains, and the zai-proxy already absorbs most of that with retries and its
+own adaptive ceiling. This input gives the governor a worker-count brake for
+the elastic tier (§23) when upstream refusals persist. It is optional per
+account, ships first for `claude-zai`, and is a hardening layer, not a
+precondition for the §23 rollout (`claude-zai` actuation stays at
+`max_workers <= 2` until this input is live and validated).
+
+Out of scope: per-request throttling (the proxy's job), prompt or task
+scheduling (§3), and any change to roster workers.
+
+### 24.2 Signal definition (locked)
+
+- The signal is the **upstream 429 fraction** over a trailing window:
+  `upstream_429 / attempts`, where `upstream_429` is the increase of the
+  proxy's `zai_proxy_upstream_errors_total{error_type="429"}` and `attempts`
+  is the increase of `zai_proxy_requests_total` (all statuses) plus
+  `zai_proxy_retry_attempts_total` (each retry is a further upstream attempt).
+- The proxy's own capacity-gate rejections are excluded. They are local
+  admission, not provider pressure.
+- Client-visible 429s (`requests_total{status_code="429"}`) are not used: the
+  proxy hides most upstream 429s behind retries, so they understate pressure.
+- A sample with fewer than `min_attempts` (default 30) attempts carries no
+  fraction; it is "insufficient", not zero.
+
+### 24.3 Contract extension (locked)
+
+The normalized snapshot (§6) gains an optional top-level object:
+
+```json
+"backpressure": {
+  "upstream_429_fraction": 0.31,
+  "attempts": 412,
+  "window_seconds": 300
+}
+```
+
+- `upstream_429_fraction` is in `[0, 1]` and is omitted when attempts are
+  insufficient; the object may then carry only `attempts` and `window_seconds`.
+- Absence of the whole object means "no signal". Absence never means "no
+  pressure".
+- Older readers ignore it (the structs are open), and an account without
+  `backpressure` policy ignores it.
+
+### 24.4 Controller behaviour (locked)
+
+Per account with a `utilization.backpressure` policy:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `hold_above` | 0.20 | enter HOLD: no elastic scale-up |
+| `step_down_above` | 0.50 | enter STEP_DOWN: drop one elastic worker per cycle |
+| `recover_below` | 0.10 | a quiet cycle |
+| `quiet_cycles` | 3 | consecutive quiet cycles to return to NORMAL |
+| `signal_loss_release_seconds` | 1800 | release a non-NORMAL state if no usable sample arrives |
+
+- States are NORMAL, HOLD, STEP_DOWN, persisted in account state (§10).
+  Transitions: NORMAL to HOLD above `hold_above`; HOLD to STEP_DOWN above
+  `step_down_above`; STEP_DOWN to HOLD and HOLD to NORMAL after
+  `quiet_cycles` consecutive samples below `recover_below`.
+- The brake can only lower `desired_workers` (elastic terms, §23.4):
+  HOLD caps it at the current owned count; STEP_DOWN caps it at the current
+  owned count minus one, floored at `min_workers`. It never raises, never
+  stops unowned workers, and composes after the quota controller with a
+  minimum.
+- A missing, stale or insufficient sample is no signal: it does not enter a
+  state and does not count as a quiet cycle. A non-NORMAL state with no usable
+  sample for `signal_loss_release_seconds` releases to NORMAL and emits an
+  event, so a dead collector cannot freeze the fleet.
+- The decision event records the backpressure state, the fraction, and
+  whether the brake changed the result.
+
+### 24.5 Collector requirements (locked)
+
+The site-local Z.AI collector (§7.3) derives the fraction from the proxy's
+counters. Those are cumulative and per replica, behind a load-balanced route:
+
+- The collector keeps a small state file of the last reading per replica,
+  keyed by the replica's `process_start_time_seconds`, and computes per-replica
+  deltas, then sums them. A restart (new start time, or a counter that went
+  down) discards that replica's baseline instead of producing a negative delta.
+- Each run scrapes the route several times to see both replicas; a replica seen
+  for the first time contributes no delta until its next reading.
+- Only readings at least 60 seconds apart contribute, and the state file is
+  written atomically and holds no credentials.
+
+### 24.6 Work packages
+
+#### WP19: contract and schema
+
+Dependencies: WP1.
+
+- [ ] Add the optional `backpressure` object to the quota snapshot model, the
+  published JSON Schema and the collector fixtures, with validation of the
+  fraction range and a test that older payloads still parse.
+
+#### WP20: collector deltas
+
+Dependencies: WP19, §7.3.
+
+- [ ] Implement §24.2 and §24.5 in the site-local collector, with fixture
+  tests for a replica restart, a first-seen replica, counter reset and an
+  insufficient sample.
+- [ ] Check the denominator against real proxy data before trusting it: the
+  fraction must stay in `[0, 1]` and move with observed throttling.
+
+#### WP21: controller state machine
+
+Dependencies: WP19, WP16.
+
+- [ ] Implement §24.4 with persisted state, the event fields, and config
+  validation (thresholds ordered, `quiet_cycles >= 1`).
+- [ ] Property tests: the brake never raises `desired_workers`, never goes below
+  `min_workers`, and a run of no-signal samples releases within
+  `signal_loss_release_seconds`.
+
+#### WP22: observe-only validation and enablement
+
+Dependencies: WP20, WP21, WP17.
+
+- [ ] Run observe-only against the live proxy across at least one real
+  throttling episode and record the fraction against the brake's would-be
+  decisions.
+- [ ] Enable the policy on `claude-zai` only after the recorded episode shows
+  no flapping (no more than one state change per `quiet_cycles` cycles).
+
+### 24.7 Acceptance criteria
+
+- [ ] An account without a `backpressure` policy is byte-for-byte unchanged.
+- [ ] A snapshot without the `backpressure` object never enters or advances a
+  brake state.
+- [ ] The brake is provably monotone: it only ever lowers the elastic target.
+- [ ] No roster unit is touched by a backpressure transition.
