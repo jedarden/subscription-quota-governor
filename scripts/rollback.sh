@@ -103,9 +103,9 @@ valid_systemd_word "$subgov_config" || fail "SUBGOV_CONFIG must be an absolute p
 
 systemctl() {
     if [[ $systemd_scope == user ]]; then
-        "$systemctl_bin" --user "$@"
+        command "$systemctl_bin" --user "$@"
     else
-        "$systemctl_bin" "$@"
+        command "$systemctl_bin" "$@"
     fi
 }
 

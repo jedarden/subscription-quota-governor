@@ -1,15 +1,17 @@
-# Migration candidate config: replaces claude-governor (cgov)'s needle-sonnet
-# pool for the anthropic:local-subscription account. NOT yet deployed --
-# see docs/notes/migration-claude-governor-to-subgov.md for the staged
-# rollout plan, the cgov-vs-subgov model differences this config cannot
-# paper over, and the preflight evidence proving this is a safe single-owner
-# target state before any actuator is enabled.
+# Source-controlled reference for the live claude-anthropic account, which
+# replaced claude-governor (cgov)'s needle-sonnet pool for the
+# anthropic:local-subscription account. The user service keeps its local copy
+# at ~/.config/subgov/claude-anthropic.yaml. See
+# docs/notes/runbooks/controller-ownership.md for the staged rollout, live
+# comparison evidence, and cgov-vs-subgov model differences.
 #
 # Mirrors the live tuning in ~/.config/claude-governor/governor.yaml's
 # needle-sonnet pool as closely as subgov's model allows (read 2026-10-07):
 #   - launch_cmd targets --agent claude-print --workspace /home/coding/pose-detection
 #   - session_pattern: needle-claude-print-cgov-sonnet-*
 #   - min_workers: 0, max_workers: 1
+#   - identifier_prefix: sg-claude-anthropic- for observer and actuator;
+#     older unprefixed workers remain an unowned floor and are not stopped
 #   - windows: [five_hour, seven_day] only -- weekly_scoped is deliberately
 #     excluded (it is scoped to a different model, Fable, not this pool)
 #   - target_ceiling 90.0 overridden to 0.85 on five_hour/seven_day (15% reserve)
@@ -28,6 +30,8 @@ accounts:
     fleet:
       min_workers: 0
       max_workers: 1
+      # Keep this ceiling until observe-only decisions and measured burn
+      # support a larger elastic fleet.
       # cgov has no bootstrap_workers equivalent; it instead assumes a
       # baseline_burn_rate (0.15 %/worker/hr) to compute an initial
       # safe_worker_count from zero measured samples. subgov's controller has
@@ -42,11 +46,13 @@ accounts:
       max_scale_down_per_cycle: 1
       observer:
         type: needle_status
+        identifier_prefix: sg-claude-anthropic-
         agent: claude-print
         heartbeat_dir: ~/.needle/state/heartbeats
         stale_after_seconds: 60
       actuator:
         type: needle_run
+        identifier_prefix: sg-claude-anthropic-
         repo: /home/coding/pose-detection
         adapter: claude-print
     utilization:
