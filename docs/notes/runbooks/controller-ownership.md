@@ -608,20 +608,23 @@ remains `max_workers: 1`; these observations do not support raising it.
 
 The service was put in verified observe-only before changing the config. Its
 unprefixed baseline at 12:16:25Z reported `current_workers: 1` and
-`desired_workers: 1`. After the prefix was added, two fresh cycles reported:
+`desired_workers: 1`. After the prefix was added, fresh cycles reported:
 
 | Time (UTC) | Owned | Unowned | Total target | Elastic target | Source / window result |
 | --- | ---: | ---: | ---: | ---: | --- |
 | 12:17:13 | 0 | 1 | 1 | 0 | Fresh; five-hour 0%, seven-day and weekly_all 84% |
 | 12:22:24 | 0 | 1 | 1 | 0 | Fresh; same utilization and per-window target |
+| 12:27:26 | 0 | 1 | 1 | 0 | Fresh; same utilization and per-window target |
+| 12:32:27 | 0 | 1 | 1 | 0 | Fresh; five-hour 1% targets 2; weekly windows stay at 84% and target 1 |
 
-Both prefixed decisions retained the previous pool-wide target of one. The
-observer and actuator agreed on the prefix, no prefixed worker was launched,
-and the existing heartbeat continued to update. Both cycles were observe-only
-with no actuator attempt. The comparison uses the same quota constraints as
-the unprefixed baseline; it changes only ownership accounting. Keep the
-account at one elastic worker until measured burn or operational evidence
-supports a higher ceiling.
+All four prefixed decisions retained the previous pool-wide target of one.
+The 12:32 sample includes a measured five-hour burn rate, but the weekly
+windows remain binding at one. The observer and actuator agreed on the
+prefix, no prefixed worker was launched, and the existing heartbeat
+continued to update. All cycles were observe-only with no actuator attempt.
+The comparison uses the same quota constraints as the unprefixed baseline;
+it changes only ownership accounting. Keep the account at one elastic worker
+until measured burn or operational evidence supports a higher ceiling.
 
 The first attempt to use `scripts/rollback.sh --user observe-only` exposed a
 recursive `systemctl` shell wrapper when `SYSTEMCTL_BIN` was the default name
