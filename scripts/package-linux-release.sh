@@ -76,7 +76,6 @@ SUBGOV_BUILD_TARGET="$TARGET" \
 SUBGOV_BUILD_ARTIFACT="$ARTIFACT" \
 SUBGOV_BUILD_LOCK_SHA256="$LOCK_SHA256" \
 SUBGOV_BUILD_RUSTC_VERSION="$RUSTC_VERSION" \
-SUBGOV_BUILD_WORKFLOW_UID="${SUBGOV_BUILD_WORKFLOW_UID:-local-${TAG_COMMIT}}" \
 SUBGOV_BUILDER_ID="${SUBGOV_BUILDER_ID:-local://scripts/package-linux-release.sh}" \
 SUBGOV_BINARY_PATH="$OUTPUT_DIR/$ARTIFACT" \
 SUBGOV_PROVENANCE_PATH="$OUTPUT_DIR/$ARTIFACT.intoto.jsonl" \
@@ -123,13 +122,13 @@ statement = {
         },
         "runDetails": {
             "builder": {"id": os.environ["SUBGOV_BUILDER_ID"]},
-            "metadata": {
-                "invocationId": os.environ["SUBGOV_BUILD_WORKFLOW_UID"],
-            },
             "byproducts": [],
         },
     },
 }
+workflow_uid = os.environ.get("SUBGOV_BUILD_WORKFLOW_UID")
+if workflow_uid:
+    statement["predicate"]["runDetails"]["metadata"] = {"invocationId": workflow_uid}
 with open(os.environ["SUBGOV_PROVENANCE_PATH"], "w", encoding="utf-8") as output:
     output.write(json.dumps(statement, sort_keys=True, separators=(",", ":")) + "\n")
 PY
