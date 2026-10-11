@@ -362,9 +362,24 @@ subgov preflight --inventory tests/fixtures/controller-ownership/claude-anthropi
    claude-governor.service` decisions for the same window. Specifically
    check: do `weekly_all` and `seven_day` ever diverge? Does subgov flap
    without cgov's hysteresis?
-3. Only once decisions correlate and no flapping is observed: stop
-   `claude-governor-stop-watch.timer` first (or it will restart cgov), then
-   `systemctl --user disable --now claude-governor.service`. Re-run the
+3. Only once decisions correlate and no flapping is observed: **disable and
+   stop** the stop-watch timer and its helper first, then the cgov service:
+
+   ```console
+   systemctl --user disable --now claude-governor-stop-watch.timer claude-governor-stop-watch.service
+   systemctl --user disable --now claude-governor.service
+   systemctl --user is-enabled claude-governor-stop-watch.timer claude-governor.service
+   systemctl --user is-active claude-governor-stop-watch.timer claude-governor-stop-watch.service claude-governor.service
+   systemctl --user show claude-governor.service --property=MainPID
+   ```
+
+   Expect both enablement results to be `disabled`, all three activity results
+   to be `inactive`, and `MainPID=0`. The helper service is static (no
+   `[Install]` section), so disabling it may report that there are no install
+   links; it must still be inactive. Stopping an enabled timer alone is not
+   durable: a user-manager restart starts it again, and it can explicitly
+   restart even a disabled cgov service. Stopping the helper also drains any
+   in-flight timer invocation before retiring cgov. Re-run the
    cutover-target preflight fixture against live state to confirm cgov now
    reads `disabled`/inactive. Then remove subgov's `--observe-only` drop-in
    (or redeploy its unit without the flag) so it begins actuating.
@@ -404,6 +419,12 @@ clean against the real live state at each stage (parallel-observe: 1
 actuating owner; the moment both were non-actuating: 0 owners, a safe gap);
 subgov's `--observe-only` drop was removed from its `ExecStart` and it began
 actuating.
+
+**Retirement correction — 2026-10-10:** that original cutover only stopped
+the timer. A user-manager restart revived it and it restarted cgov, creating
+dual ownership. Use the `disable --now` sequence in step 3 above for the
+timer, helper, and governor service; an inactive timer alone is insufficient.
+The command block below shows the corrected retirement sequence for reuse.
 
 **A real deployment bug surfaced on the first actual scale attempt, not
 before.** `fleet::actuate_config` short-circuits to a no-op whenever
@@ -450,7 +471,7 @@ retries on its normal 5-minute cadence without intervention; expect recovery
 once system load eases.
 
 ```text
-systemctl --user stop claude-governor-stop-watch.timer
+systemctl --user disable --now claude-governor-stop-watch.timer claude-governor-stop-watch.service
 systemctl --user disable --now claude-governor.service  -> inactive; daemon PID confirmed gone
 subgov preflight (cgov disabled, subgov observe-only)   -> PASS, 0 actuation-capable owners
 # ExecStart edited to drop --observe-only; daemon-reload; restart

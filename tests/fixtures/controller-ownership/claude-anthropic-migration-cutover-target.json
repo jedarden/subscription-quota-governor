@@ -11,7 +11,7 @@
       "config_path": "/home/coding/.config/claude-governor/governor.yaml",
       "state_path": "/home/coding/.config/claude-governor/governor-state.json",
       "actuator": "claude-governor.service stopped and disabled by the cutover step",
-      "evidence": "Target state: claude-governor-stop-watch.timer must also be stopped first, or it will restart claude-governor.service."
+      "evidence": "Target state: disable --now claude-governor-stop-watch.timer and its helper service before disable --now claude-governor.service; verify timer/governor disabled, all three inactive, and governor MainPID=0. Stopping an enabled timer alone lets a user-manager restart revive it and restart cgov."
     },
     {
       "name": "subgov-codinghome-claude-anthropic",
