@@ -123,6 +123,69 @@ fn a_valid_snapshot_collects_successfully_via_every_transport() {
         assert_eq!(snapshot.windows[0].id, "weekly", "{transport:?}");
         assert_eq!(snapshot.windows[0].used_fraction, 0.42, "{transport:?}");
         assert!(snapshot.fresh, "{transport:?}");
+        assert_eq!(snapshot.backpressure, None, "{transport:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_backpressure_signal_collects_and_preserves_its_fields_via_every_transport() {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "observed_at": "2026-09-28T12:00:00Z",
+        "windows": [{
+            "id": "weekly",
+            "used_fraction": 0.42,
+            "resets_at": "2026-09-30T00:00:00Z"
+        }],
+        "backpressure": {
+            "upstream_429_fraction": 0.31,
+            "attempts": 412,
+            "window_seconds": 300
+        }
+    }))
+    .unwrap();
+
+    for transport in ALL_TRANSPORTS {
+        let snapshot = collect_via_transport(transport, &bytes)
+            .unwrap_or_else(|error| panic!("{transport:?} should accept backpressure: {error:#}"));
+        let backpressure = snapshot
+            .backpressure
+            .expect("signal should survive collection");
+        assert_eq!(
+            backpressure.upstream_429_fraction,
+            Some(0.31),
+            "{transport:?}"
+        );
+        assert_eq!(backpressure.attempts, 412, "{transport:?}");
+        assert_eq!(backpressure.window_seconds, 300, "{transport:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_out_of_range_upstream_429_fraction_is_rejected_by_every_transport() {
+    for fraction in [-0.1, 1.1] {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "observed_at": "2026-09-28T12:00:00Z",
+            "windows": [{
+                "id": "weekly",
+                "used_fraction": 0.42,
+                "resets_at": "2026-09-30T00:00:00Z"
+            }],
+            "backpressure": {
+                "upstream_429_fraction": fraction,
+                "attempts": 412,
+                "window_seconds": 300
+            }
+        }))
+        .unwrap();
+        for transport in ALL_TRANSPORTS {
+            let error = collect_via_transport(transport, &bytes).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("upstream_429_fraction"),
+                "{transport:?} should report the invalid fraction: {error:#}"
+            );
+        }
     }
 }
 

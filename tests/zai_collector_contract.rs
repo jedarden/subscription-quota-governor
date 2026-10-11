@@ -83,6 +83,27 @@ fn a_normal_fixture_collects_successfully_through_the_command_transport() {
     assert_eq!(by_id("five_hour").used_fraction, 0.28);
     assert_eq!(by_id("weekly").used_fraction, 0.52);
     assert!(snapshot.fresh);
+    let backpressure = snapshot
+        .backpressure
+        .expect("normal fixture should carry a backpressure signal");
+    assert_eq!(backpressure.upstream_429_fraction, Some(0.31));
+    assert_eq!(backpressure.attempts, 412);
+    assert_eq!(backpressure.window_seconds, 300);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_insufficient_attempt_fixture_preserves_the_missing_fraction() {
+    let fixture = load_fixture("insufficient_attempts");
+    let snapshot = collect_via_command(&fixture)
+        .expect("a low-attempt sample without a fraction is a valid snapshot");
+
+    let backpressure = snapshot
+        .backpressure
+        .expect("sample metadata should survive even when the fraction is absent");
+    assert_eq!(backpressure.upstream_429_fraction, None);
+    assert_eq!(backpressure.attempts, 12);
+    assert_eq!(backpressure.window_seconds, 300);
 }
 
 #[cfg(unix)]
@@ -144,6 +165,7 @@ fn a_reset_generation_rollover_fixture_is_accepted_despite_its_reset_time_alread
         "the new generation's near-zero usage must pass through unchanged"
     );
     assert_eq!(snapshot.windows.len(), 2);
+    assert_eq!(snapshot.backpressure, None, "older snapshots remain valid");
 }
 
 #[cfg(unix)]
@@ -389,7 +411,13 @@ fn percentage_derived_and_absolute_derived_usage_normalize_to_identical_governor
 
 #[test]
 fn every_committed_fixture_is_a_valid_quota_snapshot_document() {
-    for name in ["normal", "near_limit", "stale", "reset_generation_rollover"] {
+    for name in [
+        "normal",
+        "near_limit",
+        "stale",
+        "reset_generation_rollover",
+        "insufficient_attempts",
+    ] {
         let fixture = load_fixture(name);
         let snapshot: QuotaSnapshot = serde_json::from_value(fixture).unwrap_or_else(|error| {
             panic!("{name} fixture must deserialize as QuotaSnapshot: {error}")

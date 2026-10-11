@@ -572,6 +572,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         }
     }
 
@@ -681,6 +682,7 @@ mod tests {
             windows: Vec::new(),
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         account.record(&empty_snapshot, 1, 3);
         assert!(

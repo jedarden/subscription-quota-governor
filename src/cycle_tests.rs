@@ -161,6 +161,7 @@ fn single_window_snapshot(
         }],
         eligible_backlog_capacity: None,
         reset_credits: None,
+        backpressure: None,
     }
 }
 

@@ -73,6 +73,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         }
     }
 

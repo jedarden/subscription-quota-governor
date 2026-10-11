@@ -873,6 +873,7 @@ mod tests {
             ],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let decision = evaluate(
             "test",
@@ -902,6 +903,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let plain = evaluate("t", &account(), &snapshot, &AccountState::default(), 4, now).unwrap();
         let pooled = evaluate_pool(
@@ -938,6 +940,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let decision = evaluate_pool(
             "t",
@@ -973,6 +976,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         for unowned in [0_u32, 1, 5, 20] {
             let decision = evaluate_pool(
@@ -1008,6 +1012,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let decision = evaluate(
             "test",
@@ -1049,6 +1054,7 @@ mod tests {
             ],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let decision =
             evaluate("test", &config, &snapshot, &AccountState::default(), 4, now).unwrap();
@@ -1073,6 +1079,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1115,6 +1122,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1155,6 +1163,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1187,6 +1196,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let decision = evaluate(
             "test",
@@ -1216,6 +1226,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let decision = evaluate(
             "test",
@@ -1292,6 +1303,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1325,6 +1337,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1366,6 +1379,7 @@ mod tests {
                 available_count: 1,
                 credits: None,
             }),
+            backpressure: None,
         };
         let mut prior = AccountState::default();
         add_banked_burn_history(&mut prior, now, reset, 0.30, 0.001, 0.01);
@@ -1439,6 +1453,7 @@ mod tests {
                     description: None,
                 }]),
             }),
+            backpressure: None,
         };
         let mut prior = AccountState::default();
         add_banked_burn_history(&mut prior, now, reset, 0.20, 0.001, 0.01);
@@ -1484,6 +1499,7 @@ mod tests {
                 }],
                 eligible_backlog_capacity: Some(12),
                 reset_credits,
+                backpressure: None,
             }
         }
 
@@ -1673,6 +1689,7 @@ mod tests {
                 available_count: 1,
                 credits: None,
             }),
+            backpressure: None,
         };
 
         let decision =
@@ -1710,6 +1727,7 @@ mod tests {
                     description: None,
                 }]),
             }),
+            backpressure: None,
         };
 
         let decision =
@@ -1877,6 +1895,7 @@ mod tests {
                 }],
                 eligible_backlog_capacity: None,
                 reset_credits: None,
+                backpressure: None,
             };
 
             let decision = evaluate("test", &config, &snapshot, &AccountState::default(), 2, now)
@@ -1939,6 +1958,7 @@ mod tests {
             ],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
 
         let decision =
@@ -1973,6 +1993,7 @@ mod tests {
             }],
             eligible_backlog_capacity: None,
             reset_credits: None,
+            backpressure: None,
         };
 
         let error =
@@ -2057,6 +2078,7 @@ mod tests {
                 }],
                 eligible_backlog_capacity: None,
                 reset_credits: None,
+                backpressure: None,
             }
         }
 
@@ -2115,6 +2137,7 @@ mod tests {
                     }],
                     eligible_backlog_capacity: None,
                     reset_credits: None,
+                    backpressure: None,
                 };
                 let decision = evaluate_pool(
                     "prop",
@@ -2172,6 +2195,7 @@ mod tests {
                     }],
                     eligible_backlog_capacity: None,
                     reset_credits: None,
+                    backpressure: None,
                 };
                 let decision = evaluate(
                     "prop",
@@ -2226,6 +2250,7 @@ mod tests {
                     windows: vec![window_a.clone()],
                     eligible_backlog_capacity: None,
                     reset_credits: None,
+                    backpressure: None,
                 };
                 let snapshot_two = QuotaSnapshot {
                     observed_at: now,
@@ -2233,6 +2258,7 @@ mod tests {
                     windows: vec![window_a, window_b],
                     eligible_backlog_capacity: None,
                     reset_credits: None,
+                    backpressure: None,
                 };
                 let decision_one = evaluate(
                     "prop",
@@ -2356,6 +2382,7 @@ mod tests {
                     }],
                     eligible_backlog_capacity: None,
                     reset_credits: None,
+                    backpressure: None,
                 };
                 let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                 assert_bounded_step(workers, &decision, &config);
@@ -2411,6 +2438,7 @@ mod tests {
                     }],
                     eligible_backlog_capacity: None,
                     reset_credits: None,
+                    backpressure: None,
                 };
                 let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                 assert_bounded_step(workers, &decision, &config);
@@ -2485,6 +2513,7 @@ mod tests {
                         }],
                         eligible_backlog_capacity: None,
                         reset_credits: None,
+                        backpressure: None,
                     };
                     let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                     assert_bounded_step(workers, &decision, &config);
@@ -2519,6 +2548,7 @@ mod tests {
                     }],
                     eligible_backlog_capacity: None,
                     reset_credits: None,
+                    backpressure: None,
                 };
                 let decision = step(&config, &mut prior, workers, &pending_rollover, clock.now());
                 assert_eq!(

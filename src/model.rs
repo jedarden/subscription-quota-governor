@@ -15,6 +15,35 @@ pub struct QuotaSnapshot {
     pub eligible_backlog_capacity: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits: Option<ResetCreditsSnapshot>,
+    /// Optional provider-pressure signal over a trailing observation window.
+    /// Sources omit this object when they have no upstream throttling data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backpressure: Option<BackpressureSnapshot>,
+}
+
+/// Upstream throttling observed over a trailing window (§24.3).
+///
+/// A low-attempt sample still carries its denominator and window, but omits
+/// `upstream_429_fraction`; missing fraction means insufficient evidence, not
+/// zero pressure.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct BackpressureSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_429_fraction: Option<f64>,
+    pub attempts: u64,
+    pub window_seconds: u64,
+}
+
+impl BackpressureSnapshot {
+    /// Enforces the §24.3 fraction range; serde handles the integer fields.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(fraction) = self.upstream_429_fraction {
+            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+                bail!("quota snapshot backpressure upstream_429_fraction must be in [0, 1]");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -172,6 +201,70 @@ mod tests {
         let without_capacity = json.replace(",\n            \"eligible_backlog_capacity\": 3", "");
         let snapshot: QuotaSnapshot = serde_json::from_str(&without_capacity).unwrap();
         assert_eq!(snapshot.eligible_backlog_capacity, None);
+    }
+
+    #[test]
+    fn quota_snapshot_accepts_optional_backpressure_and_older_payloads() {
+        let older_payload = r#"{
+            "observed_at": "2026-09-28T12:00:00Z",
+            "windows": [{
+                "id": "weekly",
+                "used_fraction": 0.42,
+                "resets_at": "2026-10-03T00:00:00Z"
+            }]
+        }"#;
+        let snapshot: QuotaSnapshot = serde_json::from_str(older_payload).unwrap();
+        assert_eq!(snapshot.backpressure, None);
+
+        let with_signal = r#"{
+            "observed_at": "2026-09-28T12:00:00Z",
+            "windows": [{
+                "id": "weekly",
+                "used_fraction": 0.42,
+                "resets_at": "2026-10-03T00:00:00Z"
+            }],
+            "backpressure": {
+                "upstream_429_fraction": 0.31,
+                "attempts": 412,
+                "window_seconds": 300
+            }
+        }"#;
+        let snapshot: QuotaSnapshot = serde_json::from_str(with_signal).unwrap();
+        let backpressure = snapshot.backpressure.unwrap();
+        assert_eq!(backpressure.upstream_429_fraction, Some(0.31));
+        assert_eq!(backpressure.attempts, 412);
+        assert_eq!(backpressure.window_seconds, 300);
+
+        let insufficient = r#"{
+            "attempts": 12,
+            "window_seconds": 300
+        }"#;
+        let backpressure: BackpressureSnapshot = serde_json::from_str(insufficient).unwrap();
+        assert_eq!(backpressure.upstream_429_fraction, None);
+        assert!(backpressure.validate().is_ok());
+    }
+
+    #[test]
+    fn backpressure_fraction_is_inclusive_and_range_checked() {
+        for fraction in [0.0, 1.0] {
+            assert!(BackpressureSnapshot {
+                upstream_429_fraction: Some(fraction),
+                attempts: 30,
+                window_seconds: 300,
+            }
+            .validate()
+            .is_ok());
+        }
+
+        for fraction in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+            assert!(BackpressureSnapshot {
+                upstream_429_fraction: Some(fraction),
+                attempts: 30,
+                window_seconds: 300,
+            }
+            .validate()
+            .is_err());
+        }
     }
 
     #[test]

@@ -1,6 +1,11 @@
 {
   "observed_at": "2026-09-28T12:00:00Z",
   "fresh": true,
+  "backpressure": {
+    "upstream_429_fraction": 0.31,
+    "attempts": 412,
+    "window_seconds": 300
+  },
   "windows": [
     {"id": "five_hour", "used_fraction": 0.28, "resets_at": "2026-09-28T17:00:00Z", "duration_minutes": 300},
     {"id": "weekly", "used_fraction": 0.52, "resets_at": "2026-10-03T00:00:00Z", "duration_minutes": 10080}
