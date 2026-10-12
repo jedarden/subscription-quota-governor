@@ -634,6 +634,7 @@ mod tests {
                 stale_behavior: Default::default(),
                 minimum_sample_seconds: 60,
                 backpressure: None,
+                zai_saturation: None,
                 windows: BTreeMap::new(),
             },
             banked_resets: BankedResetConfig::default(),

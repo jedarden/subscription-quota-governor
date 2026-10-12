@@ -184,3 +184,9 @@ the [implementation plan](docs/plan/plan.md), the [changelog](CHANGELOG.md), a
 ## License
 
 MIT
+
+Z.ai accounts can explicitly opt in to a bounded completed-request throughput
+search with `utilization.zai_saturation: {}`. See the
+[policy and telemetry contract](docs/zai-saturation.md) and the
+[observe-only example](examples/zai-saturation.yaml). Defaults for existing
+accounts are unchanged; production enablement requires separate validation.

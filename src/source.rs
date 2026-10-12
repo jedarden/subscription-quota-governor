@@ -714,6 +714,7 @@ pub fn parse_anthropic_usage(payload: &Value, observed_at: DateTime<Utc>) -> Res
         eligible_backlog_capacity: None,
         reset_credits: None,
         backpressure: None,
+        saturation: None,
     })
 }
 
@@ -1288,6 +1289,7 @@ pub fn parse_codex_rate_limits(
         eligible_backlog_capacity: None,
         reset_credits: parse_reset_credits(result),
         backpressure: None,
+        saturation: None,
     })
 }
 
@@ -1395,6 +1397,9 @@ fn validate_snapshot(snapshot: QuotaSnapshot) -> Result<QuotaSnapshot> {
                 bail!("quota snapshot has a reset credit with an empty id");
             }
         }
+    }
+    if let Some(saturation) = &snapshot.saturation {
+        saturation.validate()?;
     }
     if let Some(backpressure) = &snapshot.backpressure {
         backpressure.validate()?;

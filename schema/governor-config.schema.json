@@ -31,6 +31,13 @@
     }
   },
   "$defs": {
+    "identifierPrefix": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 32,
+      "pattern": "^[a-z0-9_-]+$",
+      "description": "Optional owned-worker identifier prefix; lowercase ASCII letters, digits, '-' and '_', 1-32 characters. Absent/null is unscoped. Config::validate() also requires matching observer/actuator prefixes, a sibling equality constraint not expressible here."
+    },
     "account": {
       "type": "object",
       "required": ["source", "fleet", "utilization"],
@@ -163,6 +170,7 @@
               "pattern": "^[A-Za-z0-9._-]+$",
               "description": "NEEDLE adapter name; Config::validate() permits ASCII letters, digits, '.', '_' and '-'."
             },
+            "identifier_prefix": { "$ref": "#/$defs/identifierPrefix" },
             "heartbeat_dir": {
               "type": "string",
               "minLength": 1,
@@ -224,6 +232,7 @@
           "properties": {
             "type": { "const": "needle_run" },
             "repo": { "type": "string", "minLength": 1 },
+            "identifier_prefix": { "$ref": "#/$defs/identifierPrefix" },
             "adapter": {
               "type": "string",
               "minLength": 1,
@@ -360,10 +369,60 @@
           "description": "Config::validate() rejects 0 or a value above i64::MAX."
         },
         "backpressure": { "$ref": "#/$defs/backpressure" },
+        "zai_saturation": { "$ref": "#/$defs/zaiSaturation" },
         "windows": {
           "type": "object",
           "default": {},
           "additionalProperties": { "$ref": "#/$defs/windowPolicy" }
+        }
+      }
+    },
+    "zaiSaturation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Explicit opt-in bounded throughput search. See docs/zai-saturation.md; no assumed provider slot count or worker target. Omit to preserve existing controller behavior.",
+      "properties": {
+        "step_workers": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 1
+        },
+        "dwell_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 600
+        },
+        "minimum_window_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 300
+        },
+        "minimum_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615,
+          "default": 30
+        },
+        "reprobe_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 3600
+        },
+        "plateau_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 1,
+          "default": 0.05
+        },
+        "concurrency_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 1,
+          "default": 0.1
         }
       }
     },

@@ -138,6 +138,7 @@ fn account_config(strategy: Strategy, target: f64, fleet: FleetConfig) -> Accoun
             stale_behavior: StaleBehavior::Hold,
             minimum_sample_seconds: 60,
             backpressure: None,
+            zai_saturation: None,
             windows: BTreeMap::new(),
         },
         banked_resets: BankedResetConfig::default(),
@@ -163,6 +164,7 @@ fn single_window_snapshot(
         eligible_backlog_capacity: None,
         reset_credits: None,
         backpressure: None,
+        saturation: None,
     }
 }
 

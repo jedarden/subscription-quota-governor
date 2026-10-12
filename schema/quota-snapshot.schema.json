@@ -23,6 +23,7 @@
       "minimum": 0,
       "description": "Optional count of workers supported by eligible queued work. Banked-reset pacing is capped at this count; when absent, the current worker count is the cap."
     },
+    "saturation": { "$ref": "#/$defs/saturation", "description": "Optional completed-request throughput and provider error 1302 interval evidence; not generic HTTP 429." },
     "backpressure": {
       "$ref": "#/$defs/backpressure",
       "description": "Optional upstream 429 signal over a trailing observation window. Absence of this object means no signal."
@@ -36,6 +37,42 @@
     "reset_credits": { "$ref": "#/$defs/resetCreditsSnapshot" }
   },
   "$defs": {
+    "saturation": {
+      "type": "object",
+      "required": [
+        "completed_requests",
+        "window_seconds",
+        "attempts"
+      ],
+      "additionalProperties": true,
+      "description": "Nonnegative interval deltas for the full stable replica set. completed_requests must be <= attempts (enforced by Rust; sibling comparison not expressible in standard JSON Schema). Missing fraction means unknown concurrency pressure. A first sample, reset, restart, partial replica set or unmeasurable completion counter withholds the whole object.",
+      "properties": {
+        "completed_requests": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "window_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "upstream_concurrency_fraction": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Provider code 1302 delta / attempt delta. Never infer from undifferentiated HTTP 429; absent/null means unknown."
+        }
+      }
+    },
     "window": {
       "type": "object",
       "required": ["id", "used_fraction", "resets_at"],

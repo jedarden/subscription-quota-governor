@@ -111,7 +111,46 @@
           "description": "The `windows[].id` whose raw desired count won the §9.6 arbitration (the minimum across `windows`), before the banked-reset floor and step limits are applied. Absent for a stale decision. A tie between windows favors the first in snapshot order."
         },
         "banked_resets": { "$ref": "#/$defs/bankedResetDecision" },
-        "backpressure": { "$ref": "#/$defs/backpressureDecision" }
+        "backpressure": { "$ref": "#/$defs/backpressureDecision" },
+        "saturation": { "$ref": "#/$defs/saturationDecision" }
+      }
+    },
+    "saturationDecision": {
+      "type": "object",
+      "required": [
+        "reason",
+        "completed_requests_per_second",
+        "upstream_concurrency_fraction",
+        "target_workers",
+        "probe_pending"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "completed_requests_per_second": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "upstream_concurrency_fraction": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "target_workers": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "probe_pending": {
+          "type": "boolean"
+        }
       }
     },
     "backpressureDecision": {

@@ -900,11 +900,6 @@ fn run_cycle(
             let snapshot =
                 source::collect(&account_config.source).map_err(AccountFailure::Observation)?;
             metrics.source_success = true;
-            metrics.sample_age_seconds = Some(
-                now.signed_duration_since(snapshot.observed_at)
-                    .num_seconds()
-                    .max(0) as u64,
-            );
             let workers = if account_config
                 .fleet
                 .hosts
@@ -933,6 +928,15 @@ fn run_cycle(
                 fleet::unowned_workers(&account_config.fleet)
                     .map_err(AccountFailure::Observation)?
             };
+            // Commands and worker observations may take seconds. Evaluate
+            // freshness against the time after observation, so a collector's
+            // genuine execution-time timestamp is not treated as future data.
+            let now = Utc::now();
+            metrics.sample_age_seconds = Some(
+                now.signed_duration_since(snapshot.observed_at)
+                    .num_seconds()
+                    .max(0) as u64,
+            );
             let mut decision = evaluate_pool(
                 name,
                 account_config,
@@ -943,6 +947,20 @@ fn run_cycle(
                 now,
             )
             .map_err(AccountFailure::Observation)?;
+            if account_config.utilization.zai_saturation.is_some() {
+                let next = subscription_governor::saturation::apply_zai_saturation(
+                    &mut decision,
+                    account_config,
+                    &snapshot,
+                    &prior,
+                    now,
+                );
+                state
+                    .accounts
+                    .entry(name.clone())
+                    .or_default()
+                    .zai_saturation = Some(next);
+            }
             if let Some(policy) = &account_config.utilization.backpressure {
                 let next_backpressure = apply_backpressure(
                     &mut decision,
@@ -1238,6 +1256,7 @@ mod shutdown_tests {
                 stale_behavior: StaleBehavior::Hold,
                 minimum_sample_seconds: 60,
                 backpressure: None,
+                zai_saturation: None,
                 windows: BTreeMap::new(),
             },
             banked_resets: BankedResetConfig::default(),
@@ -1358,6 +1377,7 @@ mod exit_code_tests {
                 stale_behavior: StaleBehavior::Hold,
                 minimum_sample_seconds: 60,
                 backpressure: None,
+                zai_saturation: None,
                 windows: BTreeMap::new(),
             },
             banked_resets: BankedResetConfig::default(),
@@ -1514,6 +1534,7 @@ mod status_tests {
             binding_window,
             banked_resets: None,
             backpressure: None,
+            saturation: None,
             unowned_workers: 0,
             desired_total: None,
         }
@@ -1685,6 +1706,7 @@ mod metrics_tests {
             binding_window: Some("weekly".to_owned()),
             banked_resets: None,
             backpressure: None,
+            saturation: None,
             unowned_workers: 0,
             desired_total: None,
         }

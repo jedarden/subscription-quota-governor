@@ -1,0 +1,24 @@
+version: 1
+poll_interval_seconds: 300
+state_path: /home/coding/.local/state/subgov/zai-saturation-observe.json
+# Observe-only example: subgov --config examples/zai-saturation.yaml run --observe-only
+# Choose the fleet ceiling from actual host/backlog capacity, never provider slots.
+accounts:
+  claude-zai:
+    source:
+      type: normalized_file
+      path: /home/coding/.local/state/subgov/zai-saturation-snapshot.json
+    fleet:
+      min_workers: 0
+      max_workers: 8
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 1
+      observer: { type: static, workers: 1 }
+      actuator: { type: none }
+    utilization:
+      reserve_fraction: 0.10
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      minimum_sample_seconds: 240
+      zai_saturation: {}

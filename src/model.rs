@@ -19,6 +19,35 @@ pub struct QuotaSnapshot {
     /// Sources omit this object when they have no upstream throttling data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backpressure: Option<BackpressureSnapshot>,
+    /// Completed upstream requests and provider-specific concurrency rejection evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saturation: Option<SaturationSnapshot>,
+}
+
+/// Interval deltas, never cumulative counters. Only provider error 1302 belongs
+/// in the concurrency fraction; generic HTTP 429 is not a concurrency signal.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SaturationSnapshot {
+    pub completed_requests: u64,
+    pub window_seconds: u64,
+    pub attempts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_concurrency_fraction: Option<f64>,
+}
+
+impl SaturationSnapshot {
+    pub fn validate(&self) -> Result<()> {
+        if self.completed_requests > self.attempts {
+            bail!("quota snapshot saturation completed_requests must be <= attempts");
+        }
+        if self
+            .upstream_concurrency_fraction
+            .is_some_and(|fraction| !fraction.is_finite() || !(0.0..=1.0).contains(&fraction))
+        {
+            bail!("quota snapshot saturation upstream_concurrency_fraction must be in [0, 1]");
+        }
+        Ok(())
+    }
 }
 
 /// Upstream throttling observed over a trailing window (§24.3).

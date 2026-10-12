@@ -235,8 +235,37 @@ pub struct UtilizationConfig {
     pub minimum_sample_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backpressure: Option<BackpressureConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zai_saturation: Option<ZaiSaturationConfig>,
     #[serde(default)]
     pub windows: BTreeMap<String, WindowPolicy>,
+}
+
+/// Explicit opt-in search for the smallest fleet near the throughput plateau.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ZaiSaturationConfig {
+    pub step_workers: u32,
+    pub dwell_seconds: u64,
+    pub minimum_window_seconds: u64,
+    pub minimum_attempts: u64,
+    pub plateau_fraction: f64,
+    pub concurrency_fraction: f64,
+    pub reprobe_seconds: u64,
+}
+
+impl Default for ZaiSaturationConfig {
+    fn default() -> Self {
+        Self {
+            step_workers: 1,
+            dwell_seconds: 600,
+            minimum_window_seconds: 300,
+            minimum_attempts: 30,
+            plateau_fraction: 0.05,
+            concurrency_fraction: 0.10,
+            reprobe_seconds: 3600,
+        }
+    }
 }
 
 /// Policy for applying provider throttling feedback after quota evaluation (§24.4).
@@ -372,6 +401,31 @@ impl Config {
                 &format!("account {name}"),
                 true,
             )?;
+            if let Some(policy) = &account.utilization.zai_saturation {
+                if policy.step_workers == 0 || policy.minimum_attempts == 0 {
+                    bail!("account {name}: utilization.zai_saturation step_workers and minimum_attempts must be positive");
+                }
+                for (field, value) in [
+                    ("dwell_seconds", policy.dwell_seconds),
+                    ("minimum_window_seconds", policy.minimum_window_seconds),
+                    ("reprobe_seconds", policy.reprobe_seconds),
+                ] {
+                    validate_duration(
+                        value,
+                        &format!("account {name}: utilization.zai_saturation.{field}"),
+                    )?;
+                }
+                for (field, value) in [
+                    ("plateau_fraction", policy.plateau_fraction),
+                    ("concurrency_fraction", policy.concurrency_fraction),
+                ] {
+                    if !value.is_finite() || !(0.0..1.0).contains(&value) {
+                        bail!(
+                            "account {name}: utilization.zai_saturation.{field} must be in [0, 1)"
+                        );
+                    }
+                }
+            }
             if let Some(backpressure) = &account.utilization.backpressure {
                 validate_backpressure(backpressure, name)?;
             }
@@ -887,6 +941,7 @@ mod tests {
             stale_behavior: StaleBehavior::Hold,
             minimum_sample_seconds: 300,
             backpressure: None,
+            zai_saturation: None,
             windows: BTreeMap::new(),
         };
         assert_eq!(config.policy_for("weekly").unwrap().target, 0.85);
@@ -1359,6 +1414,51 @@ accounts:
             let error = config.validate().unwrap_err().to_string();
             assert!(error.contains(expected), "{extra}: {error}");
         }
+    }
+
+    #[test]
+    fn saturation_policy_is_strict_opt_in_and_validates_settings() {
+        let yaml = config_with_utilization(&indent("reserve_fraction: 0.1"));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(serde_json::to_value(&config.accounts["acct"].utilization)
+            .unwrap()
+            .get("zai_saturation")
+            .is_none());
+        let enabled = config_with_utilization(&indent("reserve_fraction: 0.1\nzai_saturation: {}"));
+        let config: Config = serde_yaml::from_str(&enabled).unwrap();
+        config.validate().unwrap();
+        let policy = config.accounts["acct"]
+            .utilization
+            .zai_saturation
+            .as_ref()
+            .unwrap();
+        assert_eq!(policy.step_workers, 1);
+        assert_eq!(policy.dwell_seconds, 600);
+        assert_eq!(policy.reprobe_seconds, 3600);
+        for setting in [
+            "step_workers: 0",
+            "minimum_attempts: 0",
+            "dwell_seconds: 0",
+            "minimum_window_seconds: 0",
+            "reprobe_seconds: 0",
+            "plateau_fraction: 1",
+            "concurrency_fraction: -0.1",
+            "dwell_seconds: 9223372036854775808",
+        ] {
+            let yaml = config_with_utilization(&indent(&format!(
+                "reserve_fraction: 0.1\nzai_saturation:\n  {setting}"
+            )));
+            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert!(config.validate().is_err(), "{setting}");
+        }
+        let unknown = enabled.replace(
+            "zai_saturation: {}",
+            "zai_saturation: {unexpected_key: true}",
+        );
+        assert!(serde_yaml::from_str::<Config>(&unknown).is_err());
+        let example: Config =
+            serde_yaml::from_str(include_str!("../examples/zai-saturation.yaml")).unwrap();
+        example.validate().unwrap();
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct Decision {
     /// Present only when utilization.backpressure is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backpressure: Option<BackpressureDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saturation: Option<crate::saturation::SaturationDecision>,
     /// Plan §23.4: fresh same-adapter workers the governor does not own (the
     /// roster floor). Zero, and omitted from events, for an unscoped account.
     #[serde(skip_serializing_if = "is_zero")]
@@ -301,6 +303,7 @@ pub fn evaluate(
             binding_window: None,
             banked_resets: None,
             backpressure: None,
+            saturation: None,
             unowned_workers: 0,
             desired_total: None,
         });
@@ -426,6 +429,7 @@ pub fn evaluate(
         binding_window,
         banked_resets,
         backpressure: None,
+        saturation: None,
         unowned_workers: 0,
         desired_total: None,
     })
@@ -911,6 +915,7 @@ mod tests {
                 stale_behavior: StaleBehavior::Hold,
                 minimum_sample_seconds: 60,
                 backpressure: None,
+                zai_saturation: None,
                 windows: BTreeMap::new(),
             },
             banked_resets: BankedResetConfig::default(),
@@ -978,6 +983,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let decision = evaluate(
             "test",
@@ -1008,6 +1014,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let plain = evaluate("t", &account(), &snapshot, &AccountState::default(), 4, now).unwrap();
         let pooled = evaluate_pool(
@@ -1045,6 +1052,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let decision = evaluate_pool(
             "t",
@@ -1081,6 +1089,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         for unowned in [0_u32, 1, 5, 20] {
             let decision = evaluate_pool(
@@ -1117,6 +1126,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let decision = evaluate(
             "test",
@@ -1159,6 +1169,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let decision =
             evaluate("test", &config, &snapshot, &AccountState::default(), 4, now).unwrap();
@@ -1184,6 +1195,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1227,6 +1239,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1268,6 +1281,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1301,6 +1315,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let decision = evaluate(
             "test",
@@ -1331,6 +1346,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let decision = evaluate(
             "test",
@@ -1408,6 +1424,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1442,6 +1459,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1484,6 +1502,7 @@ mod tests {
                 credits: None,
             }),
             backpressure: None,
+            saturation: None,
         };
         let mut prior = AccountState::default();
         add_banked_burn_history(&mut prior, now, reset, 0.30, 0.001, 0.01);
@@ -1558,6 +1577,7 @@ mod tests {
                 }]),
             }),
             backpressure: None,
+            saturation: None,
         };
         let mut prior = AccountState::default();
         add_banked_burn_history(&mut prior, now, reset, 0.20, 0.001, 0.01);
@@ -1604,6 +1624,7 @@ mod tests {
                 eligible_backlog_capacity: Some(12),
                 reset_credits,
                 backpressure: None,
+                saturation: None,
             }
         }
 
@@ -1794,6 +1815,7 @@ mod tests {
                 credits: None,
             }),
             backpressure: None,
+            saturation: None,
         };
 
         let decision =
@@ -1832,6 +1854,7 @@ mod tests {
                 }]),
             }),
             backpressure: None,
+            saturation: None,
         };
 
         let decision =
@@ -2000,6 +2023,7 @@ mod tests {
                 eligible_backlog_capacity: None,
                 reset_credits: None,
                 backpressure: None,
+                saturation: None,
             };
 
             let decision = evaluate("test", &config, &snapshot, &AccountState::default(), 2, now)
@@ -2063,6 +2087,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
 
         let decision =
@@ -2098,6 +2123,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
 
         let error =
@@ -2120,6 +2146,7 @@ mod tests {
             binding_window: None,
             banked_resets: None,
             backpressure: None,
+            saturation: None,
             unowned_workers: 0,
             desired_total: None,
         }
@@ -2136,6 +2163,7 @@ mod tests {
             windows: Vec::new(),
             eligible_backlog_capacity: None,
             reset_credits: None,
+            saturation: None,
             backpressure: Some(crate::model::BackpressureSnapshot {
                 upstream_429_fraction: fraction,
                 attempts: fraction.map_or(0, |_| 30),
@@ -2221,6 +2249,7 @@ mod tests {
         for snapshot in [
             QuotaSnapshot {
                 backpressure: None,
+                saturation: None,
                 ..backpressure_snapshot(now + Duration::seconds(30), true, None)
             },
             backpressure_snapshot(now + Duration::seconds(30), true, None),
@@ -2430,6 +2459,7 @@ mod tests {
                         stale_behavior: StaleBehavior::Hold,
                         minimum_sample_seconds,
                         backpressure: None,
+                        zai_saturation: None,
                         windows: BTreeMap::new(),
                     },
                     banked_resets: BankedResetConfig::default(),
@@ -2457,6 +2487,7 @@ mod tests {
                 eligible_backlog_capacity: None,
                 reset_credits: None,
                 backpressure: None,
+                saturation: None,
             }
         }
 
@@ -2516,6 +2547,7 @@ mod tests {
                     eligible_backlog_capacity: None,
                     reset_credits: None,
                     backpressure: None,
+                    saturation: None,
                 };
                 let decision = evaluate_pool(
                     "prop",
@@ -2574,6 +2606,7 @@ mod tests {
                     eligible_backlog_capacity: None,
                     reset_credits: None,
                     backpressure: None,
+                    saturation: None,
                 };
                 let decision = evaluate(
                     "prop",
@@ -2629,6 +2662,7 @@ mod tests {
                     eligible_backlog_capacity: None,
                     reset_credits: None,
                     backpressure: None,
+                    saturation: None,
                 };
                 let snapshot_two = QuotaSnapshot {
                     observed_at: now,
@@ -2637,6 +2671,7 @@ mod tests {
                     eligible_backlog_capacity: None,
                     reset_credits: None,
                     backpressure: None,
+                    saturation: None,
                 };
                 let decision_one = evaluate(
                     "prop",
@@ -2761,6 +2796,7 @@ mod tests {
                     eligible_backlog_capacity: None,
                     reset_credits: None,
                     backpressure: None,
+                    saturation: None,
                 };
                 let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                 assert_bounded_step(workers, &decision, &config);
@@ -2817,6 +2853,7 @@ mod tests {
                     eligible_backlog_capacity: None,
                     reset_credits: None,
                     backpressure: None,
+                    saturation: None,
                 };
                 let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                 assert_bounded_step(workers, &decision, &config);
@@ -2892,6 +2929,7 @@ mod tests {
                         eligible_backlog_capacity: None,
                         reset_credits: None,
                         backpressure: None,
+                        saturation: None,
                     };
                     let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                     assert_bounded_step(workers, &decision, &config);
@@ -2927,6 +2965,7 @@ mod tests {
                     eligible_backlog_capacity: None,
                     reset_credits: None,
                     backpressure: None,
+                    saturation: None,
                 };
                 let decision = step(&config, &mut prior, workers, &pending_rollover, clock.now());
                 assert_eq!(

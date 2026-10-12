@@ -1654,3 +1654,20 @@ Dependencies: WP20, WP21, WP17.
   brake state.
 - [ ] The brake is provably monotone: it only ever lowers the elastic target.
 - [ ] No roster unit is touched by a backpressure transition.
+
+## 25. Opt-in Z.ai saturation adapter (authorized 2026-10-12)
+
+The user authorized an additive adapter policy that keeps request concurrency
+productive with the smallest useful NEEDLE fleet. Historical worker estimates
+and proxy slot counts are not controller constants. This scope includes stable
+full-replica completed-request telemetry, classified provider-1302 evidence when
+available, a bounded throughput search with persisted experiments, conservative
+quota/backlog/settlement gates, strict config/schema compatibility and focused
+regression tests. See [the policy contract](../zai-saturation.md) and
+[the opt-in example](../../examples/zai-saturation.yaml).
+
+The rollout gate is separate: install and inspect observe-only decisions with
+isolated state before considering production actuation. Existing §24/WP22
+`NORMAL -> HOLD -> STEP_DOWN` transition-rate validation remains deferred under
+`subgov-d80695e2`; this additive policy does not change or satisfy that gate.
+No production policy is enabled by the example or implementation.

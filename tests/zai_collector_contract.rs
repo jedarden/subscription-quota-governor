@@ -309,6 +309,7 @@ fn zai_linear_to_reset_account(target_utilization: f64) -> AccountConfig {
             stale_behavior: StaleBehavior::Hold,
             minimum_sample_seconds: 300,
             backpressure: None,
+            zai_saturation: None,
             windows: BTreeMap::new(),
         },
         banked_resets: BankedResetConfig::default(),

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// read. A file with no `schema_version` at all predates versioning and is
 /// read with the current version. Earlier versions are migrated by defaulting
 /// fields added to account and host state, then advancing the version on load.
-pub const STATE_SCHEMA_VERSION: u32 = 5;
+pub const STATE_SCHEMA_VERSION: u32 = 6;
 
 fn current_schema_version() -> u32 {
     STATE_SCHEMA_VERSION
@@ -81,6 +81,32 @@ pub struct AccountState {
     /// accounts that do not enable the policy byte-for-byte stable.
     #[serde(default, skip_serializing_if = "BackpressureState::is_default")]
     pub backpressure: BackpressureState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zai_saturation: Option<SaturationState>,
+}
+
+/// Persisted experiment state; all timestamps describe actual observations.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct SaturationState {
+    pub last_sample_at: Option<DateTime<Utc>>,
+    pub observed_workers: Option<u32>,
+    pub settled_at: Option<DateTime<Utc>>,
+    pub baseline_rate: Option<f64>,
+    #[serde(default)]
+    pub plateau_rate: Option<f64>,
+    pub pending: Option<SaturationProbe>,
+    #[serde(default)]
+    pub shrinking: bool,
+    pub next_probe_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct SaturationProbe {
+    pub from_workers: u32,
+    pub to_workers: u32,
+    pub baseline_rate: f64,
+    #[serde(default)]
+    pub recovery: bool,
 }
 
 /// Backpressure phase retained between controller cycles (§24.4).
@@ -450,6 +476,7 @@ impl State {
         // Version 3 adds per-host placement target history. Version 4 adds
         // reset-spanning aggregate burn samples and advisory de-duplication
         // state. Version 5 adds persisted backpressure phase/recovery state.
+        // Version 6 adds opt-in saturation baseline/probe state.
         // All additions default empty when loading an older file.
         if state.schema_version < STATE_SCHEMA_VERSION {
             state.schema_version = STATE_SCHEMA_VERSION;
@@ -607,6 +634,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         }
     }
 
@@ -717,6 +745,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             backpressure: None,
+            saturation: None,
         };
         account.record(&empty_snapshot, 1, 3);
         assert!(
@@ -882,6 +911,11 @@ mod tests {
         let account: AccountState = serde_json::from_str("{}").unwrap();
         assert!(account.history.is_empty());
         assert!(account.backpressure.is_default());
+        assert!(account.zai_saturation.is_none());
+        assert!(serde_json::to_value(&account)
+            .unwrap()
+            .get("zai_saturation")
+            .is_none());
         assert!(serde_json::to_value(account)
             .unwrap()
             .get("backpressure")
