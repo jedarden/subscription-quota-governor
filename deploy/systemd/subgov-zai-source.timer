@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep subgov Z.AI source snapshot fresh
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=120s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

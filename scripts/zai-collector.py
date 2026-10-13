@@ -28,6 +28,11 @@ def labels(raw):
 
 
 def parse_metrics(body, now, stale_after=900):
+    dedicated_concurrency = any(
+        line.startswith(("# TYPE zai_proxy_upstream_concurrency_rejections_total ",
+                         "zai_proxy_upstream_concurrency_rejections_total ",
+                         "zai_proxy_upstream_concurrency_rejections_total{"))
+        for line in body.splitlines())
     values = {key: 0 for key in COUNTERS}
     family = set()
     starts = set()
@@ -78,7 +83,9 @@ def parse_metrics(body, now, stale_after=900):
                 field = "retries"
             elif name == "zai_proxy_rate_limit_rejections_total":
                 field = "capacity"
-            elif name == "zai_proxy_zai_errors_total" and tags.get("code") == "1302":
+            elif name == "zai_proxy_upstream_concurrency_rejections_total":
+                field = "concurrency"
+            elif name == "zai_proxy_zai_errors_total" and tags.get("code") == "1302" and not dedicated_concurrency:
                 field = "concurrency"
             if field:
                 if not value.is_integer() or value > 2**64 - 1:
@@ -111,7 +118,7 @@ def parse_metrics(body, now, stale_after=900):
     if "zai_proxy_request_duration_seconds_count" in family:
         family.add("zai_proxy_request_duration_seconds")
     usable = len(starts) == 1 and next(iter(starts), 0) > 0 and required <= family and generation_supported
-    sample = {"at": now, "start": next(iter(starts), None), "classified": "zai_proxy_zai_errors_total" in family, **values} if usable else None
+    sample = {"at": now, "start": next(iter(starts), None), "classified": bool({"zai_proxy_zai_errors_total", "zai_proxy_upstream_concurrency_rejections_total"} & family), **values} if usable else None
     return snapshot, sample
 
 
@@ -300,6 +307,8 @@ def main():
     parser.add_argument("--minimum-interval", type=int, default=60)
     parser.add_argument("--maximum-interval", type=int, default=900)
     parser.add_argument("--minimum-attempts", type=int, default=30)
+    parser.add_argument("--deadline-seconds", type=int, default=12,
+                        help="collection deadline; values above 12 require an asynchronous snapshot publisher")
     parser.add_argument("--insecure-tls", action="store_true", help="explicit opt-in for trusted site-local TLS endpoints only")
     args = parser.parse_args()
     if not 1 <= args.minimum_interval <= args.maximum_interval or args.minimum_attempts < 1 or args.stale_after <= 0 or not 1 <= args.port <= 65535:
@@ -308,9 +317,13 @@ def main():
         parser.error("expected replicas must be between one and eight")
     def deadline(_signum, _frame):
         print("zai-collector: collection deadline exceeded", file=sys.stderr, flush=True)
-        os._exit(1)  # Also terminates stuck scrape threads, before subgov's 15s cap.
+        # Also terminate stuck scrape threads. Direct command sources retain
+        # the default 12s deadline; longer deadlines require a file publisher.
+        os._exit(1)
     signal.signal(signal.SIGALRM, deadline)
-    signal.alarm(12)
+    if not 1 <= args.deadline_seconds <= 120:
+        parser.error("deadline must be between 1 and 120 seconds")
+    signal.alarm(args.deadline_seconds)
     try:
         print(json.dumps(collect(args), allow_nan=False))
     except Exception as error:

@@ -69,6 +69,14 @@ class CollectorTests(unittest.TestCase):
         self.assertIsNone(output["upstream_concurrency_fraction"])
         self.assertEqual(output["completed_requests"], 30)
 
+    def test_dedicated_concurrency_metric_is_known_zero_without_double_counting(self):
+        body = metrics(pressure=9) + '\n# TYPE zai_proxy_upstream_concurrency_rejections_total counter\nzai_proxy_upstream_concurrency_rejections_total{variant="production"} 0'
+        _, parsed = collector.parse_metrics(body, 1000)
+        self.assertTrue(parsed["classified"])
+        self.assertEqual(parsed["concurrency"], 0)
+        _, parsed = collector.parse_metrics(body.replace('production"} 0', 'production"} 2'), 1000)
+        self.assertEqual(parsed["concurrency"], 2)
+
     def test_type_family_is_evidence_for_zero_classification(self):
         _, parsed = collector.parse_metrics(metrics(classification=False) + '\n# TYPE zai_proxy_zai_errors_total counter', 1000)
         self.assertTrue(parsed["classified"])

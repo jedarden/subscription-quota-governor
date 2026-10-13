@@ -70,8 +70,11 @@ is zero. The proxy's local admission gate always increments a generation 503
 alongside its capacity-rejection counter (`proxy/handler.go`). Any generation
 503 or unknown status without the capacity family withholds saturation; it does
 not assume that an absent metric universally means zero.
-`upstream_concurrency_fraction` counts only `zai_proxy_zai_errors_total{code="1302"}`
-over attempts. Generic 429 errors and retry-trigger reason series do not substitute
+`upstream_concurrency_fraction` counts the initialized
+`zai_proxy_upstream_concurrency_rejections_total` counter over attempts, falling
+back to `zai_proxy_zai_errors_total{code="1302"}` on compatible older proxies.
+When both exist, the dedicated counter wins; errors are never counted twice.
+Generic 429 errors and retry-trigger reason series do not substitute
 for classification or retries. Fewer than 30 attempts produce a null fraction.
 An absent classification family also produces null, even if other 429 counters
 exist. A declared classification metric family is evidence that absent 1302
@@ -179,3 +182,53 @@ operator masks and restoration. It never calls a live endpoint or service.
 `tests/zai_adapter_scripts.rs` runs that suite within the normal `cargo test` gate
 with an isolated HOME. Live verification can run only `observe`; activation and
 service mutation belong to the explicit rollout step.
+
+## Production fixed-fleet handoff — 2026-10-13
+
+The user authorized direct verification with running workers and replacement of
+fixed Z.AI capacity with subgov management, without an observe-only validation
+phase. This supersedes the earlier roster-immutability prerequisite for the
+explicit Z.AI roster only. Other providers and operator masks remain outside
+this handoff. Owner: `subgov-77416d49`; classified proxy telemetry dependency:
+`zaiproxy-f82552f3` in the zai-proxy repository.
+
+On codinghome, `subgov-claude-zai.service` uses
+`~/.config/subgov/claude-zai-managed.yaml` and the 18 identities in
+`zai-saturation-roster.json`. Fixed boot enablement was removed without restarting
+those workers. The same governor service now owns their command observer and
+actuator; it retains the 18-worker ceiling and one-worker per-cycle limits.
+Retirement guards prevent an external fixed-fleet start from reviving a retired
+identity. The two legacy `sg-zai` tmux workers were retired only after verifying
+idle, task-free supervisor identities; neither is a second actuation pool.
+
+Fleet commands run through `systemd-run --user --wait --pipe --collect --quiet
+--property=NoNewPrivileges=yes` with the absolute Python executable and the
+normal `zai-fleet.py` arguments. These helpers have an independent process view:
+the governor's hardened mount namespace cannot inspect worker PIDs directly.
+Keep all other governor restrictions and `KillMode=process` intact.
+
+Full-replica network sampling exceeded the direct command source's 15-second
+budget on this host. `zai-source-refresh.py --settings PATH` instead publishes
+an atomic `normalized_file` snapshot from a separate systemd service/timer.
+The collector's default deadline remains 12 seconds; this asynchronous caller
+uses `--deadline-seconds 45`. The timer refreshes every 120 seconds, collector
+intervals remain at least 300 seconds, and runtime freshness still expires at
+900 seconds. Failed collection preserves the prior snapshot and cannot make it
+fresh. No collector credentials belong in settings or command arguments.
+
+The settings JSON contains absolute `collector`, `collector_args`, `snapshot`,
+`roster`, `routing_dir`, `heartbeat_dir` paths and `host`. Deployed settings are
+`~/.config/subgov/zai-source-refresh.json`; user unit templates are under
+`deploy/systemd/subgov-zai-source.*`. The publisher queries the bead-rs ready
+frontier only in explicitly routed workspaces, respects queue host ownership,
+excludes held/human/proposal work, and includes verified busy claims once.
+Ambiguous policy YAML, backend errors or failed demand queries withhold capacity
+instead of inventing zero demand. This conservative frontier does not infer
+additional eligible work from other roaming destinations.
+
+Before changing ownership, retain unit enablement, MainPIDs, configs and exact
+drop-ins. The handoff backup and dated live evidence are in
+`/home/coding/scratch/subgov-77416d49-cutover/`. For rollback, stop the Z.AI
+governor, remove only its matching retirement files as described above, restore
+the backed-up service configuration and prior enablement states, and reload the
+user manager. Do not unmask excluded workers or restore all units indiscriminately.

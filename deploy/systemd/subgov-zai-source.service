@@ -1,0 +1,10 @@
+# Codinghome/NixOS user-service template; adapt the Python path on other hosts.
+[Unit]
+Description=Refresh Z.AI full-replica telemetry and accepted-work capacity
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/run/current-system/sw/bin:/usr/bin:/bin
+ExecStart=/run/current-system/sw/bin/python3 -B %h/.local/lib/subgov-zai/zai-source-refresh.py --settings %h/.config/subgov/zai-source-refresh.json
+TimeoutStartSec=150
+UMask=0077
