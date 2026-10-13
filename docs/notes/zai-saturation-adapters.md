@@ -214,8 +214,9 @@ Full-replica network sampling exceeded the direct command source's 15-second
 budget on this host. `zai-source-refresh.py --settings PATH` instead publishes
 an atomic `normalized_file` snapshot from a separate systemd service/timer.
 The collector's default deadline remains 12 seconds; this asynchronous caller
-uses `--deadline-seconds 45`. The timer refreshes every 120 seconds, collector
-intervals remain at least 300 seconds, and runtime freshness still expires at
+uses `--deadline-seconds 45`. The timer waits 300 seconds after each refresh
+finishes, so intervals remain at least 300 seconds and a completed throughput
+sample is not overwritten by an intermediate quota-only refresh. Runtime freshness expires at
 900 seconds. Failed collection preserves the prior snapshot and cannot make it
 fresh. No collector credentials belong in settings or command arguments.
 
