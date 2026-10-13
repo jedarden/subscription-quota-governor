@@ -410,6 +410,7 @@ pub fn evaluate(
                 .is_some_and(|window| !is_weekly_window(window.duration_minutes))
     });
     let raw_desired = match &banked_resets {
+        Some(plan) if plan.manual_redemption_recommended => plan.desired_workers,
         Some(plan) if !plan.manual_redemption_recommended && !short_window_reached => {
             ordinary_desired.max(plan.desired_workers)
         }
@@ -549,8 +550,16 @@ fn banked_reset_decision(
     let feasible =
         max_feasible_burn_per_hour.is_some_and(|maximum| maximum >= required_burn_per_hour);
 
+    let threshold = config.banked_resets.redeem_at_utilization;
+    // Once a generation reaches redemption, lower later readings cannot
+    // resume worker pacing. The hold ends only when the reset changes.
+    let reached_in_this_generation = prior
+        .history
+        .get(&window.id)
+        .filter(|history| same_reset_generation(history.resets_at, window.resets_at))
+        .is_some_and(|history| history.max_used_fraction >= threshold);
     let manual_redemption_recommended =
-        window.reached || window.used_fraction >= config.banked_resets.redeem_at_utilization;
+        window.reached || window.used_fraction >= threshold || reached_in_this_generation;
     let (desired_workers, reason) = if manual_redemption_recommended {
         (
             config.fleet.min_workers,
@@ -1823,6 +1832,100 @@ mod tests {
         let banked = decision.banked_resets.unwrap();
         assert!(banked.manual_redemption_recommended);
         assert_eq!(decision.desired_workers, 0);
+    }
+
+    #[test]
+    fn banked_redemption_drains_until_a_new_reset_generation() {
+        let now = Utc::now();
+        let reset = now + Duration::days(6);
+        let mut config = account();
+        config.banked_resets.enabled = true;
+        config.banked_resets.redeem_at_utilization = 0.8;
+        config.fleet.min_workers = 1;
+        config.fleet.max_scale_down_per_cycle = 1;
+        let mut snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "codex.secondary".into(),
+                used_fraction: 0.79,
+                resets_at: reset,
+                duration_minutes: Some(10_080),
+                reached: false,
+            }],
+            eligible_backlog_capacity: Some(10),
+            reset_credits: Some(ResetCreditsSnapshot {
+                available_count: 1,
+                credits: None,
+            }),
+            backpressure: None,
+            saturation: None,
+        };
+        let mut prior = AccountState::default();
+
+        let before = evaluate("test", &config, &snapshot, &prior, 4, now).unwrap();
+        assert!(
+            !before
+                .banked_resets
+                .as_ref()
+                .unwrap()
+                .manual_redemption_recommended
+        );
+        assert_eq!(before.desired_workers, 4);
+
+        for (poll, (usage, workers, expected)) in
+            [(0.8, 4, 3), (0.83, 3, 2), (0.85, 2, 1), (0.86, 1, 1)]
+                .into_iter()
+                .enumerate()
+        {
+            let observed_at = now + Duration::minutes(5 * (poll as i64 + 1));
+            snapshot.observed_at = observed_at;
+            snapshot.windows[0].used_fraction = usage;
+            let decision =
+                evaluate("test", &config, &snapshot, &prior, workers, observed_at).unwrap();
+            let banked = decision.banked_resets.as_ref().unwrap();
+            assert!(banked.manual_redemption_recommended, "usage={usage}");
+            assert_eq!(banked.reason, "weekly_window_awaiting_manual_redemption");
+            assert_eq!(banked.desired_workers, config.fleet.min_workers);
+            assert_eq!(decision.desired_workers, expected, "usage={usage}");
+            prior.record(&snapshot, workers, decision.desired_workers);
+        }
+
+        // More than the 16 retained history samples pass below the threshold.
+        // The high-water mark must keep redemption sticky for this generation.
+        for poll in 0..18 {
+            let observed_at = now + Duration::minutes(25 + poll);
+            snapshot.observed_at = observed_at;
+            snapshot.windows[0].used_fraction = 0.5;
+            let held = evaluate("test", &config, &snapshot, &prior, 1, observed_at).unwrap();
+            assert!(
+                held.banked_resets
+                    .as_ref()
+                    .unwrap()
+                    .manual_redemption_recommended,
+                "same-generation poll {poll}"
+            );
+            assert_eq!(held.desired_workers, config.fleet.min_workers);
+            prior.record(&snapshot, 1, held.desired_workers);
+        }
+
+        let observed_at = now + Duration::minutes(43);
+        snapshot.observed_at = observed_at;
+        snapshot.windows[0].used_fraction = 0.02;
+        snapshot.windows[0].resets_at = reset + Duration::days(7);
+        let recovered = evaluate("test", &config, &snapshot, &prior, 1, observed_at).unwrap();
+        assert!(
+            !recovered
+                .banked_resets
+                .as_ref()
+                .unwrap()
+                .manual_redemption_recommended
+        );
+        assert_eq!(recovered.windows[0].reason, "learning_burn_rate");
+        assert_eq!(
+            recovered.banked_resets.as_ref().unwrap().reason,
+            "learning_banked_reset_24h_burn_rate"
+        );
     }
 
     #[test]

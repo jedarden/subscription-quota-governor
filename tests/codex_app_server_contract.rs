@@ -26,8 +26,10 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use subscription_governor::config::SourceConfig;
+use subscription_governor::config::{AccountConfig, SourceConfig};
+use subscription_governor::controller::evaluate;
 use subscription_governor::source::{collect, shutdown_codex_sessions};
+use subscription_governor::state::AccountState;
 
 fn fake_codex_executable() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fake_codex_app_server"))
@@ -119,6 +121,105 @@ fn handshake_success_produces_a_normalized_snapshot() {
         .windows
         .iter()
         .any(|window| window.id == "codex.secondary"));
+}
+
+#[test]
+fn banked_reset_decisions_never_consume_a_credit_through_the_app_server() {
+    // The ordinary utilization target is deliberately above the redemption
+    // threshold. This exercises the manual-redemption branch at the first
+    // crossing, as well as before and after it.
+    let config: AccountConfig = serde_json::from_value(json!({
+        "source": {
+            "type": "codex_app_server",
+            "executable": fake_codex_executable(),
+            "timeout_seconds": 5
+        },
+        "fleet": {
+            "min_workers": 2,
+            "max_workers": 10,
+            "max_scale_up_per_cycle": 10,
+            "max_scale_down_per_cycle": 10
+        },
+        "utilization": {"target_utilization": 0.9},
+        "banked_resets": {"enabled": true, "redeem_at_utilization": 0.8}
+    }))
+    .unwrap();
+
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (scenario, used_percent, redemption_expected) in [
+        ("below threshold", 79.0, false),
+        ("at threshold", 80.0, true),
+        ("past threshold", 90.0, true),
+        ("window reached", 100.0, true),
+    ] {
+        let reset_epoch = (chrono::Utc::now() + chrono::Duration::days(7)).timestamp();
+        let steps = vec![
+            read_step(),
+            write_step(json!({"id": 1, "result": {}})),
+            read_step(),
+            read_step(),
+            write_step(json!({
+                "id": 2,
+                "result": {
+                    "rateLimitsByLimitId": {
+                        "codex": {
+                            "secondary": {
+                                "usedPercent": used_percent,
+                                "windowDurationMins": 10_080,
+                                "resetsAt": reset_epoch
+                            }
+                        }
+                    },
+                    "rateLimitResetCredits": {"availableCount": 1}
+                }
+            })),
+            // Keep inspecting client writes after the result. A request
+            // issued during decision handling must still reach the log.
+            json!({"action": "audit_until_eof"}),
+        ];
+        let (_, script) = scripted_source(&steps, 5);
+        let request_log = tempfile::NamedTempFile::new().unwrap();
+
+        shutdown_codex_sessions();
+        std::env::set_var("FAKE_CODEX_SCRIPT", &script);
+        std::env::set_var("FAKE_CODEX_REQUEST_LOG", request_log.path());
+        let snapshot = collect(&config.source);
+        std::env::remove_var("FAKE_CODEX_SCRIPT");
+        let snapshot = snapshot.expect(scenario);
+        let decision = evaluate(
+            "codex",
+            &config,
+            &snapshot,
+            &AccountState::default(),
+            5,
+            snapshot.observed_at,
+        )
+        .expect(scenario);
+        assert_eq!(
+            decision
+                .banked_resets
+                .as_ref()
+                .unwrap()
+                .manual_redemption_recommended,
+            redemption_expected,
+            "{scenario}"
+        );
+
+        shutdown_codex_sessions();
+        std::env::remove_var("FAKE_CODEX_REQUEST_LOG");
+        let methods = std::fs::read_to_string(request_log.path()).unwrap();
+        assert_eq!(
+            methods.lines().collect::<Vec<_>>(),
+            ["initialize", "initialized", "account/rateLimits/read"],
+            "{scenario}: provider integration must remain read-only with respect to reset credits"
+        );
+        assert!(
+            !methods.contains("account/rateLimitResetCredit/consume"),
+            "{scenario}: reset credit was consumed"
+        );
+    }
 }
 
 #[test]

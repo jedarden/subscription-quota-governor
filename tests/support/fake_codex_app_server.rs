@@ -16,6 +16,13 @@
 //!   or hung app-server.
 //! - `{"action": "exit", "code": <i32>}` -- exit immediately, to simulate
 //!   the app-server process dying mid-exchange.
+//! - `{"action": "audit_until_eof"}` -- keep reading requests after the
+//!   scripted response, so a contract test can inspect every method sent
+//!   before the client closes the session.
+//!
+//! When `FAKE_CODEX_REQUEST_LOG` is set, every request read from stdin is
+//! appended to that file as a method name. This lets contract tests enforce
+//! the ADR-0001 read-only reset-credit boundary against actual JSON-RPC IO.
 //!
 //! Steps run in order; reaching the end of the script exits cleanly (code
 //! 0). This process never validates protocol correctness on the client's
@@ -34,6 +41,27 @@ enum Step {
     Write { frame: Value },
     SleepMs { value: u64 },
     Exit { code: i32 },
+    AuditUntilEof,
+}
+
+fn record_method(line: &str) {
+    let method = serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|frame| frame.get("method")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "<missing method>".to_owned());
+    assert_ne!(
+        method, "account/rateLimitResetCredit/consume",
+        "the governor must never consume a reset credit"
+    );
+    let Ok(path) = std::env::var("FAKE_CODEX_REQUEST_LOG") else {
+        return;
+    };
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("failed to open request log");
+    writeln!(log, "{method}").expect("failed to record request method");
 }
 
 fn main() {
@@ -55,7 +83,9 @@ fn main() {
                 line.clear();
                 // A zero-byte read means the client closed stdin; there is
                 // nothing left to consume, so just move on to the next step.
-                let _ = input.read_line(&mut line);
+                if input.read_line(&mut line).unwrap_or(0) > 0 {
+                    record_method(&line);
+                }
             }
             Step::Write { frame } => {
                 writeln!(output, "{frame}").expect("failed to write to stdout");
@@ -67,6 +97,13 @@ fn main() {
             Step::Exit { code } => {
                 std::process::exit(code);
             }
+            Step::AuditUntilEof => loop {
+                line.clear();
+                if input.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                record_method(&line);
+            },
         }
     }
 }

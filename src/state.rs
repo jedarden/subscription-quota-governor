@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// read. A file with no `schema_version` at all predates versioning and is
 /// read with the current version. Earlier versions are migrated by defaulting
 /// fields added to account and host state, then advancing the version on load.
-pub const STATE_SCHEMA_VERSION: u32 = 6;
+pub const STATE_SCHEMA_VERSION: u32 = 7;
 
 fn current_schema_version() -> u32 {
     STATE_SCHEMA_VERSION
@@ -176,6 +176,11 @@ pub struct WindowSample {
 pub struct WindowHistory {
     pub resets_at: DateTime<Utc>,
     pub samples: VecDeque<HistorySample>,
+    /// Highest observed utilization in this reset generation. Unlike the
+    /// bounded sample queue, this survives later low readings to keep a
+    /// manual redemption hold until the generation changes.
+    #[serde(default)]
+    pub max_used_fraction: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -355,7 +360,9 @@ fn record_samples(
             .unwrap_or_else(|| WindowHistory {
                 resets_at: window.resets_at,
                 samples: VecDeque::new(),
+                max_used_fraction: 0.0,
             });
+        entry.max_used_fraction = entry.max_used_fraction.max(window.used_fraction);
         entry.samples.push_back(HistorySample {
             observed_at: snapshot.observed_at,
             used_fraction: window.used_fraction,
@@ -477,11 +484,19 @@ impl State {
         // reset-spanning aggregate burn samples and advisory de-duplication
         // state. Version 5 adds persisted backpressure phase/recovery state.
         // Version 6 adds opt-in saturation baseline/probe state.
+        // Version 7 adds the per-generation utilization high-water mark.
         // All additions default empty when loading an older file.
         if state.schema_version < STATE_SCHEMA_VERSION {
             state.schema_version = STATE_SCHEMA_VERSION;
         }
         for account in state.accounts.values_mut() {
+            for history in account.history.values_mut() {
+                // Version 6 histories have no high-water field. Preserve a
+                // threshold already present in their retained samples.
+                for sample in &history.samples {
+                    history.max_used_fraction = history.max_used_fraction.max(sample.used_fraction);
+                }
+            }
             for samples in account.aggregate_burn_history.values_mut() {
                 while samples.len() > MAX_AGGREGATE_BURN_SAMPLES {
                     samples.pop_front();
@@ -657,6 +672,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generation_high_water_survives_bounded_sample_eviction() {
+        let mut account = AccountState::default();
+        let resets_at = Utc::now() + chrono::Duration::days(7);
+        account.record(&snapshot_with_one_window("weekly", 0.8, resets_at), 3, 2);
+        for _ in 0..(MAX_HISTORY_SAMPLES_PER_GENERATION + 2) {
+            account.record(&snapshot_with_one_window("weekly", 0.5, resets_at), 2, 2);
+        }
+        let history = &account.history["weekly"];
+        assert!(history
+            .samples
+            .iter()
+            .all(|sample| sample.used_fraction == 0.5));
+        assert_eq!(history.max_used_fraction, 0.8);
+
+        let new_generation = resets_at + chrono::Duration::days(7);
+        account.record(
+            &snapshot_with_one_window("weekly", 0.02, new_generation),
+            2,
+            2,
+        );
+        assert_eq!(account.history["weekly"].max_used_fraction, 0.02);
+    }
+
     /// Regression for the live 2026-10-08 incident: the real Anthropic
     /// usage API computes `resets_at` dynamically per request, so
     /// consecutive polls of the *same* generation return sub-second-jittered
@@ -775,9 +814,38 @@ mod tests {
         let history = loaded.accounts["acct"].history.get("5h").unwrap();
         assert_eq!(history.samples.len(), 2);
         assert_eq!(history.samples.back().unwrap().used_fraction, 0.3);
+        assert_eq!(history.max_used_fraction, 0.3);
         assert_eq!(
             loaded.accounts["acct"].aggregate_burn_history["5h"].len(),
             2
+        );
+    }
+
+    #[test]
+    fn loading_version_six_history_recovers_its_high_water() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let resets_at = Utc::now() + chrono::Duration::days(7);
+        let mut state = State {
+            schema_version: 6,
+            ..State::default()
+        };
+        let account = state.accounts.entry("acct".to_owned()).or_default();
+        account.record(&snapshot_with_one_window("weekly", 0.8, resets_at), 3, 2);
+        account.record(&snapshot_with_one_window("weekly", 0.5, resets_at), 2, 2);
+        let mut old_state = serde_json::to_value(&state).unwrap();
+        old_state["accounts"]["acct"]["history"]["weekly"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_used_fraction");
+        fs::write(&path, serde_json::to_vec(&old_state).unwrap()).unwrap();
+
+        let (loaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.accounts["acct"].history["weekly"].max_used_fraction,
+            0.8
         );
     }
 
