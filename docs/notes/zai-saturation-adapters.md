@@ -74,6 +74,9 @@ not assume that an absent metric universally means zero.
 `zai_proxy_upstream_concurrency_rejections_total` counter over attempts, falling
 back to `zai_proxy_zai_errors_total{code="1302"}` on compatible older proxies.
 When both exist, the dedicated counter wins; errors are never counted twice.
+Its initialized family also identifies the proxy contract in which an unused
+retry CounterVec is omitted until the first retry; that absence means zero
+retries. Older proxies still need explicit retry-family support.
 Generic 429 errors and retry-trigger reason series do not substitute
 for classification or retries. Fewer than 30 attempts produce a null fraction.
 An absent classification family also produces null, even if other 429 counters

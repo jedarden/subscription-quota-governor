@@ -77,6 +77,17 @@ class CollectorTests(unittest.TestCase):
         _, parsed = collector.parse_metrics(body.replace('production"} 0', 'production"} 2'), 1000)
         self.assertEqual(parsed["concurrency"], 2)
 
+    def test_unused_retry_family_is_zero_only_with_initialized_proxy_contract(self):
+        body = '\n'.join(line for line in metrics(classification=False).splitlines()
+                         if 'zai_proxy_retry_attempts_total' not in line)
+        _, unsupported = collector.parse_metrics(body, 1000)
+        self.assertIsNone(unsupported)
+        body += '\n# TYPE zai_proxy_upstream_concurrency_rejections_total counter\nzai_proxy_upstream_concurrency_rejections_total{variant="production"} 0'
+        _, supported = collector.parse_metrics(body, 1000)
+        self.assertIsNotNone(supported)
+        self.assertEqual(supported["retries"], 0)
+        self.assertTrue(supported["classified"])
+
     def test_type_family_is_evidence_for_zero_classification(self):
         _, parsed = collector.parse_metrics(metrics(classification=False) + '\n# TYPE zai_proxy_zai_errors_total counter', 1000)
         self.assertTrue(parsed["classified"])

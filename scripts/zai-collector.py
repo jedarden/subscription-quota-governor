@@ -107,6 +107,11 @@ def parse_metrics(body, now, stale_after=900):
         windows.append(item)
     snapshot = {"observed_at": (moment - timedelta(seconds=age)).isoformat().replace("+00:00", "Z"), "fresh": age < stale_after, "windows": windows}
     required = {"zai_proxy_requests_total", "zai_proxy_request_duration_seconds", "zai_proxy_retry_attempts_total", "zai_proxy_rate_limit_rejections_total"}
+    # The initialized dedicated counter identifies the compatible proxy
+    # contract: its retry CounterVec is omitted until the first retry. On
+    # these proxies only, an absent retry family is a measured lifetime zero.
+    if dedicated_concurrency:
+        required.discard("zai_proxy_retry_attempts_total")
     # Prometheus CounterVec omits the family until its first label is used.
     # handler.go's local admission gate *always* increments generation status
     # 503 requests as well as capacity rejects. A complete lifetime status
