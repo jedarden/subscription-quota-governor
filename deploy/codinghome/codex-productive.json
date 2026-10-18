@@ -16,13 +16,13 @@
     {
       "workspace": "/home/coding/codex-governor",
       "id": "codexgov-d2753c47",
-      "reviewed_revision": 2,
+      "reviewed_revision": 6,
       "admission_evidence": "Description records operator batch admission 2026-10-16/17; reviewed under subgov-564a5b9a. Native gate-health remains binding."
     },
     {
       "workspace": "/home/coding/agent-archivist",
       "id": "aa-3404195e",
-      "reviewed_revision": 0,
+      "reviewed_revision": 5,
       "admission_evidence": "Notes record operator admission 2026-10-16; reviewed under subgov-564a5b9a.",
       "external_hold": "Awaiting write-capable iad-ci credential and live cross-build acceptance; source must not dispatch until this hold is explicitly resolved and revision reviewed."
     }
