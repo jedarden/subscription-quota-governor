@@ -1,0 +1,39 @@
+# Codinghome Codex elastic governor; maintained source for ~/.config/subgov/codex.yaml.
+# Banked-reset pacing enabled under subgov-df1e9e75 (2026-10-18).
+# Existing native source has no eligible-backlog signal: banked pacing cannot
+# expand beyond observed capacity until real admitted demand is integrated.
+version: 1
+poll_interval_seconds: 300
+state_path: /home/coding/.local/state/subgov/codex.json
+accounts:
+  codex:
+    source:
+      type: codex_app_server
+      timeout_seconds: 30
+    fleet:
+      min_workers: 0
+      max_workers: 12
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 2
+      max_scale_down_per_cycle: 1
+      observer:
+        type: needle_status
+        agent: codex-gpt-5.6-luna-xhigh
+        identifier_prefix: sg-codex-
+        stale_after_seconds: 60
+      actuator:
+        type: needle_run
+        repo: /home/coding/NEEDLE
+        adapter: codex-gpt-5.6-luna-xhigh
+        identifier_prefix: sg-codex-
+    utilization:
+      reserve_fraction: 0.05
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      minimum_sample_seconds: 240
+    banked_resets:
+      enabled: true
+      minimum_pace_multiplier: 2.0
+      redeem_at_utilization: 1.0
+      deadline_safety_seconds: 21600
