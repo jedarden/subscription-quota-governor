@@ -332,6 +332,10 @@ pub struct BankedResetConfig {
     /// Raise the account's worker floor while reset credits are available.
     #[serde(default)]
     pub enabled: bool,
+    /// Use all verified eligible work capacity while banked credits exist.
+    /// Requires `enabled`; does not authorize redeeming a credit.
+    #[serde(default)]
+    pub full_speed: bool,
     /// Never pace slower than this multiple of one full quota window per its
     /// advertised duration while a reset credit is available.
     #[serde(default = "default_minimum_pace_multiplier")]
@@ -348,6 +352,7 @@ impl Default for BankedResetConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            full_speed: false,
             minimum_pace_multiplier: default_minimum_pace_multiplier(),
             redeem_at_utilization: default_redeem_at_utilization(),
             deadline_safety_seconds: default_deadline_safety_seconds(),
@@ -951,7 +956,19 @@ mod tests {
     fn banked_resets_default_to_detection_without_actuation() {
         let policy = BankedResetConfig::default();
         assert!(!policy.enabled);
+        assert!(!policy.full_speed);
         assert_eq!(policy.minimum_pace_multiplier, 2.0);
+    }
+
+    #[test]
+    fn banked_reset_full_speed_requires_an_explicit_boolean() {
+        let policy: BankedResetConfig = serde_yaml::from_str("enabled: true").unwrap();
+        assert!(!policy.full_speed);
+        let policy: BankedResetConfig =
+            serde_yaml::from_str("enabled: true\nfull_speed: true").unwrap();
+        assert!(policy.full_speed);
+        assert!(serde_yaml::from_str::<BankedResetConfig>("full_speed: 1").is_err());
+        assert!(serde_yaml::from_str::<BankedResetConfig>("full_speed: yes").is_err());
     }
 
     fn base_config(fleet_yaml: &str) -> String {

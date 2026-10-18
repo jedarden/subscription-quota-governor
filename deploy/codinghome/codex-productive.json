@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "host": "codinghome",
+  "agent": "codex-gpt-5.6-luna-xhigh",
+  "prefix": "sg-codex-",
+  "max_workers": 12,
+  "lane_label": "subgov-codex-productive",
+  "heartbeat_dir": "/home/coding/.needle/state/heartbeats",
+  "gate_health_dir": "/home/coding/.needle/state/gate-health",
+  "snapshot": "/home/coding/.local/state/subgov/codex-productive-snapshot.json",
+  "demand_state": "/home/coding/.local/state/subgov/codex-productive-demand.json",
+  "actuator_state": "/home/coding/.local/state/subgov/codex-productive-fleet.json",
+  "quota_binary": "/home/coding/.local/bin/subgov",
+  "quota_config": "/home/coding/.config/subgov/codex-quota-source.yaml",
+  "work": [
+    {
+      "workspace": "/home/coding/codex-governor",
+      "id": "codexgov-d2753c47",
+      "reviewed_revision": 2,
+      "admission_evidence": "Description records operator batch admission 2026-10-16/17; reviewed under subgov-564a5b9a. Native gate-health remains binding."
+    },
+    {
+      "workspace": "/home/coding/agent-archivist",
+      "id": "aa-3404195e",
+      "reviewed_revision": 0,
+      "admission_evidence": "Notes record operator admission 2026-10-16; reviewed under subgov-564a5b9a.",
+      "external_hold": "Awaiting write-capable iad-ci credential and live cross-build acceptance; source must not dispatch until this hold is explicitly resolved and revision reviewed."
+    }
+  ]
+}

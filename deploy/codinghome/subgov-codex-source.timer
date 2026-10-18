@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Codex quota and productive demand
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=300s
+AccuracySec=10s
+Unit=subgov-codex-source.service
+
+[Install]
+WantedBy=timers.target

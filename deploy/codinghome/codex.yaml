@@ -1,15 +1,13 @@
 # Codinghome Codex elastic governor; maintained source for ~/.config/subgov/codex.yaml.
-# Banked-reset pacing enabled under subgov-df1e9e75 (2026-10-18).
-# Existing native source has no eligible-backlog signal: banked pacing cannot
-# expand beyond observed capacity until real admitted demand is integrated.
+# Productive full-speed banked policy enabled under subgov-564a5b9a.
 version: 1
 poll_interval_seconds: 300
 state_path: /home/coding/.local/state/subgov/codex.json
 accounts:
   codex:
     source:
-      type: codex_app_server
-      timeout_seconds: 30
+      type: normalized_file
+      path: /home/coding/.local/state/subgov/codex-productive-snapshot.json
     fleet:
       min_workers: 0
       max_workers: 12
@@ -22,10 +20,22 @@ accounts:
         identifier_prefix: sg-codex-
         stale_after_seconds: 60
       actuator:
-        type: needle_run
-        repo: /home/coding/NEEDLE
-        adapter: codex-gpt-5.6-luna-xhigh
-        identifier_prefix: sg-codex-
+        type: command
+        argv:
+        - /run/current-system/sw/bin/systemd-run
+        - --user
+        - --wait
+        - --pipe
+        - --collect
+        - --quiet
+        - --property=NoNewPrivileges=yes
+        - /run/current-system/sw/bin/python3
+        - -B
+        - /home/coding/.local/lib/subgov-codex/codex-productive.py
+        - --settings
+        - /home/coding/.config/subgov/codex-productive.json
+        - actuate
+        - '{desired_workers}'
     utilization:
       reserve_fraction: 0.05
       strategy: linear_to_reset
@@ -34,6 +44,7 @@ accounts:
       minimum_sample_seconds: 240
     banked_resets:
       enabled: true
+      full_speed: true
       minimum_pace_multiplier: 2.0
       redeem_at_utilization: 1.0
       deadline_safety_seconds: 21600

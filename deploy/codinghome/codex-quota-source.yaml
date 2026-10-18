@@ -1,0 +1,14 @@
+version: 1
+accounts:
+  codex:
+    source:
+      type: codex_app_server
+      timeout_seconds: 30
+    fleet:
+      min_workers: 0
+      max_workers: 12
+      observer: {type: static, workers: 0}
+      actuator: {type: none}
+    utilization:
+      reserve_fraction: 0.05
+      strategy: linear_to_reset

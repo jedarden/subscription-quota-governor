@@ -1,0 +1,12 @@
+[Unit]
+Description=Codex read-only quota and reviewed productive demand publisher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/run/current-system/sw/bin/python3 -B /home/coding/.local/lib/subgov-codex/codex-productive.py --settings /home/coding/.config/subgov/codex-productive.json refresh
+Environment=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
+TimeoutStartSec=120s
+UMask=0077
+NoNewPrivileges=true

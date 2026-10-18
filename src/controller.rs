@@ -411,6 +411,25 @@ pub fn evaluate(
     });
     let raw_desired = match &banked_resets {
         Some(plan) if plan.manual_redemption_recommended => plan.desired_workers,
+        Some(plan) if config.banked_resets.full_speed => {
+            // A productive-work target replaces burn-rate learning, but a
+            // shorter provider window's measured pace, ceiling, or pending
+            // refresh still constrains the fleet.
+            decisions
+                .iter()
+                .filter(|decision| {
+                    decision.reason == "reset_due"
+                        || (matches!(
+                            decision.reason.as_str(),
+                            "target_reached" | "paced_to_reset"
+                        ) && snapshot.windows.iter().any(|window| {
+                            window.id == decision.id && !is_weekly_window(window.duration_minutes)
+                        }))
+                })
+                .fold(plan.desired_workers, |desired, guard| {
+                    desired.min(guard.desired_workers)
+                })
+        }
         Some(plan) if !plan.manual_redemption_recommended && !short_window_reached => {
             ordinary_desired.max(plan.desired_workers)
         }
@@ -418,7 +437,14 @@ pub fn evaluate(
     };
     let stepped_desired = apply_step_limits(raw_desired, current_workers, config);
     let desired_workers = banked_resets.as_ref().map_or(stepped_desired, |plan| {
-        stepped_desired.min(plan.eligible_backlog_capacity)
+        if config.banked_resets.full_speed {
+            // Preserve normal downward steps for existing workers, but a
+            // configured minimum cannot start workers beyond known work.
+            // Missing capacity resolves to current_workers, so cannot grow.
+            stepped_desired.min(current_workers.max(plan.eligible_backlog_capacity))
+        } else {
+            stepped_desired.min(plan.eligible_backlog_capacity)
+        }
     });
     Ok(Decision {
         account: account_name.to_owned(),
@@ -565,6 +591,19 @@ fn banked_reset_decision(
             config.fleet.min_workers,
             "weekly_window_awaiting_manual_redemption",
         )
+    } else if config.banked_resets.full_speed {
+        if window.resets_at <= now {
+            (current_workers, "banked_reset_window_awaiting_refresh")
+        } else {
+            (
+                eligible_backlog_capacity,
+                if snapshot.eligible_backlog_capacity.is_some() {
+                    "full_speed_banked_reset_work"
+                } else {
+                    "full_speed_banked_reset_capacity_unknown"
+                },
+            )
+        }
     } else if deadline_missed {
         (
             eligible_backlog_capacity,
@@ -1553,6 +1592,286 @@ mod tests {
         assert_eq!(capped.desired_workers, 1);
         assert_eq!(capped_banked.eligible_backlog_capacity, 1);
         assert!(!capped_banked.feasible);
+    }
+
+    fn full_speed_fixture(now: DateTime<Utc>) -> (AccountConfig, QuotaSnapshot) {
+        let mut config = account();
+        config.banked_resets.enabled = true;
+        config.banked_resets.full_speed = true;
+        let snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "codex.secondary".into(),
+                used_fraction: 0.3,
+                resets_at: now + Duration::days(6),
+                duration_minutes: Some(10_080),
+                reached: false,
+            }],
+            eligible_backlog_capacity: Some(8),
+            reset_credits: Some(ResetCreditsSnapshot {
+                available_count: 1,
+                credits: None,
+            }),
+            backpressure: None,
+            saturation: None,
+        };
+        (config, snapshot)
+    }
+
+    #[test]
+    fn full_speed_banked_reset_targets_work_without_burn_learning() {
+        let now = Utc::now();
+        let (config, mut snapshot) = full_speed_fixture(now);
+        for (capacity, expected) in [(Some(8), 8), (Some(100), 10), (Some(2), 2), (None, 3)] {
+            snapshot.eligible_backlog_capacity = capacity;
+            let decision =
+                evaluate("test", &config, &snapshot, &AccountState::default(), 3, now).unwrap();
+            assert_eq!(decision.desired_workers, expected, "capacity={capacity:?}");
+            let plan = decision.banked_resets.unwrap();
+            assert_eq!(plan.desired_workers, expected);
+            assert_eq!(
+                plan.reason,
+                if capacity.is_some() {
+                    "full_speed_banked_reset_work"
+                } else {
+                    "full_speed_banked_reset_capacity_unknown"
+                }
+            );
+            assert!(plan.aggregate_burn_per_hour.is_none());
+            assert!(plan.governed_worker_burn_per_hour.is_none());
+            assert!(plan.exogenous_burn_per_hour.is_none());
+            assert!(plan.max_feasible_burn_per_hour.is_none());
+            assert!(!plan.feasible);
+        }
+        // Even a measured split suggesting much slower pacing does not
+        // reduce a productive full-speed target.
+        snapshot.eligible_backlog_capacity = Some(8);
+        let mut prior = AccountState::default();
+        add_banked_burn_history(
+            &mut prior,
+            now,
+            snapshot.windows[0].resets_at,
+            0.3,
+            0.001,
+            0.01,
+        );
+        let decision = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(decision.desired_workers, 8);
+        assert!(decision
+            .banked_resets
+            .unwrap()
+            .max_feasible_burn_per_hour
+            .is_some());
+        // A positive aggregate rate at one fixed worker count still cannot
+        // identify the split. Full speed must not fabricate feasibility.
+        prior.aggregate_burn_history.insert(
+            "codex.secondary".into(),
+            [(-25, 0.05), (-12, 0.18), (-1, 0.29)]
+                .into_iter()
+                .map(|(hours, used_fraction)| AggregateBurnSample {
+                    observed_at: now + Duration::hours(hours),
+                    used_fraction,
+                    resets_at: snapshot.windows[0].resets_at,
+                    governed_workers: 3,
+                })
+                .collect(),
+        );
+        let decision = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(decision.desired_workers, 8);
+        let plan = decision.banked_resets.unwrap();
+        assert!(plan.aggregate_burn_per_hour.is_some());
+        assert!(plan.governed_worker_burn_per_hour.is_none());
+        assert!(plan.exogenous_burn_per_hour.is_none());
+        assert!(plan.max_feasible_burn_per_hour.is_none());
+        assert!(!plan.feasible);
+    }
+
+    #[test]
+    fn full_speed_banked_reset_respects_steps_and_drains_without_work() {
+        let now = Utc::now();
+        let (mut config, mut snapshot) = full_speed_fixture(now);
+        config.fleet.max_scale_up_per_cycle = 2;
+        config.fleet.max_scale_down_per_cycle = 1;
+        let prior = AccountState::default();
+        let up = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(up.desired_workers, 5);
+        snapshot.eligible_backlog_capacity = Some(0);
+        for current in (0..=3).rev() {
+            let down = evaluate("test", &config, &snapshot, &prior, current, now).unwrap();
+            assert_eq!(down.banked_resets.unwrap().desired_workers, 0);
+            assert_eq!(down.desired_workers, current.saturating_sub(1));
+        }
+        // Missing capacity cannot bootstrap productive work from zero.
+        snapshot.eligible_backlog_capacity = None;
+        assert_eq!(
+            evaluate("test", &config, &snapshot, &prior, 0, now)
+                .unwrap()
+                .desired_workers,
+            0
+        );
+        config.fleet.min_workers = 2;
+        assert_eq!(
+            evaluate("test", &config, &snapshot, &prior, 0, now)
+                .unwrap()
+                .desired_workers,
+            0,
+            "missing work evidence cannot bootstrap to a reconfigured minimum"
+        );
+        for capacity in [0, 1] {
+            snapshot.eligible_backlog_capacity = Some(capacity);
+            let decision = evaluate("test", &config, &snapshot, &prior, 0, now).unwrap();
+            assert_eq!(
+                decision.desired_workers, capacity,
+                "a configured minimum cannot start workers without productive work"
+            );
+        }
+        snapshot.eligible_backlog_capacity = Some(0);
+        let draining = evaluate("test", &config, &snapshot, &prior, 5, now).unwrap();
+        assert_eq!(draining.desired_workers, 4);
+    }
+
+    #[test]
+    fn full_speed_pool_capacity_includes_the_unowned_worker_floor() {
+        let now = Utc::now();
+        let (mut config, mut snapshot) = full_speed_fixture(now);
+        config.fleet.max_workers = 12;
+        config.fleet.max_scale_up_per_cycle = 3;
+        config.fleet.max_scale_down_per_cycle = 1;
+        let prior = AccountState::default();
+        for (capacity, owned, expected_owned, expected_total) in
+            [(1, 0, 0, 1), (4, 0, 3, 4), (1_000, 10, 12, 13)]
+        {
+            snapshot.eligible_backlog_capacity = Some(capacity);
+            let decision =
+                evaluate_pool("test", &config, &snapshot, &prior, owned, 1, now).unwrap();
+            assert_eq!(decision.current_workers, owned);
+            assert_eq!(decision.unowned_workers, 1);
+            assert_eq!(decision.desired_workers, expected_owned);
+            assert_eq!(decision.desired_total, Some(expected_total));
+            assert!(decision.desired_workers <= config.fleet.max_workers);
+            assert!(decision.desired_workers <= owned + config.fleet.max_scale_up_per_cycle);
+        }
+        snapshot.eligible_backlog_capacity = Some(1);
+        let draining = evaluate_pool("test", &config, &snapshot, &prior, 3, 1, now).unwrap();
+        assert_eq!(draining.desired_workers, 2);
+        assert_eq!(draining.desired_total, Some(3));
+    }
+
+    #[test]
+    fn full_speed_banked_reset_requires_opt_in_credits_and_weekly_window() {
+        let now = Utc::now();
+        let (mut config, snapshot) = full_speed_fixture(now);
+        let prior = AccountState::default();
+        config.banked_resets.full_speed = false;
+        let normal = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(normal.desired_workers, 3);
+        assert_eq!(
+            normal.banked_resets.unwrap().reason,
+            "learning_banked_reset_24h_burn_rate"
+        );
+        config.banked_resets.full_speed = true;
+        for credits in [
+            None,
+            Some(ResetCreditsSnapshot {
+                available_count: 0,
+                credits: None,
+            }),
+        ] {
+            let mut no_credits = snapshot.clone();
+            no_credits.reset_credits = credits;
+            let decision = evaluate("test", &config, &no_credits, &prior, 3, now).unwrap();
+            assert_eq!(decision.desired_workers, 3);
+            assert!(decision.banked_resets.is_none());
+        }
+        config.banked_resets.enabled = false;
+        let disabled = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(disabled.desired_workers, 3);
+        assert!(disabled.banked_resets.is_none());
+        config.banked_resets.enabled = true;
+        let mut no_weekly = snapshot;
+        no_weekly.windows[0].duration_minutes = Some(300);
+        let decision = evaluate("test", &config, &no_weekly, &prior, 3, now).unwrap();
+        assert_eq!(decision.desired_workers, 3);
+        assert!(decision.banked_resets.is_none());
+    }
+
+    #[test]
+    fn full_speed_banked_reset_preserves_short_window_and_refresh_guards() {
+        let now = Utc::now();
+        let (config, mut snapshot) = full_speed_fixture(now);
+        let mut prior = AccountState::default();
+        snapshot.windows.push(QuotaWindow {
+            id: "five_hour".into(),
+            used_fraction: 0.9,
+            resets_at: now + Duration::hours(2),
+            duration_minutes: Some(300),
+            reached: false,
+        });
+        let drain = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(drain.desired_workers, 0);
+        snapshot.windows[1].used_fraction = 0.2;
+        snapshot.windows[1].resets_at = now;
+        let hold = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(hold.desired_workers, 3);
+        snapshot.windows[1].resets_at = now + Duration::hours(2);
+        let learning = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(learning.windows[1].reason, "learning_burn_rate");
+        assert_eq!(learning.desired_workers, 8);
+        snapshot.windows[1].used_fraction = 0.8;
+        prior.windows.insert(
+            "five_hour".into(),
+            WindowSample {
+                observed_at: now - Duration::hours(1),
+                used_fraction: 0.7,
+                resets_at: snapshot.windows[1].resets_at,
+                workers: 3,
+            },
+        );
+        let paced = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(paced.windows[1].reason, "paced_to_reset");
+        assert_eq!(paced.desired_workers, 2);
+        snapshot.windows.pop();
+        snapshot.windows[0].resets_at = now;
+        let hold = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(hold.desired_workers, 3);
+        assert_eq!(
+            hold.banked_resets.unwrap().reason,
+            "banked_reset_window_awaiting_refresh"
+        );
+    }
+
+    #[test]
+    fn full_speed_banked_reset_preserves_redemption_latch_and_stale_guards() {
+        let now = Utc::now();
+        let (mut config, mut snapshot) = full_speed_fixture(now);
+        config.banked_resets.redeem_at_utilization = 0.8;
+        config.fleet.max_scale_down_per_cycle = 1;
+        let mut prior = AccountState::default();
+        snapshot.windows[0].used_fraction = 0.8;
+        let drain = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+        assert_eq!(drain.desired_workers, 2);
+        assert!(drain.banked_resets.unwrap().manual_redemption_recommended);
+        prior.record(&snapshot, 3, 2);
+        snapshot.windows[0].used_fraction = 0.2;
+        let latched = evaluate("test", &config, &snapshot, &prior, 2, now).unwrap();
+        assert_eq!(latched.desired_workers, 1);
+        assert!(latched.banked_resets.unwrap().manual_redemption_recommended);
+        snapshot.windows[0].resets_at += Duration::days(7);
+        let resumed = evaluate("test", &config, &snapshot, &prior, 1, now).unwrap();
+        assert_eq!(resumed.desired_workers, 8);
+        for stale_by_age in [false, true] {
+            snapshot.fresh = stale_by_age;
+            snapshot.observed_at = if stale_by_age {
+                now - Duration::hours(1)
+            } else {
+                now
+            };
+            let held = evaluate("test", &config, &snapshot, &prior, 3, now).unwrap();
+            assert!(held.stale);
+            assert_eq!(held.desired_workers, 3);
+            assert!(held.banked_resets.is_none());
+        }
     }
 
     #[test]

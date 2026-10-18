@@ -125,6 +125,23 @@ Banked-reset worker targets are capped by `eligible_backlog_capacity` from a
 normalized quota snapshot. If no backlog capacity is available, the current
 worker count is the cap, so quota headroom alone cannot scale up the fleet.
 
+Set `banked_resets.full_speed: true` together with `enabled: true` to use
+the entire verified `eligible_backlog_capacity`, capped by `max_workers`,
+while a weekly window and a positive credit balance are available. This
+opt-in defaults to `false`. It targets productive admitted work without
+waiting for burn-rate learning or an identifiable worker/exogenous split;
+the decision reason is `full_speed_banked_reset_work`. Unknown burn and
+feasibility diagnostics remain unknown (`feasible: false`). Missing demand
+holds the current target with `full_speed_banked_reset_capacity_unknown`;
+zero demand drains toward the fleet minimum. Normal scale-up and scale-down
+steps still apply, so a shrinking demand target may take several cycles to
+drain. Measured shorter-window pacing, shorter-window ceilings, and windows
+awaiting a refreshed reset constrain the target before full-speed work can
+resume. Shorter windows still learning a burn rate do not block full-speed.
+Stale snapshots and the manual redemption latch remain binding. With zero or
+missing credits, disabled
+banked resets, or no weekly window, ordinary policy continues to apply.
+
 At the threshold, the controller sets
 `manual_redemption_recommended: true`, reports the reason
 `weekly_window_awaiting_manual_redemption`, and drains toward `min_workers`.
