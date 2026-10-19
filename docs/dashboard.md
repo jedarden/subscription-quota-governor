@@ -11,7 +11,8 @@ subgov dashboard --configs ~/.config/subgov/claude-anthropic.yaml \
 
 Use `--once` for a plain snapshot or `--once --json` for structured output.
 `--interval-seconds 5` controls display refresh, independently of the governors'
-poll intervals. Press `q` or Ctrl-C to exit the interactive view.
+poll intervals. Press `j`/`k` to scroll in a shorter terminal, or `q` or Ctrl-C
+to exit the interactive view.
 
 The account cards show quota used and remaining, reset countdowns, configured
 ceilings/reserves, consumption in percentage points per hour, projected remaining
