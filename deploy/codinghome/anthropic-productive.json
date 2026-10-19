@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "host": "codinghome",
+  "agent": "claude-print",
+  "prefix": "sg-claude-anthropic-",
+  "max_workers": 2,
+  "lane_label": "subgov-anthropic-productive",
+  "heartbeat_dir": "/home/coding/.needle/state/heartbeats",
+  "gate_health_dir": "/home/coding/.needle/state/gate-health",
+  "actuator_state": "/home/coding/.local/state/subgov/anthropic-productive-fleet.json",
+  "work": [
+    {
+      "workspace": "/home/coding/claude-governor",
+      "id": "claudego-7a351ba7",
+      "reviewed_revision": 2,
+      "admission_evidence": "Ordinary manually authored defect, no generated-proposal or human holds. Reviewed under subgov-83e07f65. Native ready frontier and gate health remain binding."
+    }
+  ]
+}

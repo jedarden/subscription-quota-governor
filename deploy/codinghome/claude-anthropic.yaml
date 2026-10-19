@@ -1,0 +1,54 @@
+# Maintained codinghome Anthropic config; install as ~/.config/subgov/claude-anthropic.yaml.
+version: 1
+poll_interval_seconds: 300
+state_path: ~/.local/state/subscription-governor/claude-anthropic.json
+accounts:
+  claude-anthropic:
+    source:
+      type: anthropic_oauth
+      credentials_path: ~/.claude/.credentials.json
+      timeout_seconds: 15
+    fleet:
+      min_workers: 0
+      max_workers: 2
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 1
+      observer:
+        type: needle_status
+        identifier_prefix: sg-claude-anthropic-
+        agent: claude-print
+        heartbeat_dir: ~/.needle/state/heartbeats
+        stale_after_seconds: 60
+      actuator:
+        type: command
+        argv:
+        - /run/current-system/sw/bin/systemd-run
+        - --user
+        - --wait
+        - --pipe
+        - --collect
+        - --quiet
+        - --property=NoNewPrivileges=yes
+        - /run/current-system/sw/bin/python3
+        - -B
+        - /home/coding/.local/lib/subgov-anthropic/anthropic-productive.py
+        - --settings
+        - /home/coding/.config/subgov/anthropic-productive.json
+        - actuate
+        - '{desired_workers}'
+    utilization:
+      reserve_fraction: 0.15
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      minimum_sample_seconds: 240
+      windows:
+        five_hour:
+          burn_rate_window_seconds: 1200
+        seven_day:
+          burn_rate_window_seconds: 86400
+        weekly_all:
+          burn_rate_window_seconds: 86400
+        weekly_scoped:
+          enabled: false

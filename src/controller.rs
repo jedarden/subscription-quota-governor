@@ -341,16 +341,29 @@ pub fn evaluate(
                 Strategy::LinearToReset => {
                     match prior.windows.get(&window.id).filter(|sample| {
                         same_reset_generation(sample.resets_at, window.resets_at)
-                            && snapshot
-                                .observed_at
-                                .signed_duration_since(sample.observed_at)
-                                .num_seconds()
-                                >= config.utilization.minimum_sample_seconds as i64
+                            && (policy.burn_rate_window_seconds.is_some()
+                                || snapshot
+                                    .observed_at
+                                    .signed_duration_since(sample.observed_at)
+                                    .num_seconds()
+                                    >= config.utilization.minimum_sample_seconds as i64)
                             && window.used_fraction >= sample.used_fraction
                             && sample.workers > 0
                     }) {
                         Some(sample) => {
-                            match estimate_burn_per_worker(sample, window, snapshot.observed_at) {
+                            match policy.burn_rate_window_seconds.map_or_else(
+                                || estimate_burn_per_worker(sample, window, snapshot.observed_at),
+                                |seconds| {
+                                    estimate_window_burn(
+                                        prior.aggregate_burn_history.get(&window.id),
+                                        window,
+                                        snapshot.observed_at,
+                                        current_workers,
+                                        seconds,
+                                        config.utilization.stale_after_seconds,
+                                    )
+                                },
+                            ) {
                                 Some(per_worker) => {
                                     burn_per_worker = Some(per_worker);
                                     let remaining_hours = window
@@ -900,6 +913,56 @@ fn estimate_burn_per_worker(
     (per_worker.is_finite() && per_worker > 0.0).then_some(per_worker)
 }
 
+/// A rolling baseline is opt-in per window; ordinary windows retain the
+/// original two-point estimator. Reject missing intervals and attribution
+/// across resets, decreases or zero-worker intervals instead of guessing.
+fn estimate_window_burn(
+    history: Option<&std::collections::VecDeque<AggregateBurnSample>>,
+    window: &QuotaWindow,
+    observed_at: DateTime<Utc>,
+    workers: u32,
+    seconds: u64,
+    stale_after_seconds: u64,
+) -> Option<f64> {
+    let cutoff =
+        observed_at.checked_sub_signed(Duration::try_seconds(seconds.try_into().ok()?)?)?;
+    let history = history?;
+    let first = history
+        .iter()
+        .rposition(|sample| sample.observed_at <= cutoff)?;
+    let current = AggregateBurnSample {
+        observed_at,
+        used_fraction: window.used_fraction,
+        resets_at: window.resets_at,
+        governed_workers: workers,
+    };
+    let samples = history.iter().skip(first).chain(std::iter::once(&current));
+    let mut previous: Option<&AggregateBurnSample> = None;
+    let mut burned = 0.0;
+    let mut worker_hours = 0.0;
+    for next in samples {
+        if !same_reset_generation(next.resets_at, window.resets_at) {
+            return None;
+        }
+        if let Some(prior) = previous {
+            let elapsed = next.observed_at.signed_duration_since(prior.observed_at);
+            if elapsed < Duration::zero()
+                || elapsed > Duration::try_seconds(stale_after_seconds.try_into().ok()?)?
+                || next.used_fraction < prior.used_fraction
+                || prior.governed_workers == 0
+            {
+                return None;
+            }
+            burned += next.used_fraction - prior.used_fraction;
+            worker_hours +=
+                elapsed.num_milliseconds() as f64 / 3_600_000.0 * f64::from(prior.governed_workers);
+        }
+        previous = Some(next);
+    }
+    let rate = burned / worker_hours;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
+}
+
 fn workers_for_rate(required_rate: f64, per_worker_rate: f64) -> u32 {
     let ratio = required_rate / per_worker_rate;
     if !ratio.is_finite() {
@@ -967,6 +1030,121 @@ mod tests {
                 windows: BTreeMap::new(),
             },
             banked_resets: BankedResetConfig::default(),
+        }
+    }
+
+    #[test]
+    fn rolling_burn_paces_quantized_weekly_and_preserves_short_guard() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(46);
+        let mut cfg = account();
+        cfg.utilization.target_utilization = Some(0.85);
+        cfg.utilization.windows.insert(
+            "weekly".into(),
+            WindowPolicy {
+                burn_rate_window_seconds: Some(86400),
+                ..Default::default()
+            },
+        );
+        let mut prior = AccountState::default();
+        let mut history = VecDeque::new();
+        for index in 0..=288 {
+            history.push_back(AggregateBurnSample {
+                observed_at: now - Duration::minutes(1440 - index * 5),
+                used_fraction: 0.41 + ((index * 14 / 288) as f64) / 100.0,
+                resets_at: reset,
+                governed_workers: 1,
+            });
+        }
+        prior
+            .aggregate_burn_history
+            .insert("weekly".into(), history.clone());
+        prior.windows.insert(
+            "weekly".into(),
+            WindowSample {
+                observed_at: now - Duration::seconds(30),
+                used_fraction: 0.55,
+                resets_at: reset,
+                workers: 1,
+            },
+        );
+        let weekly = QuotaWindow {
+            id: "weekly".into(),
+            used_fraction: 0.55,
+            resets_at: reset,
+            reached: false,
+            duration_minutes: None,
+        };
+        let mut snapshot = QuotaSnapshot {
+            observed_at: now,
+            fresh: true,
+            windows: vec![weekly.clone()],
+            eligible_backlog_capacity: None,
+            reset_credits: None,
+            backpressure: None,
+            saturation: None,
+        };
+        let decision = evaluate("acct", &cfg, &snapshot, &prior, 1, now).unwrap();
+        assert_eq!(decision.desired_workers, 2);
+        cfg.utilization.windows.clear();
+        assert_eq!(
+            evaluate("acct", &cfg, &snapshot, &prior, 1, now)
+                .unwrap()
+                .desired_workers,
+            1
+        );
+        cfg.utilization.windows.insert(
+            "weekly".into(),
+            WindowPolicy {
+                burn_rate_window_seconds: Some(86400),
+                ..Default::default()
+            },
+        );
+        snapshot.windows.push(QuotaWindow {
+            id: "short".into(),
+            used_fraction: 0.85,
+            resets_at: now + Duration::hours(2),
+            reached: false,
+            duration_minutes: None,
+        });
+        assert_eq!(
+            evaluate("acct", &cfg, &snapshot, &prior, 1, now)
+                .unwrap()
+                .desired_workers,
+            0
+        );
+        for mode in [
+            "gap",
+            "reset",
+            "decrease",
+            "zero_workers",
+            "flat",
+            "missing",
+        ] {
+            let mut samples = history.clone();
+            match mode {
+                "gap" => {
+                    samples.remove(1);
+                    samples.remove(1);
+                    samples.remove(1);
+                }
+                "reset" => samples[100].resets_at -= Duration::days(7),
+                "decrease" => samples[100].used_fraction = 0.1,
+                "zero_workers" => samples[100].governed_workers = 0,
+                "flat" => {
+                    for sample in &mut samples {
+                        sample.used_fraction = 0.55;
+                    }
+                }
+                "missing" => {
+                    samples.pop_front();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                estimate_window_burn(Some(&samples), &weekly, now, 1, 86400, 900).is_none(),
+                "{mode}"
+            );
         }
     }
 

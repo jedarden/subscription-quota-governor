@@ -449,6 +449,12 @@
       "description": "validate_target(..., required=false): a window override may set at most one of target_utilization/reserve_fraction, and either or both may be entirely absent (inherits the account-level policy).",
       "not": { "required": ["target_utilization", "reserve_fraction"] },
       "properties": {
+        "burn_rate_window_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "description": "Optional rolling measured worker-hour baseline; absent retains two-point pacing. Invalid or insufficient same-generation history holds. Config::validate also requires this to be >= utilization.minimum_sample_seconds, a cross-field numeric comparison not expressible here."
+        },
         "enabled": { "type": "boolean" },
         "target_utilization": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
         "reserve_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },

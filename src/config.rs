@@ -315,6 +315,9 @@ pub enum StaleBehavior {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowPolicy {
+    /// Opt-in rolling measured worker-hour baseline for quantized windows.
+    #[serde(default)]
+    pub burn_rate_window_seconds: Option<u64>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -435,6 +438,12 @@ impl Config {
                 validate_backpressure(backpressure, name)?;
             }
             for (window, policy) in &account.utilization.windows {
+                if policy.burn_rate_window_seconds.is_some_and(|seconds| {
+                    seconds < account.utilization.minimum_sample_seconds
+                        || seconds > i64::MAX as u64
+                }) {
+                    bail!("account {name} window {window}: burn_rate_window_seconds must be >= minimum_sample_seconds and fit i64");
+                }
                 validate_target(
                     policy.target_utilization,
                     policy.reserve_fraction,
@@ -527,6 +536,7 @@ impl UtilizationConfig {
             .expect("validated utilization target");
         Some(ResolvedPolicy {
             target,
+            burn_rate_window_seconds: override_policy.and_then(|p| p.burn_rate_window_seconds),
             strategy: override_policy
                 .and_then(|p| p.strategy.clone())
                 .unwrap_or_else(|| self.strategy.clone()),
@@ -536,6 +546,7 @@ impl UtilizationConfig {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedPolicy {
+    pub burn_rate_window_seconds: Option<u64>,
     pub target: f64,
     pub strategy: Strategy,
 }
@@ -1370,6 +1381,30 @@ accounts:
 {utilization_yaml}
 "#
         )
+    }
+
+    #[test]
+    fn rolling_burn_window_is_optional_and_validated() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schema/governor-config.schema.json")).unwrap();
+        let field = &schema["$defs"]["windowPolicy"]["properties"]["burn_rate_window_seconds"];
+        assert_eq!(field["type"], "integer");
+        assert_eq!(field["minimum"], 1);
+        assert_eq!(field["maximum"].as_u64(), Some(i64::MAX as u64));
+        assert!(schema["$defs"]["windowPolicy"].get("required").is_none());
+        let yaml = config_with_utilization(&indent("reserve_fraction: 0.15"));
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(cfg.accounts["acct"]
+            .utilization
+            .policy_for("weekly")
+            .unwrap()
+            .burn_rate_window_seconds
+            .is_none());
+        for seconds in ["86400", "0", "18446744073709551615"] {
+            let yaml = config_with_utilization(&indent(&format!("reserve_fraction: 0.15\nwindows:\n  weekly:\n    burn_rate_window_seconds: {seconds}")));
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(cfg.validate().is_ok(), seconds == "86400");
+        }
     }
 
     #[test]
