@@ -24,6 +24,7 @@ accounts:
         - --collect
         - --quiet
         - --property=NoNewPrivileges=yes
+        - --setenv=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
         - /run/current-system/sw/bin/python3
         - -B
         - /home/coding/.local/lib/subgov-codex/codex-productive.py
@@ -40,6 +41,7 @@ accounts:
         - --collect
         - --quiet
         - --property=NoNewPrivileges=yes
+        - --setenv=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
         - /run/current-system/sw/bin/python3
         - -B
         - /home/coding/.local/lib/subgov-codex/codex-productive.py
