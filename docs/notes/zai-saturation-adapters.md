@@ -83,6 +83,16 @@ An absent classification family also produces null, even if other 429 counters
 exist. A declared classification metric family is evidence that absent 1302
 series means zero; absence of the entire family is unknown pressure.
 
+The collector also publishes `backpressure` for the same complete interval and
+attempt denominator, using deltas of
+`zai_proxy_upstream_errors_total{error_type="429"}`. This generic HTTP rate is
+separate from provider 1302 concurrency rejection. Its fraction is null for low
+traffic, absent metric support on any replica, older baselines without this
+counter, counter regression, or a delta exceeding attempts. Adding this optional
+counter never changes the existing throughput/concurrency result. The dashboard
+reads it from the cached snapshot; it does not scrape providers. Publishing this
+field does not enable the governor's optional `utilization.backpressure` policy.
+
 `--backlog-capacity-file PATH` optionally reads a trusted, timestamped observation:
 
 ```json

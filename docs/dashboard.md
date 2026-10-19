@@ -9,9 +9,13 @@ subgov dashboard --configs ~/.config/subgov/claude-anthropic.yaml \
   ~/.config/subgov/codex.yaml ~/.config/subgov/claude-zai-managed.yaml
 ```
 
-The interactive overview puts the three providers together, with quota left,
-active agents, reset timing and projected remaining capacity. Select a provider
-to inspect its measured history, projected trajectory and decision summary.
+The interactive overview puts every configured governor in one pane. Anthropic
+and OpenAI/Codex show quota left, consumption pace, estimated time until empty,
+reset timing and projected remaining capacity. Their charts appear together.
+ZAI shows completed requests per second, upstream HTTP 429 percentage and provider
+1302 concurrency rejection percentage instead of a linear quota forecast.
+Select a provider
+to inspect its measurement baselines and decision summary.
 The detail view contains all reported quota windows, measurement baselines and
 recorded holds. Unknown and stale measurements stay visibly distinct.
 
@@ -45,6 +49,18 @@ history must not appear as zero consumption or free capacity.
 History and projection use different chart styles. If the measured rate implies
 exhaustion before reset, the projection reaches 100% at that earlier time; it
 does not spread the same consumption across the entire remaining window.
+The empty estimate starts at the quota sample timestamp. If reset occurs first,
+the display says so: the estimate assumes unchanged pace and ignores that future
+reset. Stale, flat or insufficient observations cannot supply an empty estimate.
+
+ZAI percentages use full-proxy interval deltas divided by upstream attempts,
+including retries. HTTP 429 and provider error 1302 have separate counters; neither
+is a measurement of simultaneous requests or a provider concurrency limit. Sample
+attempts, interval length, age and the controller's concurrency threshold are
+visible. Missing, stale or insufficient samples show unknown; the default gate
+is at least 30 attempts over at least 300 seconds. A known zero requires measured
+counter support across the full stable replica set. These proxy-wide rates also
+include interactive clients.
 
 Controller-observed counts belong to their recorded observation time. Live
 heartbeat counts, where available, are checked against supervisor process
@@ -63,7 +79,11 @@ not hide the others.
 
 The maintained launcher is
 [`deploy/codinghome/subgov-dashboard.sh`](../deploy/codinghome/subgov-dashboard.sh).
-It reads the same three production configurations used by the governors. Install
+It reads the same three production configurations used by the governors. The
+installed governor units and their actual process arguments were checked to
+match this list; legacy and observer-only YAML files refer to those same accounts
+and are not additional governor instances. Keep the launcher's configuration
+list aligned when admitting a new governor. Install
 it as `~/.local/bin/subgov-dashboard`, then run it in a tab named **Subgov** in
 the existing **📊 metrics** space. This is a display process, with no new
 governor or provider account.

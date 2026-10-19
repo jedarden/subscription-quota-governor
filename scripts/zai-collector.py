@@ -41,6 +41,7 @@ def parse_metrics(body, now, stale_after=900):
     generation_supported = False
     generation_503 = 0
     generation_status_complete = True
+    http_429 = 0
     for line in body.splitlines():
         if line.startswith("# TYPE "):
             parts = line.split()
@@ -87,6 +88,10 @@ def parse_metrics(body, now, stale_after=900):
                 field = "concurrency"
             elif name == "zai_proxy_zai_errors_total" and tags.get("code") == "1302" and not dedicated_concurrency:
                 field = "concurrency"
+            elif name == "zai_proxy_upstream_errors_total" and tags.get("error_type") == "429":
+                if not value.is_integer() or value > 2**64 - 1:
+                    raise ValueError("invalid counter")
+                http_429 += int(value)
             if field:
                 if not value.is_integer() or value > 2**64 - 1:
                     raise ValueError("invalid counter")
@@ -123,7 +128,7 @@ def parse_metrics(body, now, stale_after=900):
     if "zai_proxy_request_duration_seconds_count" in family:
         family.add("zai_proxy_request_duration_seconds")
     usable = len(starts) == 1 and next(iter(starts), 0) > 0 and required <= family and generation_supported
-    sample = {"at": now, "start": next(iter(starts), None), "classified": bool({"zai_proxy_zai_errors_total", "zai_proxy_upstream_concurrency_rejections_total"} & family), **values} if usable else None
+    sample = {"at": now, "start": next(iter(starts), None), "classified": bool({"zai_proxy_zai_errors_total", "zai_proxy_upstream_concurrency_rejections_total"} & family), "http_429": http_429, "http_429_supported": "zai_proxy_upstream_errors_total" in family, **values} if usable else None
     return snapshot, sample
 
 
@@ -157,7 +162,20 @@ def update_saturation(readings, state, minimum_interval=60, maximum_interval=900
     if attempts < 0 or totals["concurrency"] > attempts or totals["completed"] > attempts:
         return None
     classified = all(current["classified"] and previous[key]["classified"] for key, current in readings.items())
-    return {"completed_requests": totals["completed"], "window_seconds": int(round(max(elapsed))), "attempts": attempts, "upstream_concurrency_fraction": totals["concurrency"] / attempts if classified and attempts >= minimum_attempts and attempts > 0 else None}
+    window_seconds = int(round(max(elapsed)))
+    # HTTP 429 and provider 1302 share the interval/attempt denominator, but
+    # have separate counters. Older baselines and absent metric families are
+    # unknown, never a measured zero. Optional telemetry cannot invalidate
+    # the established throughput/concurrency contract.
+    comparable_429 = all(current.get("http_429_supported") and previous[key].get("http_429_supported")
+                         and isinstance(current.get("http_429"), int) and isinstance(previous[key].get("http_429"), int)
+                         and current["http_429"] >= previous[key]["http_429"]
+                         for key, current in readings.items())
+    rejected = sum(current["http_429"] - previous[key]["http_429"] for key, current in readings.items()) if comparable_429 else None
+    pressure = {"attempts": attempts, "window_seconds": window_seconds,
+                "upstream_429_fraction": rejected / attempts if rejected is not None and 0 <= rejected <= attempts and attempts >= minimum_attempts and attempts > 0 else None}
+    return {"completed_requests": totals["completed"], "window_seconds": window_seconds, "attempts": attempts, "upstream_concurrency_fraction": totals["concurrency"] / attempts if classified and attempts >= minimum_attempts and attempts > 0 else None,
+            "backpressure": pressure}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -275,6 +293,7 @@ def collect(args):
         if healthy and complete:
             saturation = update_saturation(readings, state, args.minimum_interval, args.maximum_interval, args.minimum_attempts)
             if saturation is not None:
+                snapshot["backpressure"] = saturation.pop("backpressure")
                 snapshot["saturation"] = saturation
         else:
             state["replicas"] = {}

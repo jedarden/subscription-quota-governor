@@ -81,6 +81,7 @@ fn fixed_generation_rate_projection_stale_reset_and_quantized_samples() {
     assert!((window.consumption_percentage_points_per_hour.unwrap() - 30.0).abs() < 1e-8);
     assert!(window.expected_remaining_percent_at_reset.unwrap() < 1e-8);
     assert_eq!(window.baseline_seconds, Some(600));
+    assert_eq!(window.projected_empty_at, Some(reset));
     assert_eq!(window.history.len(), 2);
     assert!((window.history[0].used_percent - 35.0).abs() < 1e-8);
     assert!((window.history[1].used_percent - 40.0).abs() < 1e-8);
@@ -94,6 +95,7 @@ fn fixed_generation_rate_projection_stale_reset_and_quantized_samples() {
     assert!(stale.accounts[0].windows[0]
         .consumption_percentage_points_per_hour
         .is_none());
+    assert!(stale.accounts[0].windows[0].projected_empty_at.is_none());
     for (used, old_reset, age) in [
         (0.35, reset - Duration::days(7), 600),
         (0.5, reset, 600),
@@ -105,6 +107,7 @@ fn fixed_generation_rate_projection_stale_reset_and_quantized_samples() {
         assert!(frame.accounts[0].windows[0]
             .consumption_percentage_points_per_hour
             .is_none());
+        assert!(frame.accounts[0].windows[0].projected_empty_at.is_none());
         assert_eq!(
             frame.accounts[0].windows[0].history.len(),
             if age == 60 { 2 } else { 1 }
@@ -122,6 +125,7 @@ fn fixed_generation_rate_projection_stale_reset_and_quantized_samples() {
     assert!(frame.accounts[0].windows[0]
         .expected_remaining_percent_at_reset
         .is_none());
+    assert!(frame.accounts[0].windows[0].projected_empty_at.is_none());
     assert!(render(&frame, 40)
         .lines()
         .all(|line| line.chars().count() <= 40));
@@ -207,4 +211,124 @@ fn banked_weekly_target_override_preserves_short_window_policy_and_invalid_signa
         .cached_signals
         .iter()
         .any(|s| s.contains("throughput")));
+}
+
+#[test]
+fn pressure_preserves_denominators_and_separates_429_from_concurrency() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache.json");
+    let config = config(
+        dir.path(),
+        &format!(
+            "{{ type: normalized_file, path: {} }}",
+            serde_json::to_string(&cache).unwrap()
+        ),
+    );
+    let yaml = fs::read_to_string(&config).unwrap().replace(
+        "minimum_sample_seconds: 240 }",
+        "minimum_sample_seconds: 240, zai_saturation: {} }",
+    );
+    fs::write(&config, yaml).unwrap();
+    let now = Utc::now();
+    let snapshot = json!({"observed_at":now,"fresh":true,"windows":[{"id":"five_hour","used_fraction":0.2,"resets_at":now+Duration::hours(2)}],
+        "saturation":{"completed_requests":80,"attempts":100,"window_seconds":300,"upstream_concurrency_fraction":0.03},
+        "backpressure":{"attempts":100,"window_seconds":300,"upstream_429_fraction":0.2}});
+    write(&cache, snapshot.clone());
+    let frame = collect(std::slice::from_ref(&config), now);
+    let pressure = frame.accounts[0].pressure.as_ref().unwrap();
+    assert!(pressure.fresh);
+    assert_eq!(
+        pressure
+            .saturation
+            .as_ref()
+            .unwrap()
+            .upstream_concurrency_fraction,
+        Some(0.03)
+    );
+    assert_eq!(
+        pressure
+            .backpressure
+            .as_ref()
+            .unwrap()
+            .upstream_429_fraction,
+        Some(0.2)
+    );
+    assert_eq!(pressure.minimum_attempts, 30);
+    assert_eq!(pressure.minimum_window_seconds, 300);
+    assert!(frame.accounts[0].windows[0].projected_empty_at.is_none());
+    for change in ["stale", "future", "flag", "low", "short"] {
+        let mut sample = snapshot.clone();
+        match change {
+            "stale" => sample["observed_at"] = json!(now - Duration::hours(1)),
+            "future" => sample["observed_at"] = json!(now + Duration::minutes(1)),
+            "flag" => sample["fresh"] = json!(false),
+            "low" => {
+                sample["saturation"]["attempts"] = json!(3);
+                sample["saturation"]["completed_requests"] = json!(2);
+                sample["backpressure"]["attempts"] = json!(3);
+            }
+            "short" => {
+                sample["saturation"]["window_seconds"] = json!(60);
+                sample["backpressure"]["window_seconds"] = json!(60);
+            }
+            _ => unreachable!(),
+        }
+        write(&cache, sample);
+        let frame = collect(std::slice::from_ref(&config), now);
+        let pressure = frame.accounts[0].pressure.as_ref().unwrap();
+        assert!(
+            pressure
+                .saturation
+                .as_ref()
+                .unwrap()
+                .upstream_concurrency_fraction
+                .is_none(),
+            "{change}"
+        );
+        assert!(
+            pressure
+                .backpressure
+                .as_ref()
+                .unwrap()
+                .upstream_429_fraction
+                .is_none(),
+            "{change}"
+        );
+        assert!(pressure.saturation.as_ref().unwrap().attempts > 0);
+    }
+    let mut invalid = snapshot;
+    invalid["saturation"]["completed_requests"] = json!(101);
+    invalid["backpressure"]["upstream_429_fraction"] = json!(1.5);
+    write(&cache, invalid);
+    let frame = collect(std::slice::from_ref(&config), now);
+    let pressure = frame.accounts[0].pressure.as_ref().unwrap();
+    assert!(pressure.saturation.is_none());
+    assert!(pressure.backpressure.is_none());
+    fs::remove_file(&cache).unwrap();
+    let frame = collect(&[config], now);
+    let pressure = frame.accounts[0].pressure.as_ref().unwrap();
+    assert!(!pressure.fresh && pressure.observed_at.is_none());
+}
+
+#[test]
+fn depletion_estimate_is_anchored_at_sample_and_can_follow_reset_conditionally() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path(), "{ type: command, argv: [/bin/false] }");
+    let now = Utc::now();
+    let reset = now + Duration::minutes(30);
+    write(
+        &dir.path().join("state.json"),
+        json!({"accounts":{"account":{"windows":{"weekly":{"observed_at":now-Duration::minutes(1),"used_fraction":0.5,"resets_at":reset,"workers":2}},"aggregate_burn_history":{"weekly":[{"observed_at":now-Duration::minutes(11),"used_fraction":0.45,"resets_at":reset,"governed_workers":2}]}}}}),
+    );
+    let frame = collect(&[config], now);
+    let window = &frame.accounts[0].windows[0];
+    let empty = window.projected_empty_at.unwrap();
+    assert!(
+        (empty - (now - Duration::minutes(1) + Duration::seconds(6000)))
+            .num_seconds()
+            .abs()
+            <= 1
+    );
+    assert!(empty > reset);
+    assert!(render(&frame, 240).contains("reset occurs first"));
 }

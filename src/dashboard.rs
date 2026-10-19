@@ -1,6 +1,8 @@
 //! Read-only cached metrics. This module deliberately does not use source or fleet adapters.
 use crate::config::{AccountConfig, ActuatorConfig, Config, SourceConfig, WorkerObserverConfig};
-use crate::model::{same_reset_generation, QuotaSnapshot};
+use crate::model::{
+    same_reset_generation, BackpressureSnapshot, QuotaSnapshot, SaturationSnapshot,
+};
 use crate::state::{AccountState, AggregateBurnSample, WindowSample};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -38,6 +40,19 @@ pub struct AccountCard {
     pub windows: Vec<WindowCard>,
     pub cached_signals: Vec<String>,
     pub live_workers: Option<LiveWorkers>,
+    pub pressure: Option<PressureCard>,
+}
+
+/// Full-proxy interval observations; worker counts are not concurrent requests.
+#[derive(Debug, Serialize)]
+pub struct PressureCard {
+    pub observed_at: Option<DateTime<Utc>>,
+    pub fresh: bool,
+    pub saturation: Option<SaturationSnapshot>,
+    pub backpressure: Option<BackpressureSnapshot>,
+    pub minimum_attempts: u64,
+    pub minimum_window_seconds: u64,
+    pub concurrency_threshold: f64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -247,6 +262,8 @@ pub struct WindowCard {
     pub baseline_seconds: Option<i64>,
     pub lookback_seconds: u64,
     pub expected_remaining_percent_at_reset: Option<f64>,
+    /// Conditional time at the measured pace, before applying any future reset.
+    pub projected_empty_at: Option<DateTime<Utc>>,
     pub projection_assumption: String,
     pub history: Vec<HistoryPoint>,
 }
@@ -410,6 +427,51 @@ fn measured_rate(
     )
 }
 
+fn pressure_card(
+    snapshot: Option<&QuotaSnapshot>,
+    account: &AccountConfig,
+    now: DateTime<Utc>,
+    policy: &crate::config::ZaiSaturationConfig,
+) -> PressureCard {
+    let fresh = snapshot.is_some_and(|s| {
+        let age = age_seconds(now, s.observed_at);
+        s.fresh && age >= 0 && age as u64 <= account.utilization.stale_after_seconds
+    });
+    let mut saturation = snapshot
+        .and_then(|s| s.saturation.as_ref())
+        .filter(|s| s.validate().is_ok() && s.window_seconds > 0)
+        .cloned();
+    if let Some(signal) = saturation.as_mut() {
+        if !fresh
+            || signal.attempts < policy.minimum_attempts
+            || signal.window_seconds < policy.minimum_window_seconds
+        {
+            signal.upstream_concurrency_fraction = None;
+        }
+    }
+    let mut backpressure = snapshot
+        .and_then(|s| s.backpressure.as_ref())
+        .filter(|s| s.validate().is_ok() && s.window_seconds > 0)
+        .cloned();
+    if let Some(signal) = backpressure.as_mut() {
+        if !fresh
+            || signal.attempts < policy.minimum_attempts
+            || signal.window_seconds < policy.minimum_window_seconds
+        {
+            signal.upstream_429_fraction = None;
+        }
+    }
+    PressureCard {
+        observed_at: snapshot.map(|s| s.observed_at),
+        fresh,
+        saturation,
+        backpressure,
+        minimum_attempts: policy.minimum_attempts,
+        minimum_window_seconds: policy.minimum_window_seconds,
+        concurrency_threshold: policy.concurrency_fraction,
+    }
+}
+
 fn window_card(
     id: &str,
     sample: &WindowSample,
@@ -472,6 +534,19 @@ fn window_card(
     } else {
         None
     };
+    let projected_empty_at = if linear {
+        rate.filter(|r| *r > 0.0).and_then(|r| {
+            let seconds = ((1.0 - sample.used_fraction) * 100.0 / r * 3600.0).ceil();
+            if !seconds.is_finite() || seconds < 0.0 || seconds >= i64::MAX as f64 {
+                return None;
+            }
+            sample
+                .observed_at
+                .checked_add_signed(chrono::Duration::try_seconds(seconds as i64)?)
+        })
+    } else {
+        None
+    };
     Some(WindowCard {
         id: clean(id),
         observed_at: sample.observed_at,
@@ -487,6 +562,7 @@ fn window_card(
         baseline_seconds: baseline,
         lookback_seconds: lookback,
         expected_remaining_percent_at_reset: projected,
+        projected_empty_at,
         projection_assumption: if linear {
             "same account pace from sample to reset; includes interactive usage"
         } else {
@@ -528,6 +604,7 @@ pub fn collect(configs: &[PathBuf], now: DateTime<Utc>) -> Frame {
                     windows: Vec::new(),
                     cached_signals: Vec::new(),
                     live_workers: None,
+                    pressure: None,
                 });
                 continue;
             }
@@ -621,6 +698,11 @@ pub fn collect(configs: &[PathBuf], now: DateTime<Utc>) -> Frame {
                     .collect(),
                 cached_signals: live_notes,
                 live_workers: live,
+                pressure: account
+                    .utilization
+                    .zai_saturation
+                    .as_ref()
+                    .map(|policy| pressure_card(snapshot.as_ref(), account, now, policy)),
             };
             if let Some(snapshot) = &snapshot {
                 let age = age_seconds(now, snapshot.observed_at);
@@ -712,6 +794,16 @@ pub fn collect(configs: &[PathBuf], now: DateTime<Utc>) -> Frame {
                 }
             }
             if account.utilization.zai_saturation.is_some() {
+                if let Some(pressure) = &card.pressure {
+                    card.cached_signals.push(format!(
+                        "{}provider 1302 concurrency rejection rate: {} (full-proxy upstream attempts; not active agent count)",
+                        if pressure.fresh { "cached " } else { "STALE cached " },
+                        pressure.saturation.as_ref()
+                            .and_then(|s| s.upstream_concurrency_fraction)
+                            .map(|rate| format!("{:.1}%", rate * 100.0))
+                            .unwrap_or_else(|| "unknown".into())
+                    ));
+                }
                 card.cached_signals.push(format!(
                     "controller backpressure {:?}; saturation workers {} at {}",
                     cached.backpressure.mode,
@@ -835,6 +927,17 @@ pub fn render(frame: &Frame, width: usize) -> String {
                     .map(|v| format!("{v:.1}%"))
                     .unwrap_or_else(|| "unknown".into()),
                 w.projection_assumption
+            ));
+            lines.push(format!(
+                "  Empty at measured pace: {}{}",
+                time(w.projected_empty_at),
+                if w.projected_empty_at
+                    .is_some_and(|empty| empty > w.resets_at)
+                {
+                    " (reset occurs first; conditional, ignores future resets)"
+                } else {
+                    " (estimate)"
+                }
             ));
         }
         lines.extend(account.cached_signals.iter().cloned());

@@ -49,8 +49,8 @@ def metrics(start=10, requests=100, completed=80, pressure=3, classification=Tru
     return '\n'.join(lines)
 
 
-def sample(at=1000, start=10, requests=100, completed=80, concurrency=3, classified=True):
-    return dict(at=at, start=start, requests=requests, completed=completed, concurrency=concurrency, classified=classified, retries=4, capacity=2)
+def sample(at=1000, start=10, requests=100, completed=80, concurrency=3, classified=True, http_429=0, http_429_supported=True):
+    return dict(at=at, start=start, requests=requests, completed=completed, concurrency=concurrency, classified=classified, retries=4, capacity=2, http_429=http_429, http_429_supported=http_429_supported)
 
 
 class CollectorTests(unittest.TestCase):
@@ -60,6 +60,34 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(parsed["completed"], 80)
         self.assertEqual(parsed["retries"], 4)
         self.assertEqual(parsed["concurrency"], 3)
+        self.assertEqual(parsed["http_429"], 700)
+        self.assertTrue(parsed["http_429_supported"])
+
+    def test_http_429_interval_is_separate_from_1302_with_same_full_pool_denominator(self):
+        old = {"a": sample(http_429=100), "b": sample(start=20, http_429=50)}
+        new = {"a": sample(at=1300, requests=140, completed=110, concurrency=5, http_429=108),
+               "b": sample(at=1300, start=20, requests=120, completed=90, concurrency=4, http_429=54)}
+        result = collector.update_saturation(new, {"replicas": old})
+        self.assertEqual(result["upstream_concurrency_fraction"], 3 / 60)
+        self.assertEqual(result["backpressure"], {"attempts": 60, "window_seconds": 300, "upstream_429_fraction": 12 / 60})
+
+    def test_http_429_missing_family_old_baseline_reset_and_low_traffic_are_unknown(self):
+        _, parsed = collector.parse_metrics('\n'.join(line for line in metrics().splitlines()
+                                                     if 'upstream_errors_total' not in line), 1000)
+        self.assertFalse(parsed['http_429_supported'])
+        for old, new in [
+            (sample(http_429_supported=False), sample(at=1300, requests=140)),
+            (sample(), sample(at=1300, requests=140, http_429_supported=False)),
+            ({k: v for k, v in sample().items() if not k.startswith('http_429')}, sample(at=1300, requests=140)),
+            (sample(http_429=5), sample(at=1300, requests=140, http_429=4)),
+            (sample(), sample(at=1300, requests=120)),
+            (sample(), sample(at=1300, requests=140, http_429=41)),
+        ]:
+            result = collector.update_saturation({"a": new}, {"replicas": {"a": old}})
+            self.assertIsNotNone(result)
+            self.assertIsNone(result['backpressure']['upstream_429_fraction'])
+        result = collector.update_saturation({"a": sample(at=1300, requests=140)}, {"replicas": {"a": sample()}})
+        self.assertEqual(result['backpressure']['upstream_429_fraction'], 0)
 
     def test_unclassified_is_unknown(self):
         _, parsed = collector.parse_metrics(metrics(classification=False), 1000)

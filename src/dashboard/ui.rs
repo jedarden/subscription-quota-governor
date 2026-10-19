@@ -1,5 +1,5 @@
 //! Pure presentation of the read-only dashboard snapshot.
-use super::{AccountCard, Frame as Snapshot, WindowCard};
+use super::{AccountCard, Frame as Snapshot, PressureCard, WindowCard};
 use chrono::{DateTime, Utc};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
@@ -67,7 +67,7 @@ pub fn draw(frame: &mut Frame, data: &Snapshot, state: &mut UiState) {
             .block(panel(" WAITING FOR TELEMETRY ", BORDER)).wrap(Wrap { trim: true }).style(Style::default().fg(MUTED)), rows[1]);
     } else if state.details {
         details(frame, rows[1], data, state);
-    } else if content.width >= 108 && content.height >= 36 {
+    } else if content.width >= 108 && content.height >= 36 && data.accounts.len() <= 3 {
         overview(frame, rows[1], data, state);
     } else {
         compact(frame, rows[1], data, state);
@@ -105,6 +105,20 @@ fn primary(account: &AccountCard) -> Option<&WindowCard> {
         a.headroom_percentage_points
             .total_cmp(&b.headroom_percentage_points)
     })
+}
+
+fn depletion_window(account: &AccountCard) -> Option<&WindowCard> {
+    account
+        .windows
+        .iter()
+        .filter(|w| w.fresh && w.projected_empty_at.is_some())
+        .min_by_key(|w| {
+            (
+                w.projected_empty_at.is_some_and(|at| at > w.resets_at),
+                w.projected_empty_at,
+            )
+        })
+        .or_else(|| primary(account))
 }
 
 fn number(value: Option<u32>) -> String {
@@ -252,45 +266,46 @@ fn header(frame: &mut Frame, area: Rect, data: &Snapshot, state: &UiState) {
 }
 
 fn overview(frame: &mut Frame, area: Rect, data: &Snapshot, state: &UiState) {
-    let account = &data.accounts[state.selected];
-    let table_height = (account.windows.len() as u16 + 4).clamp(6, 9);
     let rows = Layout::vertical([
-        Constraint::Length(15),
+        Constraint::Length(16),
         Constraint::Min(9),
-        Constraint::Length(table_height),
+        Constraint::Length(7),
     ])
     .spacing(1)
     .split(area);
-    let count = data.accounts.len().min(3);
+    let count = data.accounts.len();
     let columns = Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count])
         .spacing(1)
         .split(rows[0]);
-    // More than three accounts remain reachable through navigation; show the selected group.
-    let start = state.selected / 3 * 3;
     for (offset, card_area) in columns.iter().enumerate() {
-        if let Some(card) = data.accounts.get(start + offset) {
+        if let Some(card) = data.accounts.get(offset) {
             provider_card(
                 frame,
                 *card_area,
                 card,
-                start + offset,
-                state.selected == start + offset,
+                offset,
+                state.selected == offset,
                 data.observed_at,
             );
         }
     }
-    let middle = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
+    let middle = Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count])
         .spacing(1)
         .split(rows[1]);
-    history(
-        frame,
-        middle[0],
-        account,
-        data.observed_at,
-        ACCENTS[state.selected % 3],
-    );
-    controller(frame, middle[1], account, data.observed_at, false, 0);
-    quota_table(frame, rows[2], account, data.observed_at, false);
+    for (index, account) in data.accounts.iter().enumerate() {
+        if account.pressure.is_some() {
+            pressure_panel(frame, middle[index], account, data.observed_at);
+        } else {
+            history(
+                frame,
+                middle[index],
+                account,
+                data.observed_at,
+                ACCENTS[index % 3],
+            );
+        }
+    }
+    fleet_table(frame, rows[2], data, state.selected);
 }
 
 fn provider_card(
@@ -301,6 +316,10 @@ fn provider_card(
     selected: bool,
     now: DateTime<Utc>,
 ) {
+    if account.pressure.is_some() {
+        pressure_card(frame, area, account, index, selected, now);
+        return;
+    }
     let accent = ACCENTS[index % 3];
     let (status, status_color) = health(account);
     let title = format!(
@@ -312,7 +331,7 @@ fn provider_card(
     let block = panel(title, if selected { accent } else { BORDER });
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let Some(window) = primary(account) else {
+    let Some(window) = depletion_window(account) else {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(bold(status, status_color)),
@@ -400,10 +419,13 @@ fn provider_card(
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            dim("At reset  "),
+            dim("EMPTY  "),
             bold(
-                forecast(window),
-                if window.expected_remaining_percent_at_reset == Some(0.0) {
+                empty_estimate(window, now),
+                if window
+                    .projected_empty_at
+                    .is_some_and(|at| at <= window.resets_at)
+                {
                     AMBER
                 } else {
                     TEXT
@@ -436,7 +458,10 @@ fn provider_card(
         lines[9],
     );
     frame.render_widget(
-        Paragraph::new(dim(format!("↳ {} · limiting headroom", window.id))),
+        Paragraph::new(vec![
+            Line::from(dim(format!("At reset  {}", forecast(window)))),
+            Line::from(dim(format!("↳ {} · forecast window", window.id))),
+        ]),
         lines[10],
     );
 }
@@ -459,6 +484,391 @@ fn forecast(window: &WindowCard) -> String {
         .expected_remaining_percent_at_reset
         .map(|n| format!("{n:.1}% left"))
         .unwrap_or_else(|| "unknown".into())
+}
+
+fn empty_estimate(window: &WindowCard, now: DateTime<Utc>) -> String {
+    if !window.fresh {
+        return "unknown".into();
+    }
+    let Some(at) = window.projected_empty_at else {
+        return "unknown".into();
+    };
+    let until = (at - now).num_seconds();
+    let estimate = if until <= 0 {
+        "due at measured pace".into()
+    } else {
+        format!("~{}", duration(until))
+    };
+    if at > window.resets_at {
+        format!("{estimate} · reset first")
+    } else {
+        estimate
+    }
+}
+
+fn eligible_pressure(pressure: &PressureCard, attempts: u64, seconds: u64) -> bool {
+    pressure.fresh
+        && pressure.observed_at.is_some()
+        && seconds > 0
+        && attempts >= pressure.minimum_attempts
+        && seconds >= pressure.minimum_window_seconds
+}
+
+fn pressure_fraction(pressure: &PressureCard, concurrency: bool) -> Option<f64> {
+    let value = if concurrency {
+        pressure.saturation.as_ref().and_then(|s| {
+            s.upstream_concurrency_fraction
+                .filter(|_| eligible_pressure(pressure, s.attempts, s.window_seconds))
+        })
+    } else {
+        pressure.backpressure.as_ref().and_then(|s| {
+            s.upstream_429_fraction
+                .filter(|_| eligible_pressure(pressure, s.attempts, s.window_seconds))
+        })
+    };
+    value.filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+}
+
+fn pressure_throughput(pressure: &PressureCard) -> String {
+    pressure
+        .saturation
+        .as_ref()
+        .filter(|s| {
+            pressure.fresh
+                && pressure.observed_at.is_some()
+                && s.window_seconds > 0
+                && s.completed_requests <= s.attempts
+        })
+        .map(|s| {
+            format!(
+                "{:.3} req/s",
+                s.completed_requests as f64 / s.window_seconds as f64
+            )
+        })
+        .unwrap_or_else(|| "unknown req/s".into())
+}
+
+fn percentage(value: Option<f64>) -> String {
+    value
+        .map(|n| format!("{:.1}%", n * 100.0))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn pressure_status(pressure: &PressureCard) -> (&'static str, Color) {
+    if pressure.observed_at.is_none() {
+        ("UNKNOWN", MUTED)
+    } else if !pressure.fresh {
+        ("STALE", AMBER)
+    } else {
+        ("FRESH", GREEN)
+    }
+}
+
+fn pressure_sample(pressure: &PressureCard, concurrency: bool) -> String {
+    let sample = if concurrency {
+        pressure
+            .saturation
+            .as_ref()
+            .map(|s| (s.attempts, s.window_seconds))
+    } else {
+        pressure
+            .backpressure
+            .as_ref()
+            .map(|s| (s.attempts, s.window_seconds))
+    };
+    sample
+        .map(|(n, seconds)| format!("{n}/{seconds}s"))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn pressure_unknown_reason(pressure: &PressureCard, concurrency: bool) -> String {
+    if pressure.observed_at.is_none() {
+        return "source age unknown".into();
+    }
+    if !pressure.fresh {
+        return if pressure.observed_at.is_some() {
+            "stale source"
+        } else {
+            "source age unknown"
+        }
+        .into();
+    }
+    let sample = if concurrency {
+        pressure
+            .saturation
+            .as_ref()
+            .map(|s| (s.attempts, s.window_seconds))
+    } else {
+        pressure
+            .backpressure
+            .as_ref()
+            .map(|s| (s.attempts, s.window_seconds))
+    };
+    let Some((attempts, seconds)) = sample else {
+        return "no cached sample".into();
+    };
+    if attempts < pressure.minimum_attempts {
+        return format!("{attempts}/{} minimum attempts", pressure.minimum_attempts);
+    }
+    if seconds < pressure.minimum_window_seconds || seconds == 0 {
+        return format!(
+            "{seconds}/{}s minimum interval",
+            pressure.minimum_window_seconds
+        );
+    }
+    "fraction not reported".into()
+}
+
+fn worker_summary(account: &AccountCard) -> Line<'static> {
+    Line::from(vec![
+        bold(number(account.live_workers.as_ref().map(|l| l.live)), TEXT),
+        dim(" live · "),
+        bold(
+            number(account.live_workers.as_ref().map(|l| l.executing)),
+            GREEN,
+        ),
+        dim(" busy · "),
+        bold(number(account.target_workers), TEXT),
+        dim(" target"),
+    ])
+}
+
+fn pressure_card(
+    frame: &mut Frame,
+    area: Rect,
+    account: &AccountCard,
+    index: usize,
+    selected: bool,
+    now: DateTime<Utc>,
+) {
+    let Some(pressure) = account.pressure.as_ref() else {
+        return;
+    };
+    let accent = ACCENTS[index % 3];
+    let title = format!(
+        " {} {}{} ",
+        index + 1,
+        provider_name(&account.account).to_uppercase(),
+        if selected { "  ◆" } else { "" }
+    );
+    let block = panel(title, if selected { accent } else { BORDER });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    let (status, color) = pressure_status(pressure);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            bold(format!("● {status}"), color),
+            dim(format!("  {}", age(now, pressure.observed_at))),
+        ])),
+        rows[0],
+    );
+    frame.render_widget(Paragraph::new(dim("UPSTREAM 429 RATE")), rows[1]);
+    let error_rate = pressure_fraction(pressure, false);
+    let large = error_rate
+        .map(|n| large_percent(n * 100.0, if n > 0.0 { AMBER } else { accent }))
+        .unwrap_or_else(|| {
+            Text::from(vec![
+                Line::from(""),
+                Line::from(bold("UNKNOWN", MUTED)),
+                Line::from(""),
+            ])
+        });
+    frame.render_widget(Paragraph::new(large), rows[2]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            dim("1302 concurrency  "),
+            bold(percentage(pressure_fraction(pressure, true)), TEXT),
+        ])),
+        rows[4],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            dim("Completed  "),
+            bold(pressure_throughput(pressure), TEXT),
+        ])),
+        rows[5],
+    );
+    let note = if error_rate.is_none() {
+        format!("429: {}", pressure_unknown_reason(pressure, false))
+    } else if pressure_fraction(pressure, true).is_none() {
+        format!("1302: {}", pressure_unknown_reason(pressure, true))
+    } else {
+        "Full-proxy request intervals".into()
+    };
+    frame.render_widget(Paragraph::new(dim(note)), rows[6]);
+    frame.render_widget(
+        Paragraph::new(dim(format!(
+            "429 attempts / window   {}",
+            pressure_sample(pressure, false)
+        ))),
+        rows[7],
+    );
+    frame.render_widget(
+        Paragraph::new(dim(format!(
+            "1302 attempts / window  {}",
+            pressure_sample(pressure, true)
+        ))),
+        rows[8],
+    );
+    frame.render_widget(Paragraph::new(worker_summary(account)), rows[9]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(dim(format!(
+                "Gate ≥{} attempts / ≥{}s",
+                pressure.minimum_attempts, pressure.minimum_window_seconds
+            ))),
+            Line::from(dim("Rolling quota · no empty forecast")),
+        ]),
+        rows[10],
+    );
+}
+
+fn pressure_lines(pressure: &PressureCard, now: DateTime<Utc>) -> Vec<Line<'static>> {
+    let (status, color) = pressure_status(pressure);
+    let concurrency = pressure_fraction(pressure, true);
+    let error_rate = pressure_fraction(pressure, false);
+    let mut lines = vec![
+        Line::from(vec![
+            bold(format!("● {status}"), color),
+            dim(format!(" · {}", age(now, pressure.observed_at))),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            dim("Upstream 429  "),
+            bold(
+                percentage(error_rate),
+                if error_rate.is_some_and(|r| r > 0.0) {
+                    AMBER
+                } else {
+                    TEXT
+                },
+            ),
+        ]),
+        Line::from(dim(if error_rate.is_none() {
+            pressure_unknown_reason(pressure, false)
+        } else {
+            format!("{} attempts / interval", pressure_sample(pressure, false))
+        })),
+        Line::from(""),
+        Line::from(vec![
+            dim("1302 concurrency  "),
+            bold(
+                percentage(concurrency),
+                if concurrency.is_some_and(|r| r >= pressure.concurrency_threshold) {
+                    AMBER
+                } else {
+                    TEXT
+                },
+            ),
+        ]),
+        Line::from(dim(if concurrency.is_none() {
+            pressure_unknown_reason(pressure, true)
+        } else {
+            format!("{} attempts / interval", pressure_sample(pressure, true))
+        })),
+        Line::from(dim(format!(
+            "Controller threshold {:.1}%",
+            pressure.concurrency_threshold * 100.0
+        ))),
+        Line::from(""),
+        Line::from(vec![
+            dim("Completed  "),
+            bold(pressure_throughput(pressure), TEXT),
+        ]),
+    ];
+    if let Some(sample) = &pressure.saturation {
+        lines.push(Line::from(dim(format!(
+            "{} completed / {}s",
+            sample.completed_requests, sample.window_seconds
+        ))));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(bold("MINIMUM EVIDENCE", TEXT)),
+        Line::from(dim(format!(
+            "≥{} attempts · ≥{}s interval",
+            pressure.minimum_attempts, pressure.minimum_window_seconds
+        ))),
+        Line::from(dim("Unknown = missing, stale or below gate.")),
+        Line::from(""),
+        Line::from(dim("1302 = concurrency rejections.")),
+        Line::from(dim("429 = upstream rate limiting.")),
+        Line::from(dim("Request rates ≠ live agents.")),
+    ]);
+    lines
+}
+
+fn pressure_panel(frame: &mut Frame, area: Rect, account: &AccountCard, now: DateTime<Utc>) {
+    if let Some(pressure) = &account.pressure {
+        frame.render_widget(
+            Paragraph::new(pressure_lines(pressure, now))
+                .block(panel(" ZAI / REQUEST PRESSURE ", BORDER))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+    }
+}
+
+fn fleet_table(frame: &mut Frame, area: Rect, data: &Snapshot, selected: usize) {
+    let header = Row::new([
+        "GOVERNOR",
+        "LIVE",
+        "ACTIVE",
+        "IDLE",
+        "TARGET",
+        "CACHED CONTROLLER DECISION",
+    ])
+    .style(Style::default().fg(MUTED));
+    let rows = data.accounts.iter().enumerate().map(|(index, a)| {
+        Row::new(vec![
+            Cell::from(format!(
+                "{}{}",
+                if index == selected { "◆ " } else { "  " },
+                provider_name(&a.account)
+            )),
+            Cell::from(number(a.live_workers.as_ref().map(|l| l.live))),
+            Cell::from(number(a.live_workers.as_ref().map(|l| l.executing)))
+                .style(Style::default().fg(GREEN)),
+            Cell::from(number(a.live_workers.as_ref().map(|l| l.idle))),
+            Cell::from(number(a.target_workers)),
+            Cell::from(human(&a.reason)),
+        ])
+        .style(Style::default().fg(if index == selected { TEXT } else { MUTED }))
+    });
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Percentage(21),
+                Constraint::Percentage(7),
+                Constraint::Percentage(8),
+                Constraint::Percentage(7),
+                Constraint::Percentage(8),
+                Constraint::Percentage(49),
+            ],
+        )
+        .header(header)
+        .column_spacing(1)
+        .block(panel(
+            " ALL GOVERNORS / FLEET · Enter policy, holds & quota details ",
+            BORDER,
+        )),
+        area,
+    );
 }
 
 fn large_percent(value: f64, color: Color) -> Text<'static> {
@@ -530,7 +940,7 @@ fn history(
     now: DateTime<Utc>,
     accent: Color,
 ) {
-    let Some(window) = primary(account) else {
+    let Some(window) = depletion_window(account) else {
         frame.render_widget(
             Paragraph::new("No saved quota history available")
                 .block(panel(" QUOTA TRAJECTORY ", BORDER)),
@@ -539,27 +949,42 @@ fn history(
         return;
     };
     let block = panel(
-        format!(" {} / {} · quota trajectory ", account.account, window.id),
+        format!(" {} / quota trajectory ", provider_name(&account.account)),
         BORDER,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let narrow = inner.width < 55;
     let rows = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(if narrow { 2 } else { 1 }),
         Constraint::Min(3),
         Constraint::Length(2),
     ])
     .split(inner);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("━ saved", Style::default().fg(accent)),
-            dim("   "),
-            Span::styled("━ projection", Style::default().fg(AMBER)),
-            dim(format!(
-                "   ─ {:.0}% target · sample = 0h",
-                window.target_percent
-            )),
-        ])),
+        Paragraph::new(if narrow {
+            vec![
+                Line::from(vec![
+                    Span::styled("━ saved", Style::default().fg(accent)),
+                    dim("  "),
+                    Span::styled("━ projected", Style::default().fg(AMBER)),
+                ]),
+                Line::from(dim(format!(
+                    "─ {:.0}% target · sample = 0h",
+                    window.target_percent
+                ))),
+            ]
+        } else {
+            vec![Line::from(vec![
+                Span::styled("━ saved", Style::default().fg(accent)),
+                dim("   "),
+                Span::styled("━ projection", Style::default().fg(AMBER)),
+                dim(format!(
+                    "   ─ {:.0}% target · sample = 0h",
+                    window.target_percent
+                )),
+            ])]
+        }),
         rows[0],
     );
     let origin = window.observed_at;
@@ -629,7 +1054,18 @@ fn history(
             duration((midpoint.abs() * 3600.0) as i64)
         )
     };
-    let xlabels = [Line::from(left), Line::from(middle), Line::from(right)];
+    let xlabels = if narrow {
+        vec![
+            Line::from(format!("{xmin:.1}h")),
+            Line::from(if future.is_empty() {
+                "sample".into()
+            } else {
+                format!("{xmax:.1}h reset")
+            }),
+        ]
+    } else {
+        vec![Line::from(left), Line::from(middle), Line::from(right)]
+    };
     let chart = Chart::new(datasets)
         .legend_position(None)
         .x_axis(
@@ -658,6 +1094,14 @@ fn history(
         } else {
             format!("Forecast unavailable · {}", human(&window.rate_status))
         }
+    } else if narrow {
+        format!(
+            "{} saved · {:.2} pp/h\nSame pace · stops at reset",
+            window.history.len(),
+            window
+                .consumption_percentage_points_per_hour
+                .unwrap_or_default()
+        )
     } else {
         format!(
             "{} saved points · {:.2} pp/h · constant historical pace, includes interactive usage",
@@ -924,85 +1368,180 @@ fn quota_table(
     );
 }
 
+fn all_governor_lines(
+    data: &Snapshot,
+    state: &UiState,
+    width: u16,
+    condensed: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, account) in data.accounts.iter().enumerate() {
+        if index > 0 && !condensed {
+            lines.push(Line::from(""));
+        }
+        let name = format!(
+            "{}{}  ",
+            if index == state.selected {
+                "› "
+            } else {
+                "  "
+            },
+            provider_name(&account.account)
+        );
+        let accent = ACCENTS[index % 3];
+        if let Some(pressure) = &account.pressure {
+            let mut first = vec![
+                bold(name, accent),
+                dim("429 "),
+                bold(percentage(pressure_fraction(pressure, false)), TEXT),
+                dim(" · 1302 "),
+                bold(percentage(pressure_fraction(pressure, true)), TEXT),
+            ];
+            if condensed {
+                first.extend([dim(" · "), dim(pressure_throughput(pressure))]);
+            }
+            lines.push(Line::from(first));
+            if !condensed {
+                let (status, color) = pressure_status(pressure);
+                lines.push(Line::from(vec![
+                    dim("  "),
+                    bold(pressure_throughput(pressure), TEXT),
+                    dim(format!(
+                        " · {}→{} agents · ",
+                        number(account.live_workers.as_ref().map(|l| l.live)),
+                        number(account.target_workers)
+                    )),
+                    bold(status, color),
+                ]));
+                lines.push(Line::from(dim(format!(
+                    "  attempts 429 {} · 1302 {} · min {}/{}s",
+                    pressure_sample(pressure, false),
+                    pressure_sample(pressure, true),
+                    pressure.minimum_attempts,
+                    pressure.minimum_window_seconds
+                ))));
+            }
+        } else if let Some(window) = depletion_window(account) {
+            let mut first = vec![
+                bold(name, accent),
+                bold(
+                    format!("{:.1}%", (100.0 - window.used_percent).clamp(0.0, 100.0)),
+                    TEXT,
+                ),
+                dim(" left · "),
+                bold(rate(window), TEXT),
+            ];
+            if condensed {
+                first.extend([
+                    dim(" · EMPTY "),
+                    bold(
+                        empty_estimate(window, data.observed_at),
+                        if window.fresh { TEXT } else { AMBER },
+                    ),
+                ]);
+            } else {
+                first.push(dim(format!(
+                    " · {}→{} agents",
+                    number(account.live_workers.as_ref().map(|l| l.live)),
+                    number(account.target_workers)
+                )));
+            }
+            lines.push(Line::from(first));
+            if !condensed {
+                lines.push(Line::from(vec![
+                    dim("  EMPTY "),
+                    bold(
+                        empty_estimate(window, data.observed_at),
+                        if window.fresh { TEXT } else { AMBER },
+                    ),
+                    dim(format!(
+                        " · reset {}",
+                        duration((window.resets_at - data.observed_at).num_seconds())
+                    )),
+                ]));
+                if width >= 70 {
+                    lines.push(Line::from(dim(format!(
+                        "  At reset {} · sample {}{}",
+                        forecast(window),
+                        age(data.observed_at, Some(window.observed_at)),
+                        if window.fresh { "" } else { " · STALE" }
+                    ))));
+                }
+            }
+        } else {
+            lines.push(Line::from(vec![
+                bold(name, accent),
+                dim("quota unknown · no usable cached observation"),
+            ]));
+            if !condensed {
+                lines.push(Line::from(dim(format!(
+                    "  {}",
+                    human(&account.cache_status)
+                ))));
+            }
+        }
+    }
+    lines
+}
+
 fn compact(frame: &mut Frame, area: Rect, data: &Snapshot, state: &UiState) {
-    let account = &data.accounts[state.selected];
-    let table_height = (data.accounts.len() as u16 + 3)
-        .min(7)
-        .min(area.height.saturating_sub(3));
-    let rows = Layout::vertical([Constraint::Length(table_height), Constraint::Min(0)])
+    let full = all_governor_lines(data, state, area.width, false);
+    let needed = full.len().saturating_add(2);
+    let (mut lines, condensed) = if needed <= area.height as usize {
+        (full, false)
+    } else {
+        (all_governor_lines(data, state, area.width, true), true)
+    };
+    if condensed {
+        let capacity = area.height.saturating_sub(4) as usize;
+        let total = lines.len();
+        lines.truncate(capacity);
+        lines.push(Line::from(bold(
+            format!(
+                "Enlarge: {} governors need {} rows for full metrics",
+                data.accounts.len(),
+                needed + 5
+            ),
+            AMBER,
+        )));
+        if capacity < total {
+            lines.push(Line::from(dim(format!(
+                "{} of {} governors fit this terminal",
+                capacity, total
+            ))));
+        }
+    }
+    let height = (lines.len().saturating_add(2) as u16).min(area.height);
+    let summary = Paragraph::new(lines).block(panel(
+        format!(
+            " ALL {} GOVERNORS / QUOTAS & REQUEST PRESSURE ",
+            data.accounts.len()
+        ),
+        BORDER,
+    ));
+    if area.height.saturating_sub(height) < 5 {
+        frame.render_widget(summary, area);
+        return;
+    }
+    let rows = Layout::vertical([Constraint::Length(height), Constraint::Min(0)])
         .spacing(1)
         .split(area);
-    let header = Row::new(["PROVIDER", "LEFT", "PACE / H", "RESET", "LIVE→TGT", "STATE"])
-        .style(Style::default().fg(MUTED));
-    let providers = data.accounts.iter().enumerate().map(|(index, a)| {
-        let w = primary(a);
-        let (status, color) = health(a);
-        Row::new(vec![
-            Cell::from(format!(
-                "{}{}",
-                if index == state.selected {
-                    "› "
-                } else {
-                    "  "
-                },
-                provider_name(&a.account)
-            )),
-            Cell::from(
-                w.map(|w| format!("{:.1}%", (100.0 - w.used_percent).clamp(0.0, 100.0)))
-                    .unwrap_or_else(|| "?".into()),
-            ),
-            Cell::from(w.map(rate).unwrap_or_else(|| "unknown".into())),
-            Cell::from(
-                w.map(|w| duration((w.resets_at - data.observed_at).num_seconds()))
-                    .unwrap_or_else(|| "?".into()),
-            ),
-            Cell::from(format!(
-                "{}→{}",
-                number(a.live_workers.as_ref().map(|l| l.live)),
-                number(a.target_workers)
-            )),
-            Cell::from(status).style(Style::default().fg(color)),
-        ])
-        .style(
-            Style::default()
-                .fg(if index == state.selected { TEXT } else { MUTED })
-                .bg(if index == state.selected {
-                    BORDER
-                } else {
-                    PANEL
-                }),
-        )
-    });
-    frame.render_widget(
-        Table::new(
-            providers,
-            [
-                Constraint::Percentage(25),
-                Constraint::Percentage(11),
-                Constraint::Percentage(18),
-                Constraint::Percentage(17),
-                Constraint::Percentage(16),
-                Constraint::Percentage(13),
-            ],
-        )
-        .header(header)
-        .column_spacing(1)
-        .block(panel(" PROVIDERS · ↑↓ select ", BORDER)),
-        rows[0],
-    );
-    if rows[1].height >= 17 {
-        let detail = Layout::vertical([Constraint::Min(9), Constraint::Length(7)])
+    frame.render_widget(summary, rows[0]);
+    let account = &data.accounts[state.selected];
+    if rows[1].height >= 7 && rows[1].width >= 108 {
+        let parts = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
             .spacing(1)
             .split(rows[1]);
-        history(
+        quota_table(frame, parts[0], account, data.observed_at, false);
+        controller(
             frame,
-            detail[0],
+            parts[1],
             account,
             data.observed_at,
-            ACCENTS[state.selected % 3],
+            false,
+            state.scroll,
         );
-        compact_summary(frame, detail[1], account, data.observed_at, state.scroll);
-    } else {
+    } else if rows[1].height >= 4 {
         compact_summary(frame, rows[1], account, data.observed_at, state.scroll);
     }
 }
@@ -1015,6 +1554,9 @@ fn compact_summary(
     scroll: u16,
 ) {
     let mut lines = vec![];
+    if let Some(pressure) = &account.pressure {
+        lines.extend(pressure_lines(pressure, now));
+    }
     if let Some(w) = primary(account) {
         lines.push(Line::from(vec![
             bold(format!("{}  ", w.id), TEXT),
@@ -1078,6 +1620,11 @@ fn details(frame: &mut Frame, area: Rect, data: &Snapshot, state: &UiState) {
         ))),
         Line::from(""),
     ];
+    if let Some(pressure) = &account.pressure {
+        lines.push(Line::from(bold("REQUEST PRESSURE / 429 & 1302", TEXT)));
+        lines.extend(pressure_lines(pressure, data.observed_at));
+        lines.push(Line::from(""));
+    }
     for w in &account.windows {
         lines.push(Line::from(bold(
             format!("{}{}", w.id, if w.fresh { "" } else { "  [STALE]" }),
@@ -1113,6 +1660,14 @@ fn details(frame: &mut Frame, area: Rect, data: &Snapshot, state: &UiState) {
             "  Expected at reset: {} · {}",
             forecast(w),
             human(&w.projection_assumption)
+        )));
+        lines.push(Line::from(format!(
+            "  Conditional EMPTY: {}{}",
+            empty_estimate(w, data.observed_at),
+            w.projected_empty_at
+                .filter(|_| w.fresh)
+                .map(|at| format!(" ({})", at.format("%m-%d %H:%M UTC")))
+                .unwrap_or_default()
         )));
         lines.push(Line::from(dim(format!(
             "  Source {} · {} saved observations",
@@ -1188,9 +1743,7 @@ fn help(frame: &mut Frame, area: Rect) {
         Line::from(dim(
             "Pace = measured percentage points per hour, same reset.",
         )),
-        Line::from(dim(
-            "Forecast = constant historical pace; rolling quotas stay unknown.",
-        )),
+        Line::from(dim("EMPTY = same pace; 'reset first' is conditional.")),
         Line::from(dim(
             "Live agents are locally verified. Targets are controller intent.",
         )),
@@ -1210,6 +1763,7 @@ fn help(frame: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::dashboard::{HistoryPoint, LiveWorkers};
+    use crate::model::{BackpressureSnapshot, SaturationSnapshot};
     use chrono::{Duration, TimeZone};
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -1241,6 +1795,24 @@ mod tests {
                         "Pending retirements: 1 (cached)".into(),
                         "Reviewed work holds: 1 native-policy, 2 external (cached)".into(),
                     ],
+                    pressure: (index == 2).then(|| PressureCard {
+                        observed_at: Some(now - Duration::seconds(20)),
+                        fresh: true,
+                        saturation: Some(SaturationSnapshot {
+                            completed_requests: 30,
+                            attempts: 40,
+                            window_seconds: 300,
+                            upstream_concurrency_fraction: Some(0.25),
+                        }),
+                        backpressure: Some(BackpressureSnapshot {
+                            upstream_429_fraction: Some(0.10),
+                            attempts: 40,
+                            window_seconds: 300,
+                        }),
+                        minimum_attempts: 10,
+                        minimum_window_seconds: 60,
+                        concurrency_threshold: 0.5,
+                    }),
                     windows: vec![WindowCard {
                         id: if index == 2 { "rolling" } else { "weekly" }.into(),
                         observed_at: now - Duration::seconds(20),
@@ -1260,6 +1832,8 @@ mod tests {
                         } else {
                             Some(0.0)
                         },
+                        projected_empty_at: (index != 2)
+                            .then_some(now + Duration::hours(5) - Duration::seconds(20)),
                         projection_assumption: if index == 2 {
                             "unknown: rolling/request quota; linear projection not valid"
                         } else {
@@ -1315,8 +1889,11 @@ mod tests {
             "0.0% left",
             "quota trajectory",
             "CONTROLLER",
-            "Retiring",
-            "QUOTA WINDOWS",
+            "MINIMUM EVIDENCE",
+            "ALL GOVERNORS",
+            "EMPTY",
+            "Upstream 429  10.0%",
+            "1302 concurrency  25.0%",
         ] {
             assert!(screen.contains(label), "missing {label}\n{screen}");
         }
@@ -1360,7 +1937,7 @@ mod tests {
             24,
         );
         assert!(screen.contains("unknown"));
-        assert!(screen.contains("rolling/request quota"));
+        assert!(screen.contains("1302"));
     }
 
     #[test]
@@ -1372,6 +1949,202 @@ mod tests {
         assert_eq!(projected[1], (5.0, 100.0));
         assert!(projected[2].0 > 8.0);
         assert_eq!(projected[2].1, 100.0);
+    }
+
+    #[test]
+    fn all_operating_forecasts_and_pressure_are_simultaneous_at_every_supported_size() {
+        let mut data = fixture();
+        let w = &mut data.accounts[1].windows[0];
+        w.used_percent = 40.0;
+        w.consumption_percentage_points_per_hour = Some(2.0);
+        w.projected_empty_at = Some(w.observed_at + Duration::hours(30));
+        w.expected_remaining_percent_at_reset = Some(44.0);
+        w.history[0].used_percent = 38.0;
+        w.history[1].used_percent = 40.0;
+        for (width, height) in [(120, 54), (80, 24), (60, 16)] {
+            let screen = render(&data, &mut UiState::default(), width, height);
+            assert!(
+                screen.matches("EMPTY").count() >= 2,
+                "{width}x{height}\n{screen}"
+            );
+            for label in [
+                "8.00 pp/h",
+                "2.00 pp/h",
+                "~4h 59m",
+                "~1d 05h",
+                "reset first",
+                "1302",
+                "25.0%",
+                "0.100 req/s",
+            ] {
+                assert!(
+                    screen.contains(label),
+                    "missing {label} at {width}x{height}\n{screen}"
+                );
+            }
+            assert!(
+                screen.contains("429 10.0%") || screen.contains("429  10.0%"),
+                "{screen}"
+            );
+            if width == 120 {
+                assert_eq!(screen.matches("quota trajectory").count(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn after_reset_depletion_is_explicitly_conditional_and_chart_stops_at_reset() {
+        let mut data = fixture();
+        let w = &mut data.accounts[0].windows[0];
+        w.consumption_percentage_points_per_hour = Some(2.0);
+        w.projected_empty_at = Some(w.observed_at + Duration::hours(20));
+        w.expected_remaining_percent_at_reset = Some(24.0);
+        assert!(empty_estimate(w, data.observed_at).contains("reset first"));
+        let projected = projection(w, w.observed_at);
+        let end = projected.last().unwrap();
+        assert_eq!(
+            end.0,
+            (w.resets_at - w.observed_at).num_seconds() as f64 / 3600.0
+        );
+        assert!(end.1 < 100.0);
+        let screen = render(
+            &data,
+            &mut UiState {
+                details: true,
+                ..UiState::default()
+            },
+            120,
+            54,
+        );
+        assert!(screen.contains("Conditional EMPTY:"));
+        assert!(screen.contains("reset first"));
+    }
+
+    #[test]
+    fn earliest_before_reset_depletion_wins_over_a_smaller_headroom_conditional_window() {
+        let mut data = fixture();
+        let mut short = fixture().accounts.remove(0).windows.remove(0);
+        short.id = "short".into();
+        short.headroom_percentage_points = 1.0;
+        short.projected_empty_at = Some(data.observed_at + Duration::hours(1));
+        short.resets_at = data.observed_at + Duration::minutes(30);
+        data.accounts[0].windows.push(short);
+        assert_eq!(primary(&data.accounts[0]).unwrap().id, "short");
+        assert_eq!(depletion_window(&data.accounts[0]).unwrap().id, "weekly");
+        data.accounts[0].windows[1].resets_at = data.observed_at + Duration::hours(3);
+        assert_eq!(depletion_window(&data.accounts[0]).unwrap().id, "short");
+    }
+
+    #[test]
+    fn every_governor_is_present_without_changing_provider_pages() {
+        let mut data = fixture();
+        for name in ["Fourth", "Fifth", "Sixth", "Seventh"] {
+            let mut extra = fixture().accounts.remove(0);
+            extra.account = name.into();
+            data.accounts.push(extra);
+        }
+        for (width, height) in [(120, 54), (80, 24), (60, 16)] {
+            for selected in [0, 6] {
+                let screen = render(
+                    &data,
+                    &mut UiState {
+                        selected,
+                        ..UiState::default()
+                    },
+                    width,
+                    height,
+                );
+                for name in [
+                    "Anthropic",
+                    "Codex",
+                    "Z.ai",
+                    "Fourth",
+                    "Fifth",
+                    "Sixth",
+                    "Seventh",
+                ] {
+                    assert!(
+                        screen.contains(name),
+                        "missing {name} at {width}x{height}\n{screen}"
+                    );
+                }
+            }
+        }
+        for i in 8..=12 {
+            let mut extra = fixture().accounts.remove(0);
+            extra.account = format!("Governor{i}");
+            data.accounts.push(extra);
+        }
+        let screen = render(&data, &mut UiState::default(), 60, 16);
+        assert!(screen.contains("Enlarge:"));
+        assert!(screen.contains("of 12 governors fit"));
+    }
+
+    #[test]
+    fn stale_missing_and_insufficient_pressure_stay_unknown_with_evidence() {
+        for case in [
+            "stale",
+            "missing",
+            "low count",
+            "short interval",
+            "fraction absent",
+        ] {
+            let mut data = fixture();
+            let p = data.accounts[2].pressure.as_mut().unwrap();
+            let expected = match case {
+                "stale" => {
+                    p.fresh = false;
+                    "stale source"
+                }
+                "missing" => {
+                    p.saturation = None;
+                    p.backpressure = None;
+                    "no cached sample"
+                }
+                "low count" => {
+                    p.saturation.as_mut().unwrap().attempts = 2;
+                    p.saturation.as_mut().unwrap().completed_requests = 1;
+                    p.backpressure.as_mut().unwrap().attempts = 2;
+                    "2/10 minimum attempts"
+                }
+                "short interval" => {
+                    p.saturation.as_mut().unwrap().window_seconds = 20;
+                    p.backpressure.as_mut().unwrap().window_seconds = 20;
+                    "20/60s minimum interval"
+                }
+                _ => {
+                    p.saturation.as_mut().unwrap().upstream_concurrency_fraction = None;
+                    p.backpressure.as_mut().unwrap().upstream_429_fraction = None;
+                    "fraction not reported"
+                }
+            };
+            assert_eq!(pressure_fraction(p, false), None);
+            assert_eq!(pressure_fraction(p, true), None);
+            let screen = render(&data, &mut UiState::default(), 120, 54);
+            assert!(screen.contains(expected), "{case}\n{screen}");
+            assert!(screen.contains("Upstream 429  unknown"));
+            assert!(screen.contains("1302 concurrency  unknown"));
+            assert!(!screen.contains("Upstream 429  0.0%"));
+        }
+    }
+
+    #[test]
+    fn raw_completion_throughput_remains_measurable_below_pressure_gate() {
+        let mut data = fixture();
+        let p = data.accounts[2].pressure.as_mut().unwrap();
+        p.minimum_attempts = 30;
+        let sample = p.saturation.as_mut().unwrap();
+        sample.completed_requests = 29;
+        sample.attempts = 29;
+        sample.window_seconds = 309;
+        assert_eq!(pressure_throughput(p), "0.094 req/s");
+        assert_eq!(pressure_fraction(p, true), None);
+        assert!(pressure_unknown_reason(p, true).contains("29/30 minimum attempts"));
+        p.fresh = false;
+        assert_eq!(pressure_throughput(p), "unknown req/s");
+        p.fresh = true;
+        p.saturation.as_mut().unwrap().completed_requests = 31;
+        assert_eq!(pressure_throughput(p), "unknown req/s");
     }
 
     #[test]
