@@ -97,6 +97,12 @@ artifact leaves all three running governor executables intact. The launcher
 must match its maintained source. The owning bead records the exact tab, pane,
 installation, provenance and actual verification.
 
+ZAI's existing source timer runs the maintained `scripts/zai-collector.py`,
+installed as `~/.local/lib/subgov-zai/zai-collector.py`. Install it atomically and
+keep its prior copy and hash alongside the dashboard artifact. A new 429 counter
+needs a complete comparable interval; older baselines show unknown during that
+transition. This does not require restarting a governor or enabling a policy.
+
 The dashboard reads existing state, readiness and cached source/helper files.
 It does not acquire a governor state lock, quarantine malformed files, invoke
 an observer/actuator or fetch an OAuth/Codex/proxy snapshot. Its terminal
@@ -106,3 +112,5 @@ To roll back, quit only the Subgov dashboard, restore the previous display
 symlink and launcher if present, and relaunch that tab. Closing the display
 does not stop agents or governors. Preserve every other metrics tab and any
 later edits to the production configurations.
+If the collector also needs rollback, atomically restore its recorded prior
+copy to the same installed path; its existing timer will use it on the next run.
