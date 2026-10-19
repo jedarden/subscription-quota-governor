@@ -1,3 +1,4 @@
 /target/
+scripts/__pycache__/
 *.tmp
 *.json.lock
