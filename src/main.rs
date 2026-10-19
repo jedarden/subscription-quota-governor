@@ -55,6 +55,21 @@ enum Commands {
     /// Print each account's readiness classification from the last
     /// completed cycle, without inspecting credentials or live sources.
     Status,
+    /// Watch cached quota and controller metrics without contacting providers.
+    #[command(alias = "tui")]
+    Dashboard {
+        /// One or more governor configurations to display together.
+        #[arg(long, required = true, num_args = 1..)]
+        configs: Vec<PathBuf>,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        interval_seconds: u64,
+        /// Print one frame and exit (also the default with redirected output).
+        #[arg(long)]
+        once: bool,
+        /// Print a machine-readable cached frame and exit.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check that every configured NEEDLE adapter is ready to actuate.
     Doctor,
     /// Read a no-secret inventory and reject overlapping controller ownership.
@@ -126,6 +141,16 @@ fn run_cli() -> Result<(), GovernorError> {
         return subscription_governor::preflight::run(inventory)
             .map_err(GovernorError::CliOrConfig);
     }
+    if let Commands::Dashboard {
+        configs,
+        interval_seconds,
+        once,
+        json,
+    } = &cli.command
+    {
+        return subscription_governor::dashboard::run(configs, *interval_seconds, *once, *json)
+            .map_err(GovernorError::State);
+    }
     let config = Config::load(&cli.config).map_err(GovernorError::CliOrConfig)?;
     match cli.command {
         Commands::Check => {
@@ -140,6 +165,7 @@ fn run_cli() -> Result<(), GovernorError> {
         Commands::Status => status(&config),
         Commands::Doctor => doctor(&config),
         Commands::Preflight { .. } => unreachable!("preflight handled before config loading"),
+        Commands::Dashboard { .. } => unreachable!("dashboard handled before config loading"),
     }
 }
 
