@@ -313,6 +313,20 @@ class ProductiveTests(unittest.TestCase):
                 adapter.actuate(settings, 1)
             run.assert_called_once_with(["systemctl", "--user", "start", "--no-block", "needle-worker@next-sol.service"])
 
+    def test_child_bearing_idle_worker_does_not_block_retiring_another_idle_slot(self):
+        with tempfile.TemporaryDirectory() as root:
+            settings = self.settings(Path(root))
+            busy = {"worker_id": "sg-codex-1", "state": "EXECUTING", "current_bead": "busy"}
+            selecting = {"worker_id": "sg-codex-2", "state": "SELECTING", "is_idle": True, "current_bead": None}
+            free = {"worker_id": "sg-codex-3", "state": "EXHAUSTED", "is_idle": True, "current_bead": None}
+            def rank(worker):
+                return ({"sg-codex-1": 0, "sg-codex-2": 1, "sg-codex-3": 2}[worker["worker_id"]], worker["worker_id"])
+            with patch.object(adapter, "workers", return_value=[busy, selecting, free]), \
+                 patch.object(adapter, "retention_order", side_effect=rank), \
+                 patch.object(adapter, "stop_idle", return_value=True) as stop:
+                adapter.actuate(settings, 2)
+            stop.assert_called_once_with(settings, free)
+
 
 if __name__ == "__main__":
     unittest.main()

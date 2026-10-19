@@ -345,6 +345,19 @@ def idle(worker):
             and (worker.get("is_idle") is True or worker.get("state") == "ADMISSION_BLOCKED"))
 
 
+def retention_order(worker):
+    if not idle(worker):
+        return (0, worker["worker_id"])
+    try:
+        tasks = list(Path("/proc", str(worker["pid"]), "task").iterdir())
+        child_bearing = not tasks or any((task / "children").read_text().strip() for task in tasks)
+    except (OSError, KeyError):
+        child_bearing = True
+    # Prefer keeping an idle supervisor with children over a child-free idle
+    # slot. This is only selection: stop_idle still freezes and rechecks.
+    return (1 if child_bearing else 2, worker["worker_id"])
+
+
 def stop_idle(settings, worker):
     if not idle(worker):
         return False
@@ -397,7 +410,7 @@ def actuate(settings, desired):
         pending = []
         # Preserve busy workers first. A retirement marker must never remain on
         # a slot selected to stay merely because an earlier stop was deferred.
-        keep = {worker["worker_id"] for worker in sorted(live, key=lambda value: (idle(value), value["worker_id"]))[:desired]}
+        keep = {worker["worker_id"] for worker in sorted(live, key=retention_order)[:desired]}
         for worker in live:
             entry = adopted(settings, worker)
             if entry and entry.get("unit") and worker["worker_id"] in keep:
