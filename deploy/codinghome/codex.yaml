@@ -15,10 +15,21 @@ accounts:
       max_scale_up_per_cycle: 2
       max_scale_down_per_cycle: 1
       observer:
-        type: needle_status
-        agent: codex-gpt-5.6-luna-xhigh
-        identifier_prefix: sg-codex-
-        stale_after_seconds: 60
+        type: command
+        argv:
+        - /run/current-system/sw/bin/systemd-run
+        - --user
+        - --wait
+        - --pipe
+        - --collect
+        - --quiet
+        - --property=NoNewPrivileges=yes
+        - /run/current-system/sw/bin/python3
+        - -B
+        - /home/coding/.local/lib/subgov-codex/codex-productive.py
+        - --settings
+        - /home/coding/.config/subgov/codex-productive.json
+        - observe
       actuator:
         type: command
         argv:

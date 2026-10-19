@@ -26,5 +26,56 @@
       "admission_evidence": "Notes record operator admission 2026-10-16; reviewed under subgov-564a5b9a.",
       "external_hold": "Awaiting write-capable iad-ci credential and live cross-build acceptance; source must not dispatch until this hold is explicitly resolved and revision reviewed."
     }
-  ]
+  ],
+  "unit_dir": "/home/coding/.config/systemd/user",
+  "adopted_workers": [
+    {
+      "worker_id": "codex-sol-commitgraph",
+      "agent": "codex-gpt-6-sol-xhigh",
+      "workspace": "/home/coding/ROTA",
+      "unit": "needle-worker@codex-sol-commitgraph.service"
+    },
+    {
+      "worker_id": "codex-sol-armor",
+      "agent": "codex-gpt-6-sol-xhigh",
+      "workspace": "/home/coding/shephrd",
+      "unit": "needle-worker@codex-sol-armor.service"
+    },
+    {
+      "worker_id": "codex-sol-pdftract",
+      "agent": "codex-gpt-6-sol-xhigh",
+      "workspace": "/home/coding/NEEDLE",
+      "unit": "needle-worker@codex-sol-pdftract.service"
+    },
+    {
+      "worker_id": "codex-sol-rmp",
+      "agent": "codex-gpt-6-sol-xhigh",
+      "workspace": "/home/coding/jedarden.com",
+      "unit": "needle-worker@codex-sol-rmp.service"
+    },
+    {
+      "worker_id": "codex-luna-trace",
+      "agent": "codex-gpt-6-luna-xhigh",
+      "workspace": "/home/coding/TRACE",
+      "unit": "needle-worker@codex-luna-trace.service"
+    },
+    {
+      "worker_id": "codex-luna-tgplat-01",
+      "agent": "codex-gpt-5.6-luna-xhigh",
+      "workspace": "/home/coding/TWILL",
+      "unit": "needle-worker@codex-luna-tgplat-01.service"
+    },
+    {
+      "worker_id": "reset-subgov",
+      "agent": "codex-gpt-6-sol-xhigh",
+      "workspace": "/home/coding/subscription-quota-governor"
+    },
+    {
+      "worker_id": "reset-hstart",
+      "agent": "codex-gpt-6-sol-xhigh",
+      "workspace": "/home/coding/harnessctl"
+    }
+  ],
+  "routing_dir": "/home/coding/.config/needle/workers",
+  "adoption_env": "/home/coding/.config/subgov/codex-adopted.env"
 }
