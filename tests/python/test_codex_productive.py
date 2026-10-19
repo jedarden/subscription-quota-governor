@@ -38,6 +38,29 @@ class ProductiveTests(unittest.TestCase):
             self.assertFalse(adapter.allowed({**base, "labels": [label]}, adapter.current_time()), label)
         self.assertTrue(adapter.allowed({**base, "labels": ["deferred:2020-01-01T00:00:00Z"]}, adapter.current_time()))
 
+    def test_native_internal_artifacts_are_not_productive_capacity(self):
+        ordinary = {"status": "open", "assignee": None, "labels": [], "title": "Repair contract pin",
+                    "description": "Verify installed version and update the compatibility tests."}
+        self.assertTrue(adapter.allowed(ordinary, adapter.current_time()))
+        for change in [{"labels": ["infra"]}, {"labels": ["fingerprint:123"]},
+                       {"description": "## Scanner Finding\nTest failed"},
+                       {"description": "Re-verify DEFAULT_EXCLUDE_LABELS against the installed version."},
+                       {"title": "Starvation alert", "description": "Open beads exist in this workspace."},
+                       {"title": "[Unravel] repair", "description": "Original bead: test-1"}]:
+            self.assertFalse(adapter.allowed({**ordinary, **change}, adapter.current_time()), change)
+        self.assertTrue(adapter.allowed({**ordinary, "title": "Starvation alert", "description": ""}, adapter.current_time()))
+
+    def test_native_ready_frontier_does_not_override_internal_classification(self):
+        with tempfile.TemporaryDirectory() as root:
+            settings = self.settings(Path(root))
+            issue = {"id": "test-1", "revision": 7, "status": "open", "assignee": None,
+                     "labels": [settings["lane_label"]], "description": "Verify DEFAULT_EXCLUDE_LABELS"}
+            with patch.object(adapter, "policy_ok", return_value=True), patch.object(adapter, "workers", return_value=[]), \
+                 patch.object(adapter, "run", side_effect=[json.dumps([issue]), json.dumps(issue)]):
+                measured = adapter.demand(settings)
+            self.assertEqual(measured["eligible_backlog_capacity"], 0)
+            self.assertEqual(measured["blocked"][0]["reason"], "native_internal_artifact")
+
     def test_reviewed_revision_native_frontier_and_lane_all_required(self):
         with tempfile.TemporaryDirectory() as root:
             s = self.settings(Path(root))

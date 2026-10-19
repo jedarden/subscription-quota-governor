@@ -52,8 +52,38 @@ def current_time():
     return datetime.now(timezone.utc)
 
 
+def native_internal_artifact(issue):
+    # Match NEEDLE src/internal.rs (75267dbf), shared by Pluck and Explore.
+    # bead --ready does not project this additional native dispatch boundary.
+    labels = {label.strip().lower() for label in issue.get("labels", [])}
+    internal = {"alert", "crash", "starvation", "knot-starvation", "pluck-starvation",
+                "gate-broken", "generation-ratio", "pulse-finding", "unravel-proposal",
+                "worker-failure", "worker-loop", "infra"}
+    if labels & internal or any(label.startswith("fingerprint:") for label in labels):
+        return True
+    body = (issue.get("description") or "").lower()
+    if any(marker in body for marker in ["## agent crash report", "## gate execution error",
+            "## worker failure", "## live worker loop detected", "## scanner finding", "## alternative for:"]):
+        return True
+    if not body.strip():
+        return False
+    title = (issue.get("title") or "").lower()
+    if (any(marker in title for marker in ["starvation alert", "beads invisible to worker",
+                                          "open beads exist but pluck found none"])
+            and any(marker in body for marker in ["workspace", "open beads", "ready beads", "pluck",
+                                                  "candidate", "invisible", "starvation"])):
+        return True
+    return (any(term in body for term in ["pluck configuration", "pluck config", "exclude_labels",
+            "exclude labels", "bead discovery", "needle dispatch", "strand configuration",
+            "worker configuration", "bead filtering", "candidate exclusion"])
+            or "automated alternative proposal" in body
+            or (title.startswith("[unravel]") and "original bead:" in body))
+
+
 def allowed(issue, now):
     if issue.get("status") != "open" or issue.get("assignee") or issue.get("manual_blocked"):
+        return False
+    if native_internal_artifact(issue):
         return False
     for raw in issue.get("labels", []):
         label = raw.lower()
@@ -296,6 +326,8 @@ def demand(settings):
                 reason = "changed_since_review"
             elif settings["lane_label"] not in issue.get("labels", []):
                 reason = "missing_dispatch_lane"
+            elif native_internal_artifact(issue):
+                reason = "native_internal_artifact"
             elif issue["id"] not in frontiers[str(route)] or not allowed(issue, now):
                 reason = "not_currently_claimable"
             else:

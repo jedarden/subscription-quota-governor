@@ -13,7 +13,8 @@
       "workspace": "/home/coding/claude-governor",
       "id": "claudego-7a351ba7",
       "reviewed_revision": 2,
-      "admission_evidence": "Ordinary manually authored defect, no generated-proposal or human holds. Reviewed under subgov-83e07f65. Native ready frontier and gate health remain binding."
+      "admission_evidence": "Ordinary manually authored defect, no generated-proposal or human holds. Reviewed under subgov-83e07f65. Native ready frontier and gate health remain binding.",
+      "external_hold": "Native NEEDLE Pluck event 2026-10-19T03:01:48Z excludes claudego-7a351ba7 as internal_artifact. Its scheduler-configuration body matches NEEDLE src/internal.rs historical_diagnostic_shape (exclude_labels). Native policy must remain binding; remove this hold only after an authorized policy/outcome change is verified."
     }
   ]
 }

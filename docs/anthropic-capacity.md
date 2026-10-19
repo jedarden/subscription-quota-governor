@@ -35,7 +35,12 @@ identities outside the governor's `ProtectProc=invisible` sandbox.
 `deploy/codinghome/anthropic-productive.json` records reviewed ordinary outcomes.
 Each launch rechecks the exact reviewed revision, native ready frontier, positive
 lane label, human/proposal/time-bound holds, backend, host ownership and workspace
-gate health. The positive-label NEEDLE lane binds only
+gate health. Native NEEDLE also excludes scheduler-internal artifacts beyond the
+bead ready frontier. The shared adapter mirrors `NEEDLE/src/internal.rs` at
+`75267dbf`, including reserved labels, generated headings and historical body
+matching. Review that boundary when upgrading NEEDLE. A recorded `external_hold` retains that restriction when a
+reviewed record is rejected by native selection; it contributes zero demand.
+The positive-label NEEDLE lane binds only
 `sg-claude-anthropic-1` and `sg-claude-anthropic-2`, with `when_empty: idle`.
 New workers disable generation using a per-worker environment override. Busy
 claims must match their real supervisor and bead assignee. Scale-down retains
