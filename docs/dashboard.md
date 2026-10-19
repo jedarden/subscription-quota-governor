@@ -9,10 +9,29 @@ subgov dashboard --configs ~/.config/subgov/claude-anthropic.yaml \
   ~/.config/subgov/codex.yaml ~/.config/subgov/claude-zai-managed.yaml
 ```
 
+The interactive overview puts the three providers together, with quota left,
+active agents, reset timing and projected remaining capacity. Select a provider
+to inspect its measured history, projected trajectory and decision summary.
+The detail view contains all reported quota windows, measurement baselines and
+recorded holds. Unknown and stale measurements stay visibly distinct.
+
 Use `--once` for a plain snapshot or `--once --json` for structured output.
-`--interval-seconds 5` controls display refresh, independently of the governors'
-poll intervals. Press `j`/`k` to scroll in a shorter terminal, or `q` or Ctrl-C
-to exit the interactive view.
+`--interval-seconds 5` controls telemetry refresh, independently of the governors'
+poll intervals. The interactive screen updates changed cells without clearing
+and repainting the whole terminal.
+
+| Key | Action |
+| --- | --- |
+| Tab / Shift-Tab, Left / Right | Select a provider |
+| Up / Down | Select a provider in overview; scroll details |
+| 1–3 | Select Anthropic, Codex or ZAI |
+| Enter / d | Toggle provider details |
+| Esc / o | Return to overview |
+| ? / h | Show or hide keyboard help |
+| Space / p | Pause or resume telemetry refresh |
+| r | Refresh cached telemetry immediately |
+| j / k, Page Up / Down | Scroll details |
+| q / Ctrl-C | Quit and restore the terminal |
 
 The account cards show quota used and remaining, reset countdowns, configured
 ceilings/reserves, consumption in percentage points per hour, projected remaining
@@ -22,6 +41,10 @@ pace continues; it is not a promise or a causal estimate of each worker's burn.
 Each rate identifies its measurement baseline. Flat quantized readings leave the
 burn forecast unknown. Missing, stale, reset-crossing, regressing or incomplete
 history must not appear as zero consumption or free capacity.
+
+History and projection use different chart styles. If the measured rate implies
+exhaustion before reset, the projection reaches 100% at that earlier time; it
+does not spread the same consumption across the entire remaining window.
 
 Controller-observed counts belong to their recorded observation time. Live
 heartbeat counts, where available, are checked against supervisor process

@@ -81,6 +81,9 @@ fn fixed_generation_rate_projection_stale_reset_and_quantized_samples() {
     assert!((window.consumption_percentage_points_per_hour.unwrap() - 30.0).abs() < 1e-8);
     assert!(window.expected_remaining_percent_at_reset.unwrap() < 1e-8);
     assert_eq!(window.baseline_seconds, Some(600));
+    assert_eq!(window.history.len(), 2);
+    assert!((window.history[0].used_percent - 35.0).abs() < 1e-8);
+    assert!((window.history[1].used_percent - 40.0).abs() < 1e-8);
     // A healthy new cycle cannot make old quota fresh.
     write(
         &dir.path().join("status.json"),
@@ -102,6 +105,10 @@ fn fixed_generation_rate_projection_stale_reset_and_quantized_samples() {
         assert!(frame.accounts[0].windows[0]
             .consumption_percentage_points_per_hour
             .is_none());
+        assert_eq!(
+            frame.accounts[0].windows[0].history.len(),
+            if age == 60 { 2 } else { 1 }
+        );
     }
     write(&dir.path().join("state.json"), state(0.4, reset, 600));
     let frame = collect(&[config], now);

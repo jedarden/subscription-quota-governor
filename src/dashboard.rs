@@ -4,18 +4,20 @@ use crate::model::{same_reset_generation, QuotaSnapshot};
 use crate::state::{AccountState, AggregateBurnSample, WindowSample};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
+
+mod ui;
 
 #[derive(Debug, Serialize)]
 pub struct Frame {
@@ -246,6 +248,13 @@ pub struct WindowCard {
     pub lookback_seconds: u64,
     pub expected_remaining_percent_at_reset: Option<f64>,
     pub projection_assumption: String,
+    pub history: Vec<HistoryPoint>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryPoint {
+    pub observed_at: DateTime<Utc>,
+    pub used_percent: f64,
 }
 
 /// Strip control characters, including complete ANSI CSI/OSC sequences, before rendering.
@@ -309,15 +318,14 @@ fn age_seconds(now: DateTime<Utc>, then: DateTime<Utc>) -> i64 {
     now.signed_duration_since(then).num_seconds()
 }
 
-fn measured_rate(
+fn compatible_history(
     state: &AccountState,
     id: &str,
     current: &WindowSample,
     now: DateTime<Utc>,
     lookback: u64,
     stale_after: u64,
-    minimum: u64,
-) -> (Option<f64>, Option<i64>, &'static str) {
+) -> Vec<AggregateBurnSample> {
     let mut samples = state
         .aggregate_burn_history
         .get(id)
@@ -343,7 +351,7 @@ fn measured_rate(
             && a.used_fraction == b.used_fraction
             && same_reset_generation(a.resets_at, b.resets_at)
     });
-    let mut baseline: Option<&AggregateBurnSample> = None;
+    let mut compatible = Vec::new();
     let mut previous: Option<&AggregateBurnSample> = None;
     for sample in &samples {
         if sample.observed_at > current.observed_at {
@@ -354,22 +362,33 @@ fn measured_rate(
             || !fraction(sample.used_fraction)
             || !same_reset_generation(sample.resets_at, current.resets_at)
         {
-            baseline = None;
+            compatible.clear();
             previous = None;
             continue;
         }
         if let Some(prev) = previous {
             let gap = age_seconds(sample.observed_at, prev.observed_at);
             if gap <= 0 || gap as u64 > stale_after || sample.used_fraction < prev.used_fraction {
-                baseline = None;
+                compatible.clear();
             }
         }
-        if baseline.is_none() {
-            baseline = Some(sample);
-        }
+        compatible.push(sample.clone());
         previous = Some(sample);
     }
-    let Some(base) = baseline else {
+    compatible
+}
+
+fn measured_rate(
+    state: &AccountState,
+    id: &str,
+    current: &WindowSample,
+    now: DateTime<Utc>,
+    lookback: u64,
+    stale_after: u64,
+    minimum: u64,
+) -> (Option<f64>, Option<i64>, &'static str) {
+    let samples = compatible_history(state, id, current, now, lookback, stale_after);
+    let Some(base) = samples.first() else {
         return (None, None, "unknown: no compatible history");
     };
     let seconds = age_seconds(current.observed_at, base.observed_at);
@@ -474,6 +493,20 @@ fn window_card(
             "unknown: rolling/request quota; linear projection not valid"
         }
         .into(),
+        history: compatible_history(
+            state,
+            id,
+            sample,
+            now,
+            lookback,
+            account.utilization.stale_after_seconds,
+        )
+        .into_iter()
+        .map(|point| HistoryPoint {
+            observed_at: point.observed_at,
+            used_percent: point.used_fraction * 100.0,
+        })
+        .collect(),
     })
 }
 
@@ -815,52 +848,11 @@ pub fn render(frame: &Frame, width: usize) -> String {
         + "\n"
 }
 
-struct Terminal {
-    saved: String,
-}
-impl Terminal {
-    fn enter() -> Result<Self> {
-        let output = Command::new("stty")
-            .arg("-g")
-            .stdin(Stdio::inherit())
-            .output()
-            .context("terminal settings unavailable")?;
-        anyhow::ensure!(output.status.success(), "terminal settings unavailable");
-        let saved = String::from_utf8(output.stdout)?.trim().to_owned();
-        let guard = Self { saved };
-        let status = Command::new("stty")
-            .args(["-icanon", "-echo", "min", "0", "time", "1"])
-            .status()?;
-        anyhow::ensure!(status.success(), "cannot enter dashboard terminal mode");
-        print!("\x1b[?1049h\x1b[?25l");
-        io::stdout().flush()?;
-        Ok(guard)
-    }
-}
-impl Drop for Terminal {
+struct TerminalGuard;
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = Command::new("stty").arg(&self.saved).status();
-        print!("\x1b[?25h\x1b[?1049l");
-        let _ = io::stdout().flush();
+        ratatui::restore();
     }
-}
-fn dimensions() -> (usize, usize) {
-    Command::new("stty")
-        .arg("size")
-        .stdin(Stdio::inherit())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            let mut n = s.split_whitespace();
-            Some((
-                n.next()?.parse::<usize>().ok()?,
-                n.next()?.parse::<usize>().ok()?,
-            ))
-        })
-        .map(|(rows, cols)| (rows.max(4), cols.max(1)))
-        .unwrap_or((54, 120))
 }
 
 pub fn run(configs: &[PathBuf], interval_seconds: u64, once: bool, json: bool) -> Result<()> {
@@ -878,48 +870,102 @@ pub fn run(configs: &[PathBuf], interval_seconds: u64, once: bool, json: bool) -
     let signal = quit.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))
         .context("cannot install dashboard interrupt handler")?;
-    let _terminal = Terminal::enter()?;
-    let mut offset = 0usize;
-    loop {
-        let (rows, cols) = dimensions();
-        let frame = render(&collect(configs, Utc::now()), cols);
-        let lines: Vec<_> = frame.lines().collect();
-        offset = offset.min(lines.len().saturating_sub(rows.saturating_sub(2)));
-        print!("\x1b[H\x1b[2J");
-        for line in lines.iter().skip(offset).take(rows.saturating_sub(2)) {
-            print!("{line}\r\n");
+    let mut terminal = ratatui::try_init().context("cannot initialize dashboard terminal")?;
+    let _guard = TerminalGuard;
+    let mut state = ui::UiState::default();
+    let mut data = collect(configs, Utc::now());
+    let interval = Duration::from_secs(interval_seconds.max(1));
+    let mut next_refresh = Instant::now() + interval;
+    let mut redraw = true;
+    while !quit.load(Ordering::SeqCst) {
+        if !state.paused && Instant::now() >= next_refresh {
+            data = collect(configs, Utc::now());
+            next_refresh = Instant::now() + interval;
+            redraw = true;
         }
-        if lines.len() > rows.saturating_sub(2) {
-            print!(
-                "{}\r\n",
-                "j/k scroll | full detail: --once --json"
-                    .chars()
-                    .take(cols)
-                    .collect::<String>()
-            );
+        if redraw {
+            terminal.draw(|frame| ui::draw(frame, &data, &mut state))?;
+            redraw = false;
         }
-        io::stdout().flush()?;
-        let deadline = Instant::now() + Duration::from_secs(interval_seconds);
-        while Instant::now() < deadline && !quit.load(Ordering::SeqCst) {
-            let mut key = [0u8; 1];
-            match io::stdin().read(&mut key) {
-                Ok(1) if matches!(key[0], b'q' | b'Q' | 3) => {
-                    quit.store(true, Ordering::SeqCst);
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Resize(_, _) => redraw = true,
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let count = data.accounts.len();
+                let selected_before = state.selected;
+                match key.code {
+                    KeyCode::Char('q' | 'Q') => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Tab | KeyCode::Right => {
+                        if count > 0 {
+                            state.selected = (state.selected + 1) % count;
+                        }
+                    }
+                    KeyCode::BackTab | KeyCode::Left => {
+                        if count > 0 {
+                            state.selected = (state.selected + count - 1) % count;
+                        }
+                    }
+                    KeyCode::Char(number @ '1'..='9') => {
+                        let index = (number as u8 - b'1') as usize;
+                        if index < count {
+                            state.selected = index;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Char('d' | 'D') => {
+                        state.details = !state.details;
+                        state.scroll = 0;
+                    }
+                    KeyCode::Esc => {
+                        state.help = false;
+                        state.details = false;
+                        state.scroll = 0;
+                    }
+                    KeyCode::Char('o' | 'O' | '0') => {
+                        state.details = false;
+                        state.scroll = 0;
+                    }
+                    KeyCode::Char('?' | 'h') => state.help = !state.help,
+                    KeyCode::Char(' ' | 'p' | 'P') => {
+                        state.paused = !state.paused;
+                        if !state.paused {
+                            next_refresh = Instant::now();
+                        }
+                    }
+                    KeyCode::Char('r' | 'R') => {
+                        data = collect(configs, Utc::now());
+                        next_refresh = Instant::now() + interval;
+                    }
+                    KeyCode::Down if !state.details => {
+                        if count > 0 {
+                            state.selected = (state.selected + 1) % count;
+                        }
+                    }
+                    KeyCode::Up if !state.details => {
+                        if count > 0 {
+                            state.selected = (state.selected + count - 1) % count;
+                        }
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        state.scroll = state.scroll.saturating_add(1)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        state.scroll = state.scroll.saturating_sub(1)
+                    }
+                    KeyCode::PageDown => state.scroll = state.scroll.saturating_add(10),
+                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
+                    KeyCode::Home => state.scroll = 0,
+                    _ => continue,
                 }
-                Ok(1) if key[0] == b'j' => {
-                    offset = offset.saturating_add(1);
-                    break;
+                if state.selected != selected_before {
+                    state.scroll = 0;
                 }
-                Ok(1) if key[0] == b'k' => {
-                    offset = offset.saturating_sub(1);
-                    break;
-                }
-                Err(e) if e.kind() != io::ErrorKind::Interrupted => return Err(e.into()),
-                _ => {}
+                redraw = true;
             }
-        }
-        if quit.load(Ordering::SeqCst) {
-            return Ok(());
+            _ => {}
         }
     }
+    Ok(())
 }
