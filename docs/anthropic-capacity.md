@@ -25,12 +25,17 @@ the default policy. The existing `weekly_scoped` exclusion remains specific to a
 different model; both `seven_day` and `weekly_all` remain enabled.
 
 The Anthropic wrapper reuses the maintained productive adapter implementation in
-`scripts/codex-productive.py`. Copy it together with `anthropic-productive.py`,
-`subgov_adapter_common.py` and `zai-source-refresh.py` into the isolated
-`~/.local/lib/subgov-anthropic/` directory. No Codex settings, source publisher,
-binary symlink or worker prefix is used by the Anthropic wrapper. The command
-actuator runs through the existing user `systemd-run` mechanism to inspect worker
-identities outside the governor's `ProtectProc=invisible` sandbox.
+`scripts/codex-productive.py`. The shared
+`scripts/install-adapter-scripts.sh` installer copies it together with
+`anthropic-productive.py`, `subgov_adapter_common.py` and
+`zai-source-refresh.py` into the isolated `~/.local/lib/subgov-anthropic/`
+directory, while updating the corresponding Codex and Z.AI directories from the
+same committed `HEAD`. Run `scripts/install-adapter-scripts.sh --verify` before
+restarting any provider service; it fails closed on a missing or byte-divergent
+copy. No Codex settings, source publisher, binary symlink or worker prefix is
+used by the Anthropic wrapper. The command actuator runs through the existing
+user `systemd-run` mechanism to inspect worker identities outside the
+governor's `ProtectProc=invisible` sandbox.
 
 `deploy/codinghome/anthropic-productive.json` records reviewed ordinary outcomes.
 Each launch rechecks the exact reviewed revision, native ready frontier, positive

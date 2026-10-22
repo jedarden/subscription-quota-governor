@@ -72,7 +72,19 @@ Copy these files with mode 600 into `~/.config/subgov/`: `codex.yaml`,
 `codex-quota-source.yaml`, and `codex-productive.json`. Copy the three scripts
 `codex-productive.py`, `subgov_adapter_common.py`, and `zai-source-refresh.py`
 from `scripts/` into `~/.local/lib/subgov-codex/`; only the conservative workspace
-policy parser is reused from the Z.AI publisher. Verify source/install hashes.
+policy parser is reused from the Z.AI publisher. Use the shared installer so
+the Codex, Z.AI, and Anthropic copies are all taken from one committed `HEAD`
+snapshot and checked byte-for-byte:
+
+```bash
+scripts/install-adapter-scripts.sh
+scripts/install-adapter-scripts.sh --verify
+```
+
+The installer has an explicit manifest for each adapter directory and the
+verification command fails if any expected deployed file is missing or differs
+from `HEAD`. Run the verification command as part of the pre-restart doctor
+check after updating the checkout.
 Install `subgov-codex-banked.conf` as
 `~/.config/systemd/user/subgov-codex.service.d/zzzz-subgov-banked.conf` and the
 source service/timer into `~/.config/systemd/user/`. Copy `codex-adopted.env`
