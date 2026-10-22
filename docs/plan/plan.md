@@ -1671,3 +1671,68 @@ isolated state before considering production actuation. Existing §24/WP22
 `NORMAL -> HOLD -> STEP_DOWN` transition-rate validation remains deferred under
 `subgov-d80695e2`; this additive policy does not change or satisfy that gate.
 No production policy is enabled by the example or implementation.
+
+## 26. Whole-fleet management (decided 2026-10-22)
+
+Goal: every NEEDLE worker on codinghome is launched and retired by subgov in
+response to provider capacity and real work. The static roster is a transition
+state, not a floor. Decisions below are locked; no open forks.
+
+**26.1 Scope.** All workers run on this host. Inventory on 2026-10-22: ten
+`needle-worker@glm-*` systemd units (already enumerated by the Z.AI roster, §25),
+`sg-claude-anthropic-N`, `sg-codex-N`, and stragglers started outside systemd
+(for example a `needle-stable` tmux worker). Out of scope: interactive
+Claude/Codex herdr sessions, bare NATO tmux sessions, and coordinators that are
+not NEEDLE workers (`options-continuous-research`).
+
+**26.2 Takeover supersedes the "never touch the roster" floor of §23.** The
+floor shrinks to zero. Each pool declares a `takeover` list of roster units. A
+roster unit is retired (idle-only: pidfd, SIGSTOP, children check ignoring
+zombies, SIGTERM; never `needle cleanup`) only when a subgov-prefixed
+replacement in the same pool is running. When the list is empty the pool is
+fully elastic. The §25 Z.AI managed roster is the transitional form of this for
+the Z.AI pool. Cutover is stopping the fixed workers directly; there is no
+shadow mode.
+
+**26.3 Pools.** Claude (`sg-claude-anthropic-`), Codex (`sg-codex-`), Z.AI
+(`sg-zai-`). Every worker belongs to exactly one pool; a worker on any other
+backend needs an adapter (§27) or an explicit exclusion.
+
+**26.4 Demand is ready beads.** NEEDLE workers consume beads, so the demand
+signal is the count of ready beads per pool, not a hand-curated `work` list.
+Ready means unblocked, unclaimed, in a workspace the pool's agent may work, and
+not held by `proposal-pending`, `human` or a recorded external hold. Spare
+quota alone never launches a worker. `eligible_backlog_capacity` is derived from
+this count (one worker per workspace for build-heavy repos, bounded by
+`max_workers`).
+
+**26.5 Placement is NEEDLE's.** subgov chooses how many workers, not what they
+work on. `needle run -w <repo>` drains that repo and then roams, and a bare
+launch is forbidden, so subgov seeds each new worker with the ready workspace
+having the fewest running workers and lets NEEDLE's own roaming take over. No
+pinning, no repo-to-worker mapping.
+
+**26.6 The ceiling is measured, not configured.** Each cycle computes a host
+worker ceiling as the minimum of: `needle.slice` memory headroom divided by the
+observed p95 per-worker RSS, `MemAvailable` headroom the same way, and a PSI
+(memory/io `avg10`) and load brake that stops scale-up under pressure and steps
+down when it persists. It reuses the observed RAM/CPU admission approach from
+shephrd. Pool `max_workers` remains a quota-side cap. When the sum of pool
+targets exceeds the ceiling, the shortfall is split in proportion to each
+pool's ready demand, and scale-down takes idle workers first.
+
+**26.7 Work packages.**
+- WP23 ready-bead demand adapter (all pools) replacing hand-curated `work`.
+- WP24 measured host ceiling and cross-pool arbitration.
+- WP25 takeover: `sg-zai-` elastic workers, roster retirement, reconcile §25
+  with §23, and straggler adoption.
+- WP26 seed-workspace selection.
+- Already tracked: one binary and one adapter installer (done 2026-10-22, all
+  three services on `~/.local/lib/subgov/current`), backpressure live gate
+  `subgov-d80695e2`, NEEDLE zombie reaping `needle-064b92ef`.
+
+## 27. Adapter protocol (stub)
+
+One core binary plus out-of-process provider adapters over the existing JSON
+contract (§7.3). To be specified after WP23-26 land; the Claude, Codex and Z.AI
+scripts are the first conformance targets.
