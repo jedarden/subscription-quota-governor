@@ -1303,6 +1303,8 @@ mod shutdown_tests {
                 actuator: ActuatorConfig::None,
                 observer_reconciliation: ObserverReconciliation::default(),
                 hosts: None,
+                takeover: Vec::new(),
+                takeover_helper: None,
             },
             utilization: UtilizationConfig {
                 target_utilization: Some(0.9),
@@ -1425,6 +1427,8 @@ mod exit_code_tests {
                 },
                 observer_reconciliation: ObserverReconciliation::default(),
                 hosts: None,
+                takeover: Vec::new(),
+                takeover_helper: None,
             },
             utilization: UtilizationConfig {
                 target_utilization: Some(0.9),

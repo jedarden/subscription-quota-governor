@@ -276,7 +276,28 @@
           "description": "plan.md §22.2/§22.3: optional and additive. When present, at least one host is required (validate_fleet()); when absent, the account behaves byte-identically to v0.1 via `observer`/`actuator` above.",
           "propertyNames": { "minLength": 1 },
           "additionalProperties": { "$ref": "#/$defs/host" }
+        },
+        "takeover": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/takeoverTarget" },
+          "default": [],
+          "description": "plan.md §26.2: roster units and adopted stragglers this pool may retire, idle-only, once a prefixed replacement in the same pool runs. Empty leaves the §23 floor untouched. Requires a needle_run actuator with an identifier_prefix, a needle_status observer with the same prefix, no per-host fleets, and a takeover_helper (validate_takeover()); worker-id uniqueness across pools is enforced by Config::validate(), not expressible here."
+        },
+        "takeover_helper": {
+          "$ref": "#/$defs/argv",
+          "description": "plan.md §26.2: the idle-only retirement helper, invoked outside this process after each cycle's elastic reconcile. Required when `takeover` is non-empty and meaningless otherwise."
         }
+      }
+    },
+    "takeoverTarget": {
+      "type": "object",
+      "required": ["worker_id", "agent"],
+      "additionalProperties": false,
+      "description": "plan.md §26.2: one NEEDLE worker this pool may retire. A roster worker carries its systemd unit; a straggler outside systemd (for example a needle-stable tmux supervisor) is adopted by identity alone.",
+      "properties": {
+        "worker_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$", "description": "NEEDLE worker identity: the tmux identifier and the heartbeat filename component." },
+        "agent": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$", "description": "Agent (adapter) the worker runs, as in the heartbeat identity `<agent>-<worker_id>`." },
+        "unit": { "type": "string", "description": "The systemd roster unit; must equal needle-worker@<worker_id>.service (validate_takeover()). Absent for a straggler." }
       }
     },
     "host": {

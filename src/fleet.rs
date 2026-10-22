@@ -75,7 +75,10 @@ pub struct ActuationOutcome {
 }
 
 /// Builds the concrete `Observer` described by an account's fleet config.
-pub fn observer_for(config: &WorkerObserverConfig) -> Box<dyn Observer> {
+/// `takeover` carries the §26.2 worker ids the pool may retire, which a
+/// NEEDLE-status observer splits out of the unowned floor; observers that
+/// have no ownership notion ignore it.
+pub fn observer_for(config: &WorkerObserverConfig, takeover: &[String]) -> Box<dyn Observer> {
     match config {
         WorkerObserverConfig::Static { workers } => Box::new(StaticObserver { workers: *workers }),
         WorkerObserverConfig::File { path } => Box::new(FileObserver { path: path.clone() }),
@@ -90,6 +93,7 @@ pub fn observer_for(config: &WorkerObserverConfig) -> Box<dyn Observer> {
             heartbeat_dir: heartbeat_dir.clone(),
             stale_after_seconds: *stale_after_seconds,
             identifier_prefix: identifier_prefix.clone(),
+            takeover: takeover.to_vec(),
         }),
     }
 }
@@ -128,15 +132,18 @@ pub fn current_workers(config: &FleetConfig) -> Result<u32> {
         .observer
         .as_ref()
         .context("fleet.observer is required when fleet.hosts is not configured")?;
-    let observed = observer_for(observer_config).current_workers()?;
+    let observed = observer_for(observer_config, &takeover_worker_ids(config)).current_workers()?;
     reconcile_observed_range(observed, config)
 }
 
-/// Fresh same-adapter workers the governor does not own (plan §23.3), or zero
-/// when no observer is configured or it has no ownership notion.
+/// Fresh same-adapter workers the governor does not own and has not listed
+/// for takeover (plans §23.3 and §26.2), or zero when no observer is
+/// configured or it has no ownership notion.
 pub fn unowned_workers(config: &FleetConfig) -> Result<u32> {
     match config.observer.as_ref() {
-        Some(observer_config) => observer_for(observer_config).unowned_workers(),
+        Some(observer_config) => {
+            observer_for(observer_config, &takeover_worker_ids(config)).unowned_workers()
+        }
         None => Ok(0),
     }
 }
@@ -152,7 +159,7 @@ pub fn current_host_workers(config: &AccountConfig) -> Result<BTreeMap<String, u
     hosts
         .iter()
         .map(|(host_id, host)| {
-            let observed = observer_for(&host.observer)
+            let observed = observer_for(&host.observer, &[])
                 .current_workers()
                 .with_context(|| format!("host {host_id} observer failed"))?;
             Ok((host_id.clone(), observed))
@@ -212,7 +219,9 @@ pub fn actuate_host_targets(
                 .with_context(|| format!("host {host_id} actuator failed"))?;
             if reconcile_unchanged(&host.actuator) {
                 outcome.observed_workers = Some(
-                    observer_for(&host.observer)
+                    // Host-scoped fleets never carry a takeover list
+                    // (validate_takeover rejects the combination).
+                    observer_for(&host.observer, &[])
                         .current_workers()
                         .with_context(|| {
                             format!("host {host_id} post-actuation observer failed")
@@ -221,6 +230,16 @@ pub fn actuate_host_targets(
             }
             Ok((host_id.clone(), outcome))
         })
+        .collect()
+}
+
+/// The §26.2 worker ids a NEEDLE-status observer must split out of the
+/// unowned floor. Other observers have no ownership notion and ignore them.
+fn takeover_worker_ids(config: &FleetConfig) -> Vec<String> {
+    config
+        .takeover
+        .iter()
+        .map(|target| target.worker_id.clone())
         .collect()
 }
 
@@ -268,10 +287,34 @@ fn reconcile_observed_range(observed: u32, config: &FleetConfig) -> Result<u32> 
 /// whatever state it already holds is what lets the next cycle reconcile.
 pub fn actuate(config: &FleetConfig, observed: u32, desired: u32) -> Result<ActuationOutcome> {
     let mut outcome = actuate_config(&config.actuator, observed, desired)?;
+    retire_takeover(config)?;
     if reconcile_unchanged(&config.actuator) {
         outcome.observed_workers = Some(current_workers(config)?);
     }
     Ok(outcome)
+}
+
+/// Plan §26.2: after the elastic reconcile, hand one retirement step to the
+/// configured helper. The helper owns the takeover gate (a prefixed
+/// replacement in the same pool is running) and the idle-only mechanics
+/// (pidfd pin, SIGSTOP freeze, children check ignoring zombies, SIGTERM;
+/// never `needle cleanup`); it retires nothing when the gate does not hold,
+/// so running it every cycle is safe. Runs even when the elastic count did
+/// not change -- that is exactly the state in which a replacement from a
+/// previous cycle allows the next roster unit to drain. A helper failure
+/// fails the cycle so the next one reconciles.
+fn retire_takeover(config: &FleetConfig) -> Result<()> {
+    if config.takeover.is_empty() {
+        return Ok(());
+    }
+    let Some(helper) = &config.takeover_helper else {
+        // Unreachable through Config::validate; keeps the invariant local.
+        bail!("fleet.takeover is configured without fleet.takeover_helper");
+    };
+    // No {desired_workers} placeholder is defined for retirement; render the
+    // argv unchanged. The token still stabilizes an unchanged retry.
+    command_actuator_actuate(helper, 0, CHILD_TIMEOUT)?;
+    Ok(())
 }
 
 fn actuate_config(
@@ -664,6 +707,8 @@ mod tests {
                 actuator: ActuatorConfig::None,
                 observer_reconciliation: ObserverReconciliation::default(),
                 hosts: Some(hosts),
+                takeover: Vec::new(),
+                takeover_helper: None,
             },
             utilization: UtilizationConfig {
                 target_utilization: Some(0.85),
@@ -796,7 +841,7 @@ mod tests {
 
     #[test]
     fn static_observer_reports_configured_workers() {
-        let observer = observer_for(&WorkerObserverConfig::Static { workers: 7 });
+        let observer = observer_for(&WorkerObserverConfig::Static { workers: 7 }, &[]);
         assert_eq!(observer.current_workers().unwrap(), 7);
     }
 
@@ -872,7 +917,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("workers");
         fs::write(&path, vec![b'1'; (MAX_OBSERVER_BYTES + 1) as usize]).unwrap();
-        let observer = observer_for(&WorkerObserverConfig::File { path: path.clone() });
+        let observer = observer_for(&WorkerObserverConfig::File { path: path.clone() }, &[]);
         assert!(observer.current_workers().is_err());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -885,7 +930,7 @@ mod tests {
         let mut contents = vec![b'0'; (MAX_OBSERVER_BYTES - 1) as usize];
         contents.push(b'5');
         fs::write(&path, &contents).unwrap();
-        let observer = observer_for(&WorkerObserverConfig::File { path: path.clone() });
+        let observer = observer_for(&WorkerObserverConfig::File { path: path.clone() }, &[]);
         assert_eq!(observer.current_workers().unwrap(), 5);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -893,26 +938,32 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn command_observer_succeeds_for_small_output() {
-        let observer = observer_for(&WorkerObserverConfig::Command {
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "echo 3".to_string(),
-            ],
-        });
+        let observer = observer_for(
+            &WorkerObserverConfig::Command {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo 3".to_string(),
+                ],
+            },
+            &[],
+        );
         assert_eq!(observer.current_workers().unwrap(), 3);
     }
 
     #[cfg(unix)]
     #[test]
     fn command_observer_rejects_oversized_stdout_and_reaps_the_child() {
-        let observer = observer_for(&WorkerObserverConfig::Command {
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "yes | head -c 20000".to_string(),
-            ],
-        });
+        let observer = observer_for(
+            &WorkerObserverConfig::Command {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "yes | head -c 20000".to_string(),
+                ],
+            },
+            &[],
+        );
         assert!(observer.current_workers().is_err());
     }
 
@@ -1181,6 +1232,8 @@ mod tests {
             actuator: ActuatorConfig::None,
             observer_reconciliation,
             hosts: None,
+            takeover: Vec::new(),
+            takeover_helper: None,
         }
     }
 
@@ -1250,5 +1303,104 @@ mod tests {
             argv: vec!["/nonexistent/subgov-test-actuator".to_string()],
         });
         assert!(actuate(&config, 3, 8).is_err());
+    }
+
+    // --- Plan §26.2: takeover retirement runs after the elastic reconcile,
+    // every cycle, and only for a fleet that lists takeover targets. ---
+
+    #[cfg(unix)]
+    fn fake_helper(dir: &std::path::Path, name: &str, exit: i32) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit {exit}\n",
+                dir.join("helper.log").display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        vec![path.to_string_lossy().into_owned()]
+    }
+
+    fn takeover_config(target_path: &Path, helper: Vec<String>) -> FleetConfig {
+        let mut config = fleet_config_with_actuator(ActuatorConfig::TargetFile {
+            path: target_path.to_path_buf(),
+        });
+        config.takeover = vec![crate::config::TakeoverTarget {
+            worker_id: "glm-front-herdr".into(),
+            agent: "claude-code-glm-5.3-flash".into(),
+            unit: Some("needle-worker@glm-front-herdr.service".into()),
+        }];
+        config.takeover_helper = Some(helper);
+        config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn takeover_helper_runs_after_the_elastic_reconcile() {
+        let dir = std::env::temp_dir().join(format!("subgov-takeover-run-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let helper = fake_helper(&dir, "helper-ok", 0);
+        let config = takeover_config(&target, helper);
+
+        let outcome = actuate(&config, 1, 3).unwrap();
+
+        assert!(outcome.actuated, "the elastic reconcile still happens");
+        assert_eq!(fs::read_to_string(&target).unwrap().trim(), "3");
+        assert!(
+            dir.join("helper.log").exists(),
+            "the retirement helper must be invoked"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn takeover_helper_runs_even_when_the_elastic_count_is_unchanged() {
+        // desired == observed skips the elastic actuator, but a replacement
+        // launched in an earlier cycle still allows the next listed worker
+        // to drain -- retirement must not be skipped with it.
+        let dir = std::env::temp_dir().join(format!("subgov-takeover-same-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let helper = fake_helper(&dir, "helper-ok", 0);
+        let config = takeover_config(&target, helper);
+
+        let outcome = actuate(&config, 2, 2).unwrap();
+
+        assert!(!outcome.actuated);
+        assert!(!target.exists(), "no elastic actuation happened");
+        assert!(dir.join("helper.log").exists(), "retirement still runs");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_takeover_helper_fails_the_cycle() {
+        let dir = std::env::temp_dir().join(format!("subgov-takeover-fail-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let helper = fake_helper(&dir, "helper-fail", 3);
+        let config = takeover_config(&target, helper);
+
+        assert!(actuate(&config, 1, 3).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_takeover_targets_never_invokes_a_helper() {
+        // The configured helper points at a path that cannot execute; not
+        // invoking it is proven by actuate succeeding.
+        let dir = std::env::temp_dir().join(format!("subgov-takeover-none-{}", std::process::id()));
+        let config = fleet_config_with_actuator(ActuatorConfig::None);
+        let mut config = config;
+        config.takeover_helper = Some(vec!["/nonexistent/subgov-takeover-helper".to_string()]);
+        assert!(actuate(&config, 2, 2).is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

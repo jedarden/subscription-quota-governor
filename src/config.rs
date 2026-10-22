@@ -86,6 +86,39 @@ pub struct FleetConfig {
     /// host.
     #[serde(default)]
     pub hosts: Option<BTreeMap<String, HostConfig>>,
+    /// Plan §26.2: roster units and adopted stragglers this pool may retire,
+    /// idle-only, once a prefixed replacement in the same pool runs. Empty
+    /// (the default) leaves the §23 floor untouched.
+    #[serde(default)]
+    pub takeover: Vec<TakeoverTarget>,
+    /// Plan §26.2: helper program that performs the idle-only retirement,
+    /// invoked after each cycle's elastic reconcile. It runs outside this
+    /// process because the retirement gate needs `/proc` and signal reach
+    /// the governor's own hardening does not provide. Required when
+    /// `takeover` is non-empty and meaningless otherwise; the takeover
+    /// manifest it reads is part of the deployment, like the roster file it
+    /// supersedes.
+    #[serde(default)]
+    pub takeover_helper: Option<Vec<String>>,
+}
+
+/// One worker this pool may take over (plan §26.2). Roster workers carry
+/// their systemd unit; a straggler outside systemd (for example a
+/// `needle-stable` tmux supervisor) is adopted by identity alone.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TakeoverTarget {
+    /// NEEDLE worker identity: the tmux identifier and the heartbeat
+    /// filename component. Unique across every pool (plan §26.3: every
+    /// worker belongs to exactly one pool).
+    pub worker_id: String,
+    /// Agent (adapter) the worker runs, as it appears in the heartbeat
+    /// identity `<agent>-<worker_id>`.
+    pub agent: String,
+    /// The systemd roster unit, when the worker has one. Absent for a
+    /// straggler, which is retired by signalling its supervisor directly.
+    #[serde(default)]
+    pub unit: Option<String>,
 }
 
 /// One placement target within an account's fleet (plan.md §22.3).
@@ -400,6 +433,7 @@ impl Config {
             bail!("at least one account is required");
         }
         validate_duration(self.poll_interval_seconds, "poll_interval_seconds")?;
+        let mut takeover_workers: BTreeMap<String, String> = BTreeMap::new();
         for (name, account) in &self.accounts {
             if account.fleet.max_workers < account.fleet.min_workers {
                 bail!("account {name}: max_workers must be >= min_workers");
@@ -465,6 +499,16 @@ impl Config {
             }
             validate_source(&account.source, name)?;
             validate_fleet(&account.fleet, name)?;
+            validate_takeover(&account.fleet, name)?;
+            for target in &account.fleet.takeover {
+                if let Some(existing) = takeover_workers.get(&target.worker_id) {
+                    bail!(
+                        "account {name}: takeover worker {} is already listed by account {existing} (plan §26.3: every worker belongs to exactly one pool)",
+                        target.worker_id
+                    );
+                }
+                takeover_workers.insert(target.worker_id.clone(), name.clone());
+            }
             validate_banked_resets(account, name)?;
         }
         Ok(())
@@ -731,6 +775,91 @@ fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
         for (host_name, host) in hosts {
             validate_host(host, account, host_name, fleet.max_workers)?;
         }
+    }
+    Ok(())
+}
+
+/// Plan §26.2: a takeover list retires roster workers only through the
+/// §23.3 prefix machinery -- a listed worker leaves the floor the moment a
+/// prefixed replacement in the same pool runs, so both must be configured,
+/// and the same pairing rules as §23.3 apply. The retirement itself runs in
+/// the unsandboxed helper.
+fn validate_takeover(fleet: &FleetConfig, account: &str) -> Result<()> {
+    if fleet.takeover.is_empty() {
+        if fleet.takeover_helper.is_some() {
+            bail!("account {account}: fleet.takeover_helper is meaningless without fleet.takeover");
+        }
+        return Ok(());
+    }
+    if fleet.hosts.is_some() {
+        bail!("account {account}: fleet.takeover applies to the account's single fleet, not per-host fleets");
+    }
+    let ActuatorConfig::NeedleRun {
+        identifier_prefix: Some(actuator_prefix),
+        ..
+    } = &fleet.actuator
+    else {
+        bail!(
+            "account {account}: fleet.takeover requires a needle_run actuator with an identifier_prefix, because a listed worker is retired only once a prefixed replacement in the same pool runs"
+        );
+    };
+    let Some(WorkerObserverConfig::NeedleStatus {
+        identifier_prefix: Some(observer_prefix),
+        ..
+    }) = &fleet.observer
+    else {
+        bail!(
+            "account {account}: fleet.takeover requires a needle_status observer with an identifier_prefix, so listed workers leave the unowned floor (§26.2: the floor shrinks to zero)"
+        );
+    };
+    if observer_prefix != actuator_prefix {
+        bail!(
+            "account {account}: needle_status observer and needle_run actuator must use the same identifier_prefix"
+        );
+    }
+    let Some(helper) = &fleet.takeover_helper else {
+        bail!(
+            "account {account}: fleet.takeover requires fleet.takeover_helper to perform the idle-only retirement"
+        );
+    };
+    validate_argv(helper, &format!("account {account} takeover_helper"), false)?;
+    let mut listed = std::collections::BTreeSet::new();
+    for target in &fleet.takeover {
+        validate_takeover_identity(
+            &target.worker_id,
+            &format!("account {account} takeover worker_id"),
+        )?;
+        validate_takeover_identity(&target.agent, &format!("account {account} takeover agent"))?;
+        if let Some(unit) = &target.unit {
+            if unit.as_str() != format!("needle-worker@{}.service", target.worker_id) {
+                bail!(
+                    "account {account}: takeover unit {unit} does not match worker {}",
+                    target.worker_id
+                );
+            }
+        }
+        if !listed.insert(target.worker_id.as_str()) {
+            bail!(
+                "account {account}: takeover lists worker {} more than once",
+                target.worker_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The identity charset shared with the deployed roster tooling
+/// (zai-fleet.py's IDENTIFIER rule) and with NEEDLE's adapter names: a
+/// worker id or agent appears in heartbeat filenames and tmux identifiers,
+/// so it must be unambiguous in both.
+fn validate_takeover_identity(value: &str, context: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        || !value.chars().next().unwrap().is_ascii_alphanumeric()
+    {
+        bail!("{context} must start with an ASCII letter or digit and contain only ASCII letters, digits, '.', '_' or '-'");
     }
     Ok(())
 }
@@ -1719,5 +1848,327 @@ actuator: { type: needle_run, repo: /r, adapter: codex, identifier_prefix: sg-b-
         let config: Config = serde_yaml::from_str(&yaml).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("same identifier_prefix"), "{err}");
+    }
+
+    // --- Plan §26.2: the per-pool takeover list. ---
+
+    fn takeover_fleet_yaml(extra: &str) -> String {
+        indent(&format!(
+            r#"max_workers: 18
+observer:
+  type: needle_status
+  agent: claude-code-glm-5.3-flash
+  identifier_prefix: sg-zai-
+actuator:
+  type: needle_run
+  repo: /workspace
+  adapter: claude-code-glm-5.3-flash
+  identifier_prefix: sg-zai-
+{extra}"#
+        ))
+    }
+
+    fn takeover_config_with(fleet_yaml: &str) -> Config {
+        serde_yaml::from_str(&format!(
+            r#"
+version: 1
+accounts:
+  acct:
+    source:
+      type: normalized_file
+      path: /tmp/subgov-test-source.json
+    utilization:
+      reserve_fraction: 0.1
+    fleet:
+{fleet_yaml}
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn takeover_list_parses_units_and_stragglers_and_validates() {
+        let fleet = takeover_fleet_yaml(
+            "takeover:\n  - worker_id: glm-front-herdr\n    agent: claude-code-glm-5.3-flash\n    unit: needle-worker@glm-front-herdr.service\n  - worker_id: glm-roam-25\n    agent: claude-code-glm-5.3\ntakeover_helper: [\"/usr/local/bin/zai-takeover\"]",
+        );
+        let config = takeover_config_with(&fleet);
+        config.validate().unwrap();
+        let takeover = &config.accounts["acct"].fleet.takeover;
+        assert_eq!(takeover.len(), 2);
+        assert_eq!(takeover[0].worker_id, "glm-front-herdr");
+        assert_eq!(
+            takeover[0].unit.as_deref(),
+            Some("needle-worker@glm-front-herdr.service")
+        );
+        assert_eq!(takeover[1].worker_id, "glm-roam-25");
+        assert_eq!(takeover[1].unit, None, "a straggler has no unit");
+
+        // Without takeover, takeover fields default to empty and absent.
+        let plain = takeover_config_with(&takeover_fleet_yaml(""));
+        plain.validate().unwrap();
+        assert!(plain.accounts["acct"].fleet.takeover.is_empty());
+        assert!(plain.accounts["acct"].fleet.takeover_helper.is_none());
+    }
+
+    /// A fleet whose takeover wiring is valid: prefixed observer/actuator
+    /// pair, one roster unit and one straggler, and a helper.
+    fn valid_takeover_fleet() -> FleetConfig {
+        FleetConfig {
+            min_workers: 0,
+            max_workers: 18,
+            bootstrap_workers: 1,
+            max_scale_up_per_cycle: 1,
+            max_scale_down_per_cycle: 1,
+            observer: Some(WorkerObserverConfig::NeedleStatus {
+                agent: "claude-code-glm-5.3-flash".into(),
+                heartbeat_dir: PathBuf::from("/hb"),
+                stale_after_seconds: 60,
+                identifier_prefix: Some("sg-zai-".into()),
+            }),
+            actuator: ActuatorConfig::NeedleRun {
+                repo: PathBuf::from("/workspace"),
+                adapter: "claude-code-glm-5.3-flash".into(),
+                identifier_prefix: Some("sg-zai-".into()),
+                seed_demand_state: None,
+                seed_heartbeats: None,
+            },
+            observer_reconciliation: ObserverReconciliation::default(),
+            hosts: None,
+            takeover: vec![
+                TakeoverTarget {
+                    worker_id: "glm-front-herdr".into(),
+                    agent: "claude-code-glm-5.3-flash".into(),
+                    unit: Some("needle-worker@glm-front-herdr.service".into()),
+                },
+                TakeoverTarget {
+                    worker_id: "glm-roam-25".into(),
+                    agent: "claude-code-glm-5.3".into(),
+                    unit: None,
+                },
+            ],
+            takeover_helper: Some(vec!["/usr/local/bin/zai-takeover".into()]),
+        }
+    }
+
+    fn account_with_fleet(fleet: FleetConfig) -> Config {
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            "acct".to_string(),
+            AccountConfig {
+                source: SourceConfig::NormalizedFile {
+                    path: PathBuf::from("/tmp/subgov-test-source.json"),
+                },
+                fleet,
+                utilization: UtilizationConfig {
+                    target_utilization: None,
+                    reserve_fraction: Some(0.1),
+                    strategy: Strategy::LinearToReset,
+                    stale_after_seconds: 900,
+                    stale_behavior: StaleBehavior::default(),
+                    minimum_sample_seconds: 60,
+                    backpressure: None,
+                    zai_saturation: None,
+                    windows: BTreeMap::new(),
+                },
+                banked_resets: BankedResetConfig::default(),
+            },
+        );
+        Config {
+            version: 1,
+            poll_interval_seconds: default_poll_interval(),
+            state_path: None,
+            accounts,
+        }
+    }
+
+    #[test]
+    fn takeover_requires_the_prefix_pair_and_a_helper() {
+        // The valid fleet passes.
+        account_with_fleet(valid_takeover_fleet())
+            .validate()
+            .unwrap();
+
+        let missing_helper = {
+            let mut fleet = valid_takeover_fleet();
+            fleet.takeover_helper = None;
+            fleet
+        };
+        let err = account_with_fleet(missing_helper)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires fleet.takeover_helper"), "{err}");
+
+        let stray_helper = {
+            let mut fleet = valid_takeover_fleet();
+            fleet.takeover = Vec::new();
+            fleet
+        };
+        let err = account_with_fleet(stray_helper)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("meaningless without fleet.takeover"), "{err}");
+
+        // A prefixed replacement is the retirement gate: without the
+        // needle_run prefix there is no gate and takeover is rejected.
+        for actuator in [
+            ActuatorConfig::None,
+            ActuatorConfig::NeedleRun {
+                repo: PathBuf::from("/workspace"),
+                adapter: "claude-code-glm-5.3-flash".into(),
+                identifier_prefix: None,
+                seed_demand_state: None,
+                seed_heartbeats: None,
+            },
+        ] {
+            let mut fleet = valid_takeover_fleet();
+            fleet.actuator = actuator;
+            fleet.observer = Some(WorkerObserverConfig::NeedleStatus {
+                agent: "claude-code-glm-5.3-flash".into(),
+                heartbeat_dir: PathBuf::from("/hb"),
+                stale_after_seconds: 60,
+                identifier_prefix: None,
+            });
+            let err = account_with_fleet(fleet)
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("requires a needle_run actuator with an identifier_prefix"),
+                "{err}"
+            );
+        }
+
+        // Floor accounting requires the needle_status observer with the same
+        // prefix: a listed worker must leave the §23 unowned floor. (An
+        // observer with a *different* prefix is already rejected by the
+        // §23.3 pairing rule, so a non-needle_status observer is the case
+        // this fleet-level check adds.)
+        let mut fleet = valid_takeover_fleet();
+        fleet.observer = Some(WorkerObserverConfig::Static { workers: 1 });
+        let err = account_with_fleet(fleet)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a needle_status observer"), "{err}");
+
+        let mut fleet = valid_takeover_fleet();
+        if let ActuatorConfig::NeedleRun {
+            identifier_prefix, ..
+        } = &mut fleet.actuator
+        {
+            *identifier_prefix = Some("sg-codex-".into());
+        }
+        let err = account_with_fleet(fleet)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same identifier_prefix"), "{err}");
+    }
+
+    #[test]
+    fn takeover_targets_validate_identities_units_and_uniqueness() {
+        for (worker_id, agent, unit, expected) in [
+            (
+                "",
+                "claude-code-glm-5.3-flash",
+                None,
+                "worker_id must start",
+            ),
+            (
+                "glm front",
+                "claude-code-glm-5.3-flash",
+                None,
+                "worker_id must start",
+            ),
+            ("glm-front-herdr", "", None, "agent must start"),
+            (
+                "glm-front-herdr",
+                "claude-code-glm-5.3-flash",
+                Some("other.service"),
+                "does not match worker",
+            ),
+        ] {
+            let mut fleet = valid_takeover_fleet();
+            fleet.takeover = vec![TakeoverTarget {
+                worker_id: worker_id.into(),
+                agent: agent.into(),
+                unit: unit.map(Into::into),
+            }];
+            let err = account_with_fleet(fleet)
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{worker_id}: {err}");
+        }
+
+        // A worker belongs to exactly one pool: duplicated within a pool is
+        // rejected (plan §26.3).
+        let mut fleet = valid_takeover_fleet();
+        fleet.takeover.push(fleet.takeover[0].clone());
+        let err = account_with_fleet(fleet)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn takeover_worker_id_is_unique_across_pools() {
+        let mut first = account_with_fleet(valid_takeover_fleet());
+        // A second, individually valid pool listing the same worker id.
+        let mut second_fleet = valid_takeover_fleet();
+        if let ActuatorConfig::NeedleRun {
+            identifier_prefix, ..
+        } = &mut second_fleet.actuator
+        {
+            *identifier_prefix = Some("sg-other-".into());
+        }
+        second_fleet.observer = Some(WorkerObserverConfig::NeedleStatus {
+            agent: "claude-code-glm-5.3-flash".into(),
+            heartbeat_dir: PathBuf::from("/hb"),
+            stale_after_seconds: 60,
+            identifier_prefix: Some("sg-other-".into()),
+        });
+        first.accounts.insert(
+            "other".into(),
+            AccountConfig {
+                source: SourceConfig::NormalizedFile {
+                    path: PathBuf::from("/tmp/subgov-test-source.json"),
+                },
+                fleet: second_fleet,
+                utilization: first.accounts["acct"].utilization.clone(),
+                banked_resets: BankedResetConfig::default(),
+            },
+        );
+        let err = first.validate().unwrap_err().to_string();
+        assert!(err.contains("already listed by account"), "{err}");
+    }
+
+    #[test]
+    fn takeover_does_not_apply_to_per_host_fleets() {
+        let mut fleet = valid_takeover_fleet();
+        fleet.observer = None;
+        fleet.actuator = ActuatorConfig::None;
+        let mut hosts = BTreeMap::new();
+        hosts.insert(
+            "codinghome".to_string(),
+            HostConfig {
+                max_workers: None,
+                max_scale_up_per_cycle: None,
+                max_scale_down_per_cycle: None,
+                resource_reserve: None,
+                resource_source: None,
+                observer: WorkerObserverConfig::Static { workers: 1 },
+                actuator: ActuatorConfig::None,
+            },
+        );
+        fleet.hosts = Some(hosts);
+        let err = account_with_fleet(fleet)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("single fleet"), "{err}");
     }
 }

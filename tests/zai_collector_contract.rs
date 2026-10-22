@@ -300,6 +300,8 @@ fn zai_linear_to_reset_account(target_utilization: f64) -> AccountConfig {
             actuator: ActuatorConfig::None,
             observer_reconciliation: ObserverReconciliation::default(),
             hosts: None,
+            takeover: Vec::new(),
+            takeover_helper: None,
         },
         utilization: UtilizationConfig {
             target_utilization: Some(target_utilization),

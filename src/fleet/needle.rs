@@ -25,6 +25,9 @@ pub(super) struct NeedleStatusObserver {
     pub(super) heartbeat_dir: PathBuf,
     pub(super) stale_after_seconds: u64,
     pub(super) identifier_prefix: Option<String>,
+    /// Plan §26.2: worker ids this pool may retire. They are counted in
+    /// their own bucket and never form the §23 unowned floor.
+    pub(super) takeover: Vec<String>,
 }
 
 impl NeedleStatusObserver {
@@ -33,6 +36,7 @@ impl NeedleStatusObserver {
             &self.heartbeat_dir,
             &self.agent,
             self.identifier_prefix.as_deref(),
+            &self.takeover,
             self.stale_after_seconds,
             Utc::now(),
         )
@@ -50,12 +54,14 @@ impl Observer for NeedleStatusObserver {
 }
 
 /// Fresh heartbeats for one adapter, split by the governor's identifier
-/// prefix (plan §23.3). Without a prefix every worker is `owned`, which is
-/// the v1 behaviour.
+/// prefix (plan §23.3) and by the §26.2 takeover list. Without a prefix
+/// every worker is `owned`, which is the v1 behaviour; a takeover-listed
+/// worker is pending replacement and never forms the unowned floor.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HeartbeatCounts {
     owned: u32,
     unowned: u32,
+    takeover: u32,
 }
 
 #[derive(Deserialize)]
@@ -70,10 +76,13 @@ struct NeedleHeartbeat {
 /// NEEDLE names these files `{agent}-{worker_id}.json`; checking the JSON's
 /// `worker_id` as well as `qualified_id` distinguishes adapters whose names
 /// share a prefix (for example, `claude-print` and `claude-print-opus`).
+/// `takeover` lists worker ids (plan §26.2) counted in their own bucket,
+/// excluded from both `owned` and the unowned floor.
 fn count_needle_heartbeats(
     heartbeat_dir: &Path,
     agent: &str,
     identifier_prefix: Option<&str>,
+    takeover: &[String],
     stale_after_seconds: u64,
     now: DateTime<Utc>,
 ) -> Result<HeartbeatCounts> {
@@ -149,6 +158,8 @@ fn count_needle_heartbeats(
                 .unwrap_or(true);
             let slot = if owned {
                 &mut counts.owned
+            } else if takeover.iter().any(|id| id == &heartbeat.worker_id) {
+                &mut counts.takeover
             } else {
                 &mut counts.unowned
             };
@@ -720,7 +731,7 @@ mod tests {
         fs::write(dir.path().join("other-agent-worker-4.json"), "not json").unwrap();
 
         assert_eq!(
-            count_needle_heartbeats(dir.path(), "claude-print", None, 60, now)
+            count_needle_heartbeats(dir.path(), "claude-print", None, &[], 60, now)
                 .unwrap()
                 .owned,
             2
@@ -737,7 +748,7 @@ mod tests {
             stale_after_seconds: 60,
             identifier_prefix: None,
         };
-        let observer = crate::fleet::observer_for(&config);
+        let observer = crate::fleet::observer_for(&config, &[]);
 
         assert_eq!(observer.current_workers().unwrap(), 1);
     }
@@ -760,7 +771,7 @@ mod tests {
         );
 
         assert_eq!(
-            count_needle_heartbeats(dir.path(), "codex", None, 60, now)
+            count_needle_heartbeats(dir.path(), "codex", None, &[], 60, now)
                 .unwrap()
                 .owned,
             1
@@ -773,7 +784,7 @@ mod tests {
         let missing = dir.path().join("missing");
 
         assert_eq!(
-            count_needle_heartbeats(&missing, "codex", None, 60, Utc::now())
+            count_needle_heartbeats(&missing, "codex", None, &[], 60, Utc::now())
                 .unwrap()
                 .owned,
             0
@@ -790,7 +801,8 @@ mod tests {
         )
         .unwrap();
 
-        let error = count_needle_heartbeats(dir.path(), "codex", None, 60, Utc::now()).unwrap_err();
+        let error =
+            count_needle_heartbeats(dir.path(), "codex", None, &[], 60, Utc::now()).unwrap_err();
         assert!(error.to_string().contains("invalid NEEDLE heartbeat"));
     }
 
@@ -1055,22 +1067,28 @@ mod tests {
         write_heartbeat(dir.path(), "codex", "luna-roster-02", now);
         write_heartbeat(dir.path(), "codex", "luna-roster-03", now);
 
+        // One listed worker leaves the floor; the other two unlisted roster
+        // workers keep it (plan §26.2).
+        let roster = vec!["luna-roster-01".to_string()];
         let counts =
-            count_needle_heartbeats(dir.path(), "codex", Some("sg-codex-"), 60, now).unwrap();
+            count_needle_heartbeats(dir.path(), "codex", Some("sg-codex-"), &roster, 60, now)
+                .unwrap();
         assert_eq!(
             counts,
             HeartbeatCounts {
                 owned: 2,
-                unowned: 3
+                unowned: 2,
+                takeover: 1,
             }
         );
 
-        let unscoped = count_needle_heartbeats(dir.path(), "codex", None, 60, now).unwrap();
+        let unscoped = count_needle_heartbeats(dir.path(), "codex", None, &[], 60, now).unwrap();
         assert_eq!(
             unscoped,
             HeartbeatCounts {
                 owned: 5,
-                unowned: 0
+                unowned: 0,
+                takeover: 0,
             }
         );
     }

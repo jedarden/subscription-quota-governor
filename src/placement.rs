@@ -387,6 +387,8 @@ mod tests {
                 actuator: ActuatorConfig::None,
                 observer_reconciliation: ObserverReconciliation::default(),
                 hosts: Some(hosts),
+                takeover: Vec::new(),
+                takeover_helper: None,
             },
             utilization: UtilizationConfig {
                 target_utilization: Some(0.85),

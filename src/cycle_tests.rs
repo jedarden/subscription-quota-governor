@@ -121,6 +121,8 @@ fn fleet_config(min_workers: u32, max_workers: u32) -> FleetConfig {
         actuator: ActuatorConfig::None,
         observer_reconciliation: ObserverReconciliation::default(),
         hosts: None,
+        takeover: Vec::new(),
+        takeover_helper: None,
     }
 }
 
