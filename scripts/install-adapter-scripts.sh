@@ -16,6 +16,8 @@ Without --verify (or the verify subcommand), install the committed adapter
 scripts into DIRECTORY/subgov-{codex,zai,anthropic}. The default DIRECTORY is
 $HOME/.local/lib. The source files are read from git HEAD, never from a dirty
 working tree. --verify only compares deployed bytes and never writes files.
+--source-root is only for a git-archive export that has no .git directory;
+normal deployments should omit it so HEAD is enforced.
 USAGE
     exit 2
 }
@@ -27,12 +29,18 @@ fail() {
 
 mode=install
 destination_root=${SUBGOV_ADAPTER_ROOT:-${HOME:?HOME is not set}/.local/lib}
+source_root=
 
 while (($# > 0)); do
     case $1 in
         --root|--destination-root)
             (($# >= 2)) || usage
             destination_root=$2
+            shift 2
+            ;;
+        --source-root)
+            (($# >= 2)) || usage
+            source_root=$2
             shift 2
             ;;
         --verify|verify)
@@ -53,12 +61,20 @@ while (($# > 0)); do
 done
 
 [[ $destination_root == /* ]] || fail "destination root must be an absolute path: $destination_root"
+if [[ -n $source_root ]]; then
+    [[ $source_root == /* ]] || fail "source root must be an absolute path: $source_root"
+    source_root=$(cd -- "$source_root" && pwd -P) || fail "source root is not accessible: $source_root"
+fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-repo_root=$(git -C "$script_dir/.." rev-parse --show-toplevel 2>/dev/null) || \
-    fail "run from a git checkout so deployed files can be read from HEAD"
-head_commit=$(git -C "$repo_root" rev-parse --verify HEAD^{commit}) || \
-    fail "could not resolve repository HEAD"
+if [[ -n $source_root ]]; then
+    head_commit='explicit source root (git-archive export)'
+else
+    repo_root=$(git -C "$script_dir/.." rev-parse --show-toplevel 2>/dev/null) || \
+        fail "run from a git checkout so deployed files can be read from HEAD"
+    head_commit=$(git -C "$repo_root" rev-parse --verify HEAD^{commit}) || \
+        fail "could not resolve repository HEAD"
+fi
 
 adapter_dirs=(subgov-codex subgov-zai subgov-anthropic)
 declare -A adapter_files=(
@@ -82,8 +98,18 @@ done
 
 # A single archive gives every destination the same immutable source snapshot,
 # even if another process edits the checkout while this command is running.
-git -C "$repo_root" archive --format=tar HEAD -- "${sources[@]}" |
-    tar -xf - -C "$stage" || fail "could not extract adapter scripts from HEAD"
+# An explicit source root exists only so the definition-of-done can exercise a
+# committed git-archive export, which necessarily has no .git directory.
+if [[ -n $source_root ]]; then
+    for source in "${sources[@]}"; do
+        [[ -f $source_root/$source ]] || fail "source root is missing $source"
+        install -D -m "$(stat -c '%a' -- "$source_root/$source")" -- \
+            "$source_root/$source" "$stage/$source"
+    done
+else
+    git -C "$repo_root" archive --format=tar HEAD -- "${sources[@]}" |
+        tar -xf - -C "$stage" || fail "could not extract adapter scripts from HEAD"
+fi
 
 check_one() {
     local adapter_dir=$1
@@ -125,7 +151,7 @@ install_one() {
     printf 'INSTALLED %s\n' "$destination"
 }
 
-printf 'Using HEAD %s\n' "$head_commit"
+printf 'Using %s\n' "$head_commit"
 failures=0
 for adapter_dir in "${adapter_dirs[@]}"; do
     for file in ${adapter_files[$adapter_dir]}; do

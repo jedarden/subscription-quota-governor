@@ -7,6 +7,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "install-adapter-scripts.sh"
+SOURCE_ARGS = [] if (REPO / ".git").exists() else ["--source-root", str(REPO)]
 MANIFEST = {
     "subgov-codex": [
         "codex-productive.py",
@@ -31,7 +32,7 @@ MANIFEST = {
 class AdapterScriptInstallerTests(unittest.TestCase):
     def run_installer(self, root, *args):
         return subprocess.run(
-            ["bash", str(SCRIPT), "--root", str(root), *args],
+            ["bash", str(SCRIPT), "--root", str(root), *SOURCE_ARGS, *args],
             cwd=REPO,
             text=True,
             capture_output=True,
