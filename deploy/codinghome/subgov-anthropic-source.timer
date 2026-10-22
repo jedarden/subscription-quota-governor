@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Anthropic quota and productive demand
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=300s
+AccuracySec=10s
+Unit=subgov-anthropic-source.service
+
+[Install]
+WantedBy=timers.target

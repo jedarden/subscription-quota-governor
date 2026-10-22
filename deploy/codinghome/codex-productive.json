@@ -12,21 +12,6 @@
   "actuator_state": "/home/coding/.local/state/subgov/codex-productive-fleet.json",
   "quota_binary": "/home/coding/.local/bin/subgov",
   "quota_config": "/home/coding/.config/subgov/codex-quota-source.yaml",
-  "work": [
-    {
-      "workspace": "/home/coding/codex-governor",
-      "id": "codexgov-d2753c47",
-      "reviewed_revision": 6,
-      "admission_evidence": "Description records operator batch admission 2026-10-16/17; reviewed under subgov-564a5b9a. Native gate-health remains binding."
-    },
-    {
-      "workspace": "/home/coding/agent-archivist",
-      "id": "aa-3404195e",
-      "reviewed_revision": 5,
-      "admission_evidence": "Notes record operator admission 2026-10-16; reviewed under subgov-564a5b9a.",
-      "external_hold": "Awaiting write-capable iad-ci credential and live cross-build acceptance; source must not dispatch until this hold is explicitly resolved and revision reviewed."
-    }
-  ],
   "unit_dir": "/home/coding/.config/systemd/user",
   "adopted_workers": [
     {
@@ -77,5 +62,20 @@
     }
   ],
   "routing_dir": "/home/coding/.config/needle/workers",
-  "adoption_env": "/home/coding/.config/subgov/codex-adopted.env"
+  "adoption_env": "/home/coding/.config/subgov/codex-adopted.env",
+  "demand": {
+    "needle_config": "/home/coding/.config/needle/config.yaml",
+    "external_holds": [
+      {
+        "workspace": "/home/coding/agent-archivist",
+        "id": "aa-3404195e",
+        "reason": "Awaiting write-capable iad-ci credential and live cross-build acceptance; source must not dispatch until this hold is explicitly resolved and revision reviewed."
+      },
+      {
+        "workspace": "/home/coding/claude-governor",
+        "id": "claudego-7a351ba7",
+        "reason": "Native NEEDLE Pluck event 2026-10-19T03:01:48Z excludes claudego-7a351ba7 as internal_artifact. Its scheduler-configuration body matches NEEDLE src/internal.rs historical_diagnostic_shape (exclude_labels). Native policy must remain binding; remove this hold only after an authorized policy/outcome change is verified."
+      }
+    ]
+  }
 }

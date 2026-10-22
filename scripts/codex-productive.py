@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Publish reviewed Codex demand and reconcile an explicit owned worker pool.
+"""Publish ready-bead demand and reconcile an explicit owned worker pool.
 
-Admission is explicit in a reviewed manifest, enforced by NEEDLE's existing
-positive-label lane. Quota availability never creates or admits work.
+NEEDLE owns placement and admission. Quota availability never creates work.
 """
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +17,7 @@ import sys
 import time
 
 from subgov_adapter_common import atomic_json, atomic_text, live_children, locked, read_json
+from subgov_ready_beads import allowed, native_internal_artifact, policy_ok, observe as ready_demand
 
 IDLE = {"SELECTING", "IDLE", "WAITING", "BACKOFF", "SLEEPING", "EXHAUSTED", "ADMISSION_BLOCKED"}
 
@@ -52,54 +51,6 @@ def current_time():
     return datetime.now(timezone.utc)
 
 
-def native_internal_artifact(issue):
-    # Match NEEDLE src/internal.rs (75267dbf), shared by Pluck and Explore.
-    # bead --ready does not project this additional native dispatch boundary.
-    labels = {label.strip().lower() for label in issue.get("labels", [])}
-    internal = {"alert", "crash", "starvation", "knot-starvation", "pluck-starvation",
-                "gate-broken", "generation-ratio", "pulse-finding", "unravel-proposal",
-                "worker-failure", "worker-loop", "infra"}
-    if labels & internal or any(label.startswith("fingerprint:") for label in labels):
-        return True
-    body = (issue.get("description") or "").lower()
-    if any(marker in body for marker in ["## agent crash report", "## gate execution error",
-            "## worker failure", "## live worker loop detected", "## scanner finding", "## alternative for:"]):
-        return True
-    if not body.strip():
-        return False
-    title = (issue.get("title") or "").lower()
-    if (any(marker in title for marker in ["starvation alert", "beads invisible to worker",
-                                          "open beads exist but pluck found none"])
-            and any(marker in body for marker in ["workspace", "open beads", "ready beads", "pluck",
-                                                  "candidate", "invisible", "starvation"])):
-        return True
-    return (any(term in body for term in ["pluck configuration", "pluck config", "exclude_labels",
-            "exclude labels", "bead discovery", "needle dispatch", "strand configuration",
-            "worker configuration", "bead filtering", "candidate exclusion"])
-            or "automated alternative proposal" in body
-            or (title.startswith("[unravel]") and "original bead:" in body))
-
-
-def allowed(issue, now):
-    if issue.get("status") != "open" or issue.get("assignee") or issue.get("manual_blocked"):
-        return False
-    if native_internal_artifact(issue):
-        return False
-    for raw in issue.get("labels", []):
-        label = raw.lower()
-        if label in {"human", "human-owned", "owner:human", "proposal-pending", "deferred",
-                     "blocked", "manual_blocked", "manual-blocked", "blocked:manual"} or label.startswith("human:"):
-            return False
-        if label.startswith(("deferred:", "quarantine-until:", "retry-cooldown-until:")):
-            try:
-                until = datetime.fromisoformat(raw.split(":", 1)[1].replace("Z", "+00:00"))
-                if until > now:
-                    return False
-            except (ValueError, TypeError):
-                return False
-    return True
-
-
 def settings_read(path):
     value = read_json(path)
     if value.get("version") != 1 or value.get("host") != "codinghome":
@@ -108,9 +59,8 @@ def settings_read(path):
         raise ValueError("unexpected worker ownership")
     if not re.fullmatch(r"codex-[A-Za-z0-9_.-]+", value.get("agent", "")):
         raise ValueError("invalid Codex adapter")
-    keys = [(entry["workspace"], entry["id"]) for entry in value["work"]]
-    if len(keys) != len(set(keys)):
-        raise ValueError("duplicate reviewed outcome")
+    if not isinstance(value.get("demand"), dict):
+        raise ValueError("missing ready-bead workspace scope")
     names = set()
     for worker in value.get("adopted_workers", []):
         name, agent = worker.get("worker_id", ""), worker.get("agent", "")
@@ -137,24 +87,6 @@ def owned(settings, worker):
     return bool(adopted(settings, worker) or (
         worker["worker_id"].startswith(settings["prefix"])
         and worker.get("model", settings["agent"]) == settings["agent"]))
-
-
-def policy_ok(route, host):
-    # Reuse the deployed publisher's conservative backend/queue policy parser.
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("subgov_policy", Path(__file__).with_name("zai-source-refresh.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    policy = module.workspace_policy(route / ".needle.yaml")
-    return ((route / ".beads/config.json").is_file()
-            and policy["bead_cli"].get("backend") == "bead-rs"
-            and policy["queue"].get("owner_host", host) == host)
-
-
-def gate_degraded(settings, route):
-    key = hashlib.sha256(str(route.resolve()).encode()).hexdigest()[:12]
-    value = read_json(Path(settings["gate_health_dir"]) / (key + ".json"), {})
-    return value.get("degraded", False) is not False
 
 
 def identity(pid, agent, identifier):
@@ -302,38 +234,6 @@ def install_adoption(settings):
 
 
 def demand(settings):
-    now, ready, blocked = current_time(), [], []
-    frontiers = {}
-    for entry in settings["work"]:
-        route = Path(entry["workspace"]).resolve()
-        reason = None
-        if not entry.get("admission_evidence"):
-            raise ValueError("missing admission evidence")
-        if entry.get("external_hold"):
-            reason = "recorded_external_hold"
-        elif not policy_ok(route, settings["host"]):
-            reason = "backend_or_queue_owner"
-        elif gate_degraded(settings, route):
-            reason = "workspace_gate_degraded"
-        else:
-            if str(route) not in frontiers:
-                values = document(run(["bead", "list", "--ready", "--json", "--limit", "10000"], cwd=route))
-                if not isinstance(values, list):
-                    raise ValueError("invalid native ready array")
-                frontiers[str(route)] = {item["id"] for item in values}
-            issue = single(run(["bead", "show", entry["id"], "--json"], cwd=route))
-            if issue.get("revision") != entry["reviewed_revision"]:
-                reason = "changed_since_review"
-            elif settings["lane_label"] not in issue.get("labels", []):
-                reason = "missing_dispatch_lane"
-            elif native_internal_artifact(issue):
-                reason = "native_internal_artifact"
-            elif issue["id"] not in frontiers[str(route)] or not allowed(issue, now):
-                reason = "not_currently_claimable"
-            else:
-                ready.append({"id": issue["id"], "workspace": str(route)})
-        if reason:
-            blocked.append({"id": entry["id"], "reason": reason})
     owned_busy, unowned = [], 0
     for worker in inspect_fleet(settings) if settings.get("adopted_workers") else workers(settings):
         if not owned(settings, worker):
@@ -349,16 +249,13 @@ def demand(settings):
         if issue.get("status") != "in_progress" or issue.get("assignee") != worker["qualified_id"]:
             raise ValueError("busy worker claim identity mismatch")
         owned_busy.append({"id": task, "workspace": str(route)})
-    jobs = {(item["workspace"], item["id"]) for item in ready + owned_busy}
-    return {"observed_at": now.isoformat(), "ready": ready, "busy": owned_busy,
-            "blocked": blocked, "unowned_floor": unowned,
-            "eligible_backlog_capacity": len(jobs) + unowned}
+    return ready_demand(settings, owned_busy, unowned)
 
 
 def refresh(settings):
     with locked(settings["snapshot"]):
         quota = document(run([settings["quota_binary"], "--config", settings["quota_config"],
-                              "snapshot", "codex"], timeout=35))
+                              "snapshot", settings.get("quota_account", "codex")], timeout=35))
         quota.pop("eligible_backlog_capacity", None)
         try:
             measured = demand(settings)
@@ -366,6 +263,7 @@ def refresh(settings):
         except Exception as exc:
             # Unknown demand must hold existing workers, never manufacture zero
             # or grant capacity. Do not forward CLI output or credentials.
+            quota["fresh"] = False
             measured = {"observed_at": current_time().isoformat(), "unknown": type(exc).__name__}
         atomic_json(settings["demand_state"], measured)
         atomic_json(settings["snapshot"], quota)

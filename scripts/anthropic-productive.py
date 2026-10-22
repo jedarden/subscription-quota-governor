@@ -14,7 +14,7 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--settings", required=True)
-    parser.add_argument("mode", choices=["demand", "actuate", "install-lane", "remove-lane"])
+    parser.add_argument("mode", choices=["demand", "refresh", "actuate", "install-lane", "remove-lane"])
     parser.add_argument("value", nargs="?")
     args = parser.parse_args()
     settings = json.loads(Path(args.settings).read_text())
@@ -25,14 +25,15 @@ def main():
             or settings.get("lane_label") != "subgov-anthropic-productive"
             or settings.get("adopted_workers")):
         raise ValueError("unexpected Anthropic ownership")
-    keys = [(item["workspace"], item["id"]) for item in settings["work"]]
-    if len(keys) != len(set(keys)):
-        raise ValueError("duplicate reviewed outcome")
+    if not isinstance(settings.get("demand"), dict):
+        raise ValueError("missing ready-bead workspace scope")
     spec = importlib.util.spec_from_file_location("productive", Path(__file__).with_name("codex-productive.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if args.mode == "demand":
         print(json.dumps(module.demand(settings)))
+    elif args.mode == "refresh":
+        module.refresh(settings)
     elif args.mode == "actuate":
         module.actuate(settings, int(args.value))
     else:

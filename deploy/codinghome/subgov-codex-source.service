@@ -1,5 +1,5 @@
 [Unit]
-Description=Codex read-only quota and reviewed productive demand publisher
+Description=Codex read-only quota and ready-bead demand publisher
 After=network-online.target
 Wants=network-online.target
 

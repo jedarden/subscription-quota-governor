@@ -1,8 +1,8 @@
 # Anthropic productive capacity on codinghome
 
 The maintained configuration is `deploy/codinghome/claude-anthropic.yaml`, installed
-at `~/.config/subgov/claude-anthropic.yaml`. Its native OAuth source and existing
-state history remain in use. The owned fleet ceiling is two, matching NEEDLE's
+at `~/.config/subgov/claude-anthropic.yaml`. A read-only publisher combines its native OAuth source with ready-bead demand;
+its existing state history remains in use. The owned fleet ceiling is two, matching NEEDLE's
 existing Anthropic provider limit. The minimum stays zero; neither a ceiling nor
 available quota admits work.
 
@@ -27,7 +27,7 @@ different model; both `seven_day` and `weekly_all` remain enabled.
 The Anthropic wrapper reuses the maintained productive adapter implementation in
 `scripts/codex-productive.py`. The shared
 `scripts/install-adapter-scripts.sh` installer copies it together with
-`anthropic-productive.py`, `subgov_adapter_common.py` and
+`anthropic-productive.py`, `subgov_ready_beads.py`, `subgov_adapter_common.py` and
 `zai-source-refresh.py` into the isolated `~/.local/lib/subgov-anthropic/`
 directory, while updating the corresponding Codex and Z.AI directories from the
 same committed `HEAD`. Run `scripts/install-adapter-scripts.sh --verify` before
@@ -37,16 +37,14 @@ used by the Anthropic wrapper. The command actuator runs through the existing
 user `systemd-run` mechanism to inspect worker identities outside the
 governor's `ProtectProc=invisible` sandbox.
 
-`deploy/codinghome/anthropic-productive.json` records reviewed ordinary outcomes.
-Each launch rechecks the exact reviewed revision, native ready frontier, positive
-lane label, human/proposal/time-bound holds, backend, host ownership and workspace
-gate health. Native NEEDLE also excludes scheduler-internal artifacts beyond the
-bead ready frontier. The shared adapter mirrors `NEEDLE/src/internal.rs` at
-`75267dbf`, including reserved labels, generated headings and historical body
-matching. Review that boundary when upgrading NEEDLE. A recorded `external_hold` retains that restriction when a
-reviewed record is rejected by native selection; it contributes zero demand.
-The positive-label NEEDLE lane binds only
-`sg-claude-anthropic-1` and `sg-claude-anthropic-2`, with `when_empty: idle`.
+`deploy/codinghome/anthropic-productive.json` declares ready-bead workspace scope
+and a `demand_state` file. The shared reader preserves native dispatch guards,
+external holds and workspace capacity limits; see
+[ready-bead demand](notes/ready-bead-demand.md) for the contract and installation.
+The ordinary pacing target is capped by measured demand. Failed demand samples
+are marked incomplete and cannot scale up. The maintained native quota input,
+normalized snapshot and Anthropic source timer must be installed together.
+The old owned positive-label lane must be removed during authorized deployment.
 New workers disable generation using a per-worker environment override. Busy
 claims must match their real supervisor and bead assignee. Scale-down retains
 busy workers; retirement requires a fresh task-free heartbeat and uses pidfds,
@@ -57,7 +55,7 @@ frozen-thread identity checks and a child-free check before sending SIGTERM.
 Back up the installed config, user unit, state and local NEEDLE configuration under
 `/home/coding/scratch/<owning-bead>/`. Resolve symlinks before editing. The base
 `subgov.service` and global NEEDLE configuration are intentionally local files;
-this repository owns the Anthropic configuration, wrapper and reviewed manifest.
+this repository owns the Anthropic configuration, wrapper and workspace scope.
 Preserve the base unit's `KillMode=process` so governor restarts leave workers alive.
 
 Build and verify the committed revision on codinghome with the Cargo wrapper.
@@ -68,9 +66,9 @@ to point `ExecStart` at that binary. Older binaries reject the new optional
 configuration field, so install the binary and config together. No existing
 provider binary or shared `~/.local/bin/subgov` is replaced.
 
-Copy the two Anthropic config/manifest files with mode 600. Install the positive
-lane through the wrapper's `install-lane` command, which preserves unrelated
-configuration bytes and refuses unfamiliar layouts. An existing worker must
+Copy the Anthropic settings, native quota source and normalized-source config
+with mode 600, plus the maintained source service/timer. Remove only the exact
+old owned lane using `remove-lane`; preserve unrelated configuration. An existing worker must
 finish its task before being safely retired and relaunched to load its lane;
 never kill a busy worker to apply configuration. Run `subgov check`, `doctor`,
 read-only quota/ownership checks, then restart only `subgov.service`. Verify actual fresh owned heartbeats, matching

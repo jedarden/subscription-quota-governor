@@ -15,32 +15,33 @@ spec.loader.exec_module(refresh)
 
 
 class RefreshTests(unittest.TestCase):
-    def test_held_proposals_and_assigned_work_are_not_ready_capacity(self):
-        base = {"status": "open", "assignee": None, "labels": []}
-        self.assertTrue(refresh.eligible(base))
-        for label in ["human", "HUMAN:review", "proposal-pending", "deferred",
-                      "quarantine-until:2099-01-01T00:00:00Z", "blocked:manual"]:
-            self.assertFalse(refresh.eligible({**base, "labels": [label]}), label)
-        self.assertFalse(refresh.eligible({**base, "assignee": "another-worker"}))
-        self.assertFalse(refresh.eligible({**base, "manual_blocked": True}))
-
-    def test_foreign_queue_is_not_queried(self):
+    def test_shared_ready_demand_is_published_for_zai(self):
         with tempfile.TemporaryDirectory() as root:
             p = Path(root)
-            (p / ".beads").mkdir()
-            (p / ".beads/config.json").write_text("{}")
-            (p / ".needle.yaml").write_text("bead_cli:\n  backend: bead-rs\nqueue:\n  owner_host: lab\n")
-            with patch.object(refresh.subprocess, "run") as run:
-                self.assertEqual(refresh.ready(root, "codinghome"), set())
-                run.assert_not_called()
+            roster = p / "roster.json"
+            roster.write_text('{"workers":[]}')
+            settings = {"roster": str(roster)}
+            expected = {"ready_bead_count": 9, "eligible_backlog_capacity": 2, "ready": []}
+            with patch.object(refresh, "ready_demand", return_value=expected) as reader:
+                self.assertEqual(refresh.backlog(settings), expected)
+                reader.assert_called_once_with(settings, [])
 
-    def test_complex_or_duplicate_ownership_fails_closed(self):
+    def test_validated_busy_claim_accepts_current_native_object(self):
+        from datetime import datetime, timezone
         with tempfile.TemporaryDirectory() as root:
-            p = Path(root) / ".needle.yaml"
-            for text in ["queue: {owner_host: lab}\n", "queue:\n  owner_host: lab\n  owner_host: codinghome\n"]:
-                p.write_text(text)
-                with self.assertRaises(ValueError):
-                    refresh.workspace_policy(p)
+            p = Path(root)
+            worker = {"worker_id": "glm-1", "agent": "glm", "unit": "needle-worker@glm-1.service"}
+            (p / "roster.json").write_text(json.dumps({"workers": [worker]}))
+            (p / "glm-glm-1.json").write_text(json.dumps({"current_bead": "native-1", "pid": 123,
+                "workspace": root, "last_heartbeat": datetime.now(timezone.utc).isoformat()}))
+            settings = {"roster": str(p / "roster.json"), "heartbeat_dir": root, "host": "codinghome"}
+            outputs = [subprocess.CompletedProcess([], 0, '123', ''), subprocess.CompletedProcess([], 0,
+                '{"id":"native-1","status":"in_progress","assignee":"glm-glm-1"}', '')]
+            with patch.object(refresh.subprocess, "run", side_effect=outputs), \
+                 patch.object(refresh, "policy_ok", return_value=True), \
+                 patch.object(refresh, "ready_demand", return_value={}) as reader:
+                refresh.backlog(settings)
+            reader.assert_called_once_with(settings, [{"workspace": root, "id": "native-1"}])
 
     def test_failed_collection_preserves_previous_snapshot(self):
         with tempfile.TemporaryDirectory() as root:
@@ -62,6 +63,7 @@ class RefreshTests(unittest.TestCase):
                     patch.object(refresh, "backlog", side_effect=TimeoutError):
                 refresh.refresh(settings)
             self.assertNotIn("eligible_backlog_capacity", json.loads(dest.read_text()))
+            self.assertFalse(json.loads(dest.read_text())["fresh"])
 
 
 if __name__ == "__main__":

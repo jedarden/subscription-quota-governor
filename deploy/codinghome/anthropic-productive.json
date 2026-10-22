@@ -8,13 +8,24 @@
   "heartbeat_dir": "/home/coding/.needle/state/heartbeats",
   "gate_health_dir": "/home/coding/.needle/state/gate-health",
   "actuator_state": "/home/coding/.local/state/subgov/anthropic-productive-fleet.json",
-  "work": [
-    {
-      "workspace": "/home/coding/claude-governor",
-      "id": "claudego-7a351ba7",
-      "reviewed_revision": 2,
-      "admission_evidence": "Ordinary manually authored defect, no generated-proposal or human holds. Reviewed under subgov-83e07f65. Native ready frontier and gate health remain binding.",
-      "external_hold": "Native NEEDLE Pluck event 2026-10-19T03:01:48Z excludes claudego-7a351ba7 as internal_artifact. Its scheduler-configuration body matches NEEDLE src/internal.rs historical_diagnostic_shape (exclude_labels). Native policy must remain binding; remove this hold only after an authorized policy/outcome change is verified."
-    }
-  ]
+  "demand": {
+    "needle_config": "/home/coding/.config/needle/config.yaml",
+    "external_holds": [
+      {
+        "workspace": "/home/coding/agent-archivist",
+        "id": "aa-3404195e",
+        "reason": "Awaiting write-capable iad-ci credential and live cross-build acceptance; source must not dispatch until this hold is explicitly resolved and revision reviewed."
+      },
+      {
+        "workspace": "/home/coding/claude-governor",
+        "id": "claudego-7a351ba7",
+        "reason": "Native NEEDLE Pluck event 2026-10-19T03:01:48Z excludes claudego-7a351ba7 as internal_artifact. Its scheduler-configuration body matches NEEDLE src/internal.rs historical_diagnostic_shape (exclude_labels). Native policy must remain binding; remove this hold only after an authorized policy/outcome change is verified."
+      }
+    ]
+  },
+  "snapshot": "/home/coding/.local/state/subgov/anthropic-productive-snapshot.json",
+  "demand_state": "/home/coding/.local/state/subgov/anthropic-productive-demand.json",
+  "quota_binary": "/home/coding/.local/bin/subgov",
+  "quota_config": "/home/coding/.config/subgov/anthropic-quota-source.yaml",
+  "quota_account": "claude-anthropic"
 }

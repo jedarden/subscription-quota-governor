@@ -1,0 +1,9 @@
+[
+  {"id":"fixture-ready","title":"Repair quota parsing","status":"open","effective_status":"open","manual_blocked":false,"assignee":null,"dependencies":[],"labels":[],"revision":3,"description":"Handle missing usage headers."},
+  {"id":"fixture-human","title":"Operator review","status":"open","manual_blocked":false,"assignee":null,"dependencies":[],"labels":["human"],"revision":1},
+  {"id":"fixture-proposal","title":"Proposed work","status":"open","manual_blocked":false,"assignee":null,"dependencies":[],"labels":["proposal-pending"],"revision":1},
+  {"id":"fixture-held","title":"Wait for service","status":"open","manual_blocked":false,"assignee":null,"dependencies":[],"labels":[],"revision":4},
+  {"id":"fixture-internal","title":"Scanner finding","status":"open","manual_blocked":false,"assignee":null,"dependencies":[],"labels":["infra"],"revision":1},
+  {"id":"fixture-quarantine","title":"Repair backend","status":"open","manual_blocked":false,"assignee":null,"dependencies":[],"labels":["quarantine-until:2099-01-01T00:00:00Z"],"revision":1},
+  {"id":"fixture-expired","title":"Repair expired hold","status":"open","manual_blocked":false,"assignee":null,"dependencies":[],"labels":["deferred:2020-01-01T00:00:00Z"],"revision":1}
+]

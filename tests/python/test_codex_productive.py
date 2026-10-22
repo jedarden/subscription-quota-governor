@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPTS))
 spec = importlib.util.spec_from_file_location("codex_productive", SCRIPTS / "codex-productive.py")
 adapter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(adapter)
+import subgov_ready_beads as ready_beads
 
 
 class ProductiveTests(unittest.TestCase):
@@ -21,8 +22,7 @@ class ProductiveTests(unittest.TestCase):
                 "gate_health_dir": str(root / "gates"), "snapshot": str(root / "snapshot.json"),
                 "demand_state": str(root / "demand.json"), "actuator_state": str(root / "actuator.json"),
                 "quota_binary": "subgov", "quota_config": "native.yaml",
-                "work": [{"workspace": str(root), "id": "test-1", "reviewed_revision": 7,
-                          "admission_evidence": "operator admitted"}]}
+                "demand": {"workspaces": [str(root)]}}
 
     def test_native_array_and_single_object_are_understood(self):
         self.assertEqual(adapter.document('[{"id":"test-1"}]')[0]["id"], "test-1")
@@ -50,43 +50,16 @@ class ProductiveTests(unittest.TestCase):
             self.assertFalse(adapter.allowed({**ordinary, **change}, adapter.current_time()), change)
         self.assertTrue(adapter.allowed({**ordinary, "title": "Starvation alert", "description": ""}, adapter.current_time()))
 
-    def test_native_ready_frontier_does_not_override_internal_classification(self):
+    def test_new_ready_bead_needs_no_curated_revision_or_lane(self):
         with tempfile.TemporaryDirectory() as root:
             settings = self.settings(Path(root))
-            issue = {"id": "test-1", "revision": 7, "status": "open", "assignee": None,
-                     "labels": [settings["lane_label"]], "description": "Verify DEFAULT_EXCLUDE_LABELS"}
-            with patch.object(adapter, "policy_ok", return_value=True), patch.object(adapter, "workers", return_value=[]), \
-                 patch.object(adapter, "run", side_effect=[json.dumps([issue]), json.dumps(issue)]):
+            issue = {"id": "new-1", "revision": 99, "status": "open", "labels": []}
+            with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[issue]), \
+                 patch.object(adapter, "workers", return_value=[]):
                 measured = adapter.demand(settings)
-            self.assertEqual(measured["eligible_backlog_capacity"], 0)
-            self.assertEqual(measured["blocked"][0]["reason"], "native_internal_artifact")
-
-    def test_reviewed_revision_native_frontier_and_lane_all_required(self):
-        with tempfile.TemporaryDirectory() as root:
-            s = self.settings(Path(root))
-            issue = {"id": "test-1", "revision": 7, "status": "open", "assignee": None,
-                     "labels": [s["lane_label"]]}
-            with patch.object(adapter, "policy_ok", return_value=True), patch.object(adapter, "workers", return_value=[]):
-                with patch.object(adapter, "run", side_effect=[json.dumps([issue]), json.dumps(issue)]):
-                    self.assertEqual(adapter.demand(s)["eligible_backlog_capacity"], 1)
-                for change, reason in [({"revision": 8}, "changed_since_review"),
-                                       ({"labels": []}, "missing_dispatch_lane")]:
-                    with patch.object(adapter, "run", side_effect=[json.dumps([issue]), json.dumps({**issue, **change})]):
-                        result = adapter.demand(s)
-                    self.assertEqual(result["eligible_backlog_capacity"], 0)
-                    self.assertEqual(result["blocked"][0]["reason"], reason)
-
-    def test_gate_or_external_hold_prevents_frontier_query(self):
-        with tempfile.TemporaryDirectory() as root:
-            s = self.settings(Path(root))
-            for external in [True, False]:
-                s["work"][0]["external_hold"] = external
-                with patch.object(adapter, "policy_ok", return_value=True), patch.object(adapter, "gate_degraded", return_value=True), \
-                     patch.object(adapter, "workers", return_value=[]), patch.object(adapter, "run") as run:
-                    result = adapter.demand(s)
-                self.assertEqual(result["eligible_backlog_capacity"], 0)
-                self.assertEqual(result["blocked"][0]["reason"], "recorded_external_hold" if external else "workspace_gate_degraded")
-                run.assert_not_called()
+            self.assertEqual(measured["eligible_backlog_capacity"], 1)
+            self.assertEqual(measured["ready"][0]["id"], "new-1")
 
     def test_failed_demand_withholds_capacity_instead_of_zero(self):
         with tempfile.TemporaryDirectory() as root:
@@ -96,7 +69,21 @@ class ProductiveTests(unittest.TestCase):
                 adapter.refresh(s)
             value = json.loads(Path(s["snapshot"]).read_text())
             self.assertNotIn("eligible_backlog_capacity", value)
+            self.assertFalse(value["fresh"])
             self.assertEqual(json.loads(Path(s["demand_state"]).read_text())["unknown"], "RuntimeError")
+
+    def test_shared_refresh_publishes_anthropic_quota_and_demand_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            settings = self.settings(Path(root))
+            settings["quota_account"] = "claude-anthropic"
+            measured = {"observed_at": "2026-10-22T00:00:00Z", "ready_bead_count": 3,
+                        "eligible_backlog_capacity": 2, "ready": []}
+            with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}') as run, \
+                 patch.object(adapter, "demand", return_value=measured):
+                adapter.refresh(settings)
+            self.assertEqual(run.call_args.args[0][-2:], ["snapshot", "claude-anthropic"])
+            self.assertEqual(json.loads(Path(settings["demand_state"]).read_text()), measured)
+            self.assertEqual(json.loads(Path(settings["snapshot"]).read_text())["eligible_backlog_capacity"], 2)
 
     def test_failed_quota_does_not_refresh_old_snapshot(self):
         with tempfile.TemporaryDirectory() as root:
@@ -110,7 +97,7 @@ class ProductiveTests(unittest.TestCase):
     def test_live_owned_claim_is_capacity_and_foreign_claim_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
             s = self.settings(Path(root))
-            s["work"] = []
+            s["demand"]["workspaces"] = []
             worker = {"worker_id": "sg-codex-1", "qualified_id": "codex-test-sg-codex-1",
                       "current_bead": "test-1", "workspace": root}
             manual = {"worker_id": "manual-worker"}

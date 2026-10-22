@@ -448,6 +448,10 @@ pub fn evaluate(
         }
         _ => ordinary_desired,
     };
+    // Ready-bead demand bounds every provider/strategy, including ordinary
+    // Anthropic pacing. Keep gradual scale-down, but never bootstrap past work.
+    let backlog_cap = snapshot.eligible_backlog_capacity.unwrap_or(u32::MAX);
+    let raw_desired = raw_desired.min(backlog_cap);
     let stepped_desired = apply_step_limits(raw_desired, current_workers, config);
     let desired_workers = banked_resets.as_ref().map_or(stepped_desired, |plan| {
         if config.banked_resets.full_speed {
@@ -459,6 +463,7 @@ pub fn evaluate(
             stepped_desired.min(plan.eligible_backlog_capacity)
         }
     });
+    let desired_workers = desired_workers.min(current_workers.max(backlog_cap));
     Ok(Decision {
         account: account_name.to_owned(),
         observed_at: snapshot.observed_at,
@@ -1863,6 +1868,34 @@ mod tests {
         assert!(plan.exogenous_burn_per_hour.is_none());
         assert!(plan.max_feasible_burn_per_hour.is_none());
         assert!(!plan.feasible);
+    }
+
+    #[test]
+    fn ordinary_pacing_is_bounded_by_ready_work_even_with_spare_quota() {
+        let now = Utc::now();
+        let (mut config, mut snapshot) = full_speed_fixture(now);
+        config.banked_resets.enabled = false;
+        config.utilization.strategy = Strategy::CeilingOnly;
+        config.fleet.min_workers = 2;
+        config.fleet.max_scale_down_per_cycle = 1;
+        let prior = AccountState::default();
+        for capacity in [0, 1, 3] {
+            snapshot.eligible_backlog_capacity = Some(capacity);
+            let decision = evaluate("anthropic", &config, &snapshot, &prior, 0, now).unwrap();
+            assert_eq!(decision.desired_workers, capacity);
+        }
+        snapshot.eligible_backlog_capacity = Some(0);
+        let draining = evaluate("anthropic", &config, &snapshot, &prior, 5, now).unwrap();
+        assert_eq!(draining.desired_workers, 4);
+        // Adapter query failure marks the combined observation incomplete.
+        snapshot.eligible_backlog_capacity = None;
+        snapshot.fresh = false;
+        assert_eq!(
+            evaluate("anthropic", &config, &snapshot, &prior, 0, now)
+                .unwrap()
+                .desired_workers,
+            0
+        );
     }
 
     #[test]

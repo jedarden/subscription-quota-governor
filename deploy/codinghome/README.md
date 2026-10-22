@@ -7,28 +7,14 @@ downward step, provider short-window constraints, source freshness, and manual
 redemption boundary. Missing demand holds; known no-work drains safely. A busy
 worker is retained until it is task-free, fresh, and child-free.
 
-`codex-productive.json` is a reviewed work manifest, not an admission mechanism.
-Each ID needs existing operator admission evidence. A native ready query, human
-and time-bound holds, backend/host ownership, exact reviewed bead revision, and
-NEEDLE's real workspace gate-health state all constrain eligibility. Recorded
-external waits contribute no work. Changes since review require reviewing the
-owning record and updating the manifest, not discarding its holds. A current
-owned claim is counted only after matching the live supervisor and bead assignee.
-The explicit adopted roster covers the other eight local Codex workers on the
-same default Codex account. It preserves their GPT-6 Sol, GPT-6 Luna, and GPT-5.6
-Luna adapters and startup workspaces. A command observer checks the complete
-mixed-adapter pool, including actual supervisor identities, fresh heartbeats,
-effective systemd restart guards, and installed routing. An unexpected live Codex
-worker holds observation and demand until its ownership/account is reviewed.
-
-NEEDLE's existing positive-label lanes bind the twelve explicit identifiers
-`sg-codex-1` through `sg-codex-12` and the eight adopted identifiers to
-`subgov-codex-productive`, with
-`when_empty: idle`. Both home selection and roaming obey that label. Only already
-admitted, reviewed records receive it. Label-free generated proposals are not
-capacity. New workers also disable NEEDLE's Weave generation gate through a
-per-worker environment override. No tmux-server or other worker environment is
-changed.
+`codex-productive.json` declares the owned pool and ready-bead workspace scope.
+The shared adapter reads NEEDLE's native ready frontier, retaining human,
+proposal, timed and external holds, backend/host ownership and workspace gates.
+It caps build-heavy workspaces at one worker and validates current owned claims.
+See [ready-bead demand](../../docs/notes/ready-bead-demand.md) for the contract,
+all-pool settings, evidence fields and migration from curated positive lanes.
+New workers keep NEEDLE generation disabled. The adopted roster retains its
+existing identity and safe retirement checks.
 
 The adopted systemd instances are disabled without stopping their live tasks.
 Their exact `zzzz-subgov-codex.conf` drop-ins set `Restart=no`, disable generation
@@ -37,7 +23,7 @@ The two `reset-*` workers are direct tmux supervisors with no restart loop.
 Subgov adopts all current PIDs without restarting them. The six systemd workers already poll for configuration reload every 30 seconds,
 so they load the expanded lane without a restart. The two reset workers and
 original elastic worker have reload polling disabled; their previous lane settings
-remain until safe retirement. Replacement workers load the maintained positive lane. Busy claims and workers
+remain until safe retirement. Deployment must remove the obsolete owned positive lane before ready-demand dispatch. Busy claims and workers
 with children remain pending until a fresh, task-free, child-free boundary is
 verified. NEEDLE's `stop` command cancels work and is not a drain mechanism.
 Restore prioritizes the existing adopted slots, preserving their models/routing;
@@ -70,9 +56,8 @@ Only the Codex unit uses this binary; other provider units keep their binaries.
 
 Copy these files with mode 600 into `~/.config/subgov/`: `codex.yaml`,
 `codex-quota-source.yaml`, and `codex-productive.json`. Copy the three scripts
-`codex-productive.py`, `subgov_adapter_common.py`, and `zai-source-refresh.py`
-from `scripts/` into `~/.local/lib/subgov-codex/`; only the conservative workspace
-policy parser is reused from the Z.AI publisher. Use the shared installer so
+`codex-productive.py`, `subgov_adapter_common.py`, `subgov_ready_beads.py` and
+`zai-source-refresh.py` from `scripts/` into `~/.local/lib/subgov-codex/`. Use the shared installer so
 the Codex, Z.AI, and Anthropic copies are all taken from one committed `HEAD`
 snapshot and checked byte-for-byte:
 
@@ -94,7 +79,7 @@ precedence over earlier fleet/worker environment files when slots restart.
 ```bash
 python3 -B scripts/codex-productive.py \
   --settings ~/.config/subgov/codex-productive.json \
-  install-lane ~/.config/needle/config.yaml
+  remove-lane ~/.config/needle/config.yaml
 python3 -B scripts/codex-productive.py \
   --settings ~/.config/subgov/codex-productive.json install-adoption
 systemctl --user daemon-reload

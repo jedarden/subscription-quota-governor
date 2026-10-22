@@ -1,0 +1,16 @@
+# Read-only native quota input for the ready-bead publisher; never actuates.
+version: 1
+accounts:
+  claude-anthropic:
+    source:
+      type: anthropic_oauth
+      credentials_path: ~/.claude/.credentials.json
+      timeout_seconds: 15
+    fleet:
+      min_workers: 0
+      max_workers: 2
+      observer: {type: static, workers: 0}
+      actuator: {type: none}
+    utilization:
+      reserve_fraction: 0.15
+      strategy: linear_to_reset

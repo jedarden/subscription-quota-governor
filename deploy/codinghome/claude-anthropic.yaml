@@ -5,9 +5,8 @@ state_path: ~/.local/state/subscription-governor/claude-anthropic.json
 accounts:
   claude-anthropic:
     source:
-      type: anthropic_oauth
-      credentials_path: ~/.claude/.credentials.json
-      timeout_seconds: 15
+      type: normalized_file
+      path: /home/coding/.local/state/subgov/anthropic-productive-snapshot.json
     fleet:
       min_workers: 0
       max_workers: 2
