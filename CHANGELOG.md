@@ -11,6 +11,18 @@ versioned config-schema contract; see
 
 ### Added
 
+- Plan §26.2 roster takeover: an account's fleet may declare a `takeover`
+  list of roster workers (worker_id, agent, optional systemd unit) plus a
+  `takeover_helper` command. Listed workers leave the §23 unowned floor, so
+  elastic workers launch even while the roster satisfies demand, and after
+  each cycle's elastic reconcile the helper runs one idle-only retirement
+  step, retiring a listed worker only while a fresh prefixed replacement
+  runs in the same pool. `scripts/zai-takeover.py` is the production helper
+  for the Z.AI pool (identity, idleness, live-children and unit MainPID
+  verification, pidfd/SIGSTOP/SIGTERM, restart-guard drop-ins for unit
+  targets, straggler adoption without a unit; never `needle cleanup`).
+  See `examples/takeover-claude-zai.yaml` and
+  `deploy/codinghome/zai-takeover-manifest.json`.
 - Plan §26.5 seed-workspace selection: new workers are launched with
   `-w <ready workspace with fewest running workers>` and never bare. The
   productive pool adapters seed each launch from live supervisor occupancy;

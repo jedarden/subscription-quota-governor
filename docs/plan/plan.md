@@ -1382,7 +1382,9 @@ mid-build:
 
 ## 23. Elastic Tier over the NEEDLE Roster
 
-Status: plan locked 2026-10-10; no item below is implemented yet.
+Status: plan locked 2026-10-10; WP15–WP17 delivered. **§26.2 supersedes the
+ownership floor below for any pool that declares a `takeover` list** (see the
+amendments noted in §23.2 and §23.4).
 
 ### 23.1 Purpose
 
@@ -1398,6 +1400,10 @@ provider's quota, on top of the roster's fixed floor.
 1. **The roster is the floor.** subgov never starts, stops, restarts, or
    edits any `needle-worker@*` unit, and never stops a NEEDLE process it did
    not launch. The roster remains owned by `apply-ex44-fleet.sh`.
+   *(§26.2 supersedes this for a pool with a `takeover` list: listed units
+   are retired idle-only, outside systemd for the signal reach, once a
+   prefixed replacement runs in the same pool. Unlisted roster units keep
+   this guarantee.)*
 2. **Elastic workers are the governor's.** They are launched by the
    `needle_run` actuator and carry an explicit `identifier_prefix` (by
    convention `sg-<account>-`; opting in requires setting it). Anything without
@@ -1440,6 +1446,12 @@ estimate or pacing undercounts. Per cycle:
 
 A floor that alone reaches the target drives `desired_elastic` to
 `min_workers`; the governor never stops roster workers to make room.
+*(§26.2 amendment: takeover-listed workers are counted separately from
+`unowned`, so they hold no floor — otherwise a roster satisfying demand
+would keep `desired_elastic` at `min_workers` forever and the takeover
+could never start. Elastic reconcile is followed by one idle-only
+retirement step through the pool's takeover helper, which removes a listed
+worker only while a prefixed replacement runs.)*
 
 ### 23.5 Provider specifics (locked)
 
@@ -1672,6 +1684,13 @@ isolated state before considering production actuation. Existing §24/WP22
 `subgov-d80695e2`; this additive policy does not change or satisfy that gate.
 No production policy is enabled by the example or implementation.
 
+Superseded as the end state (2026-10-22): §26.2 reconciles this managed
+roster with §23 — the roster's 18 units plus adopted stragglers become the
+Z.AI pool's `takeover` list, `sg-zai-` elastic workers replace them, and the
+idle-only takeover helper retires each listed worker once a prefixed
+replacement runs. The saturation policy itself (this section) still governs
+the pool's pacing.
+
 ## 26. Whole-fleet management (decided 2026-10-22)
 
 Goal: every NEEDLE worker on codinghome is launched and retired by subgov in
@@ -1725,7 +1744,14 @@ pool's ready demand, and scale-down takes idle workers first.
 - WP23 ready-bead demand adapter (all pools) replacing hand-curated `work`.
 - WP24 measured host ceiling and cross-pool arbitration.
 - WP25 takeover: `sg-zai-` elastic workers, roster retirement, reconcile §25
-  with §23, and straggler adoption.
+  with §23, and straggler adoption (delivered 2026-10-22, `subgov-f602b666`:
+  `fleet.takeover` lists worker_id/agent/unit targets that leave the §23
+  floor; after each cycle's elastic reconcile the `takeover_helper` runs one
+  idle-only retirement, gated on fresh prefixed heartbeats;
+  `scripts/zai-takeover.py` verifies identity, idleness, children, and unit
+  MainPID before pidfd/SIGSTOP/SIGTERM — never `needle cleanup`;
+  `examples/takeover-claude-zai.yaml` and
+  `deploy/codinghome/zai-takeover-manifest.json` carry the cutover config).
 - WP26 seed-workspace selection.
 - Already tracked: one binary and one adapter installer (done 2026-10-22, all
   three services on `~/.local/lib/subgov/current`), backpressure live gate
