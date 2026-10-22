@@ -3,6 +3,7 @@ services, or worker processes."""
 import argparse
 from datetime import datetime, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -265,6 +266,80 @@ class TakeoverTests(unittest.TestCase):
         ]
         with patch.object(sys, "argv", argv):
             self.assertEqual(takeover_module.main(), 0)
+
+    def test_dry_run_verdicts_every_target_without_pidfd_or_state(self):
+        for target in manifest()["targets"]:
+            self.running(target)
+        self.make_proc_tree(child_state="Z")
+        with patch.object(os, "pidfd_open", side_effect=AssertionError("dry run must not open a pidfd")), \
+             patch.object(takeover_module.signal, "pidfd_send_signal", side_effect=AssertionError("dry run must not signal")):
+            report = self.fleet.rehearse()
+        self.assertEqual([entry["verdict"] for entry in report["verdicts"]], ["eligible", "eligible"])
+        self.assertEqual(report["replacements"], 1)
+        self.assertEqual(report["budget"], 1)
+        # Read-only: no lock file, so a rehearsal never blocks a live run.
+        self.assertFalse((self.root / "state.json.lock").exists())
+
+    def test_dry_run_classifies_busy_stale_and_missing_targets(self):
+        target = manifest()["targets"][0]
+        self.fleet.busy = {target["worker_id"]}
+        self.running(target)
+        self.make_proc_tree()
+        verdicts = {entry["worker_id"]: entry["verdict"] for entry in self.fleet.rehearse()["verdicts"]}
+        self.assertEqual(verdicts[target["worker_id"]], "busy")
+        self.assertEqual(verdicts[manifest()["targets"][1]["worker_id"]], "not running")
+        self.fleet.stale = {target["worker_id"]}
+        verdicts = {entry["worker_id"]: entry["verdict"] for entry in self.fleet.rehearse()["verdicts"]}
+        self.assertEqual(verdicts[target["worker_id"]], "stale heartbeat")
+
+    def test_dry_run_classifies_identity_and_unit_mismatch(self):
+        target = manifest()["targets"][0]
+        self.running(target)
+        self.make_proc_tree(child_state="Z")
+        with patch.object(self.fleet, "process_identity",
+                          side_effect=ValueError("supervisor identity differs from the takeover target")):
+            verdicts = {entry["worker_id"]: entry["verdict"] for entry in self.fleet.rehearse()["verdicts"]}
+        self.assertEqual(verdicts[target["worker_id"]], "identity mismatch")
+        with patch.object(self.fleet, "unit_main_pid", return_value=0):
+            verdicts = {entry["worker_id"]: entry["verdict"] for entry in self.fleet.rehearse()["verdicts"]}
+        self.assertEqual(verdicts[target["worker_id"]], "unit missing")
+
+    def test_dry_run_reports_live_children_as_busy(self):
+        target = manifest()["targets"][0]
+        self.running(target)
+        self.make_proc_tree(child_state="S")
+        with patch.object(takeover_module, "live_children", side_effect=takeover_module.live_children):
+            verdicts = {entry["worker_id"]: entry["verdict"] for entry in self.fleet.rehearse()["verdicts"]}
+        self.assertEqual(verdicts[target["worker_id"]], "busy")
+
+    def test_main_dry_run_reports_and_takes_no_lock(self):
+        atomic_json(str(self.root / "manifest.json"), manifest())
+        argv = [
+            "zai-takeover.py", "--dry-run",
+            "--manifest", str(self.root / "manifest.json"),
+            "--state", str(self.root / "state.json"),
+            "--heartbeat-dir", str(self.heartbeats),
+            "--unit-dir", str(self.root / "units"),
+            "--proc-root", str(self.root / "proc"),
+        ]
+        with patch.object(sys, "argv", argv), patch("sys.stdout", new_callable=io.StringIO) as out:
+            with patch.object(os, "pidfd_open", side_effect=AssertionError("dry run must not open a pidfd")), \
+                 patch.object(takeover_module.signal, "pidfd_send_signal", side_effect=AssertionError("dry run must not signal")):
+                self.assertEqual(takeover_module.main(), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(len(report["verdicts"]), len(manifest()["targets"]))
+        self.assertFalse((self.root / "state.json.lock").exists())
+
+    def test_main_dry_run_still_rejects_a_tampered_manifest(self):
+        document = manifest(targets=[dict(worker_id="glm-1", agent="claude-code-glm-5.3-flash", unit="other.service")])
+        atomic_json(str(self.root / "manifest.json"), document)
+        argv = [
+            "zai-takeover.py", "--dry-run",
+            "--manifest", str(self.root / "manifest.json"),
+            "--state", str(self.root / "state.json"),
+        ]
+        with patch.object(sys, "argv", argv):
+            self.assertEqual(takeover_module.main(), 1)
 
 
 if __name__ == "__main__":

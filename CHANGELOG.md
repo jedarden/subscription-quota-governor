@@ -23,6 +23,12 @@ versioned config-schema contract; see
   targets, straggler adoption without a unit; never `needle cleanup`).
   See `examples/takeover-claude-zai.yaml` and
   `deploy/codinghome/zai-takeover-manifest.json`.
+- Plan §26.2 cutover rehearsal: `scripts/zai-takeover.py --dry-run` prints one
+  verdict per takeover target (eligible / busy / identity mismatch / unit
+  missing / stale heartbeat / not running) by running every read-only
+  retirement gate — identity pinning, idleness, live children, unit MainPID —
+  plus the pool replacement budget, without opening a pidfd, taking the state
+  lock, or sending any signal.
 - Plan §26.5 seed-workspace selection: new workers are launched with
   `-w <ready workspace with fewest running workers>` and never bare. The
   productive pool adapters seed each launch from live supervisor occupancy;

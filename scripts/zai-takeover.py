@@ -143,6 +143,59 @@ class Takeover:
             atomic_text(str(dropin), self.dropin(target))
             self.systemd("daemon-reload")
 
+    def verdict(self, target):
+        """The read-only gates of stop_idle, reported instead of actuated: the
+        same checks that precede the first signal, so a cutover can be
+        rehearsed against the live roster without freezing or stopping
+        anything. The freeze is itself a signal and stays live-only."""
+        identity = f"{target['agent']}-{target['worker_id']}"
+        try:
+            pid = read_json(self.heartbeat_dir / (identity + ".json"), {}).get("pid")
+            if not isinstance(pid, int) or pid <= 0:
+                return "not running", "no heartbeat"
+            heartbeat = self.heartbeat(target, pid)
+            if not self.idle(heartbeat):
+                return "busy", f"state={heartbeat.get('state')} bead={heartbeat.get('current_bead')}"
+            self.process_identity(target, pid)
+            tasks = list((self.proc / str(pid) / "task").iterdir())
+            children = [child for task in tasks for child in live_children(task, self.proc)]
+            if children:
+                return "busy", f"live children {children}"
+            if target.get("unit") and self.unit_main_pid(target["unit"]) != pid:
+                return "unit missing", "unit MainPID differs from the heartbeat pid"
+        except json.JSONDecodeError as error:
+            return "identity mismatch", f"malformed heartbeat ({error})"
+        except KeyError as error:
+            return "identity mismatch", f"heartbeat is missing {error}"
+        except ValueError as error:
+            message = str(error)
+            if "stale" in message:
+                return "stale heartbeat", message
+            return "identity mismatch", message
+        except OSError as error:
+            return "not running", f"supervisor is gone ({type(error).__name__})"
+        except RuntimeError as error:
+            return "unit missing", str(error)
+        return "eligible", "identity, idleness, children and unit gates pass"
+
+    def rehearse(self):
+        """One verdict per takeover target plus the pool replacement gate:
+        exactly what a live cycle would and would not do, performed not at
+        all. Retirement stays unauthorized while no prefixed replacement
+        runs, so eligible verdicts are eligibility, not a pending signal."""
+        fresh = self.replacements()
+        report = {"replacements": fresh, "budget": min(self.args.limit, fresh), "verdicts": []}
+        for target in self.manifest["targets"]:
+            verdict, reason = self.verdict(target)
+            report["verdicts"].append({
+                "worker_id": target["worker_id"],
+                "agent": target["agent"],
+                "unit": target.get("unit", ""),
+                "verdict": verdict,
+                "reason": reason,
+            })
+        return report
+
     def stop_unit(self, target, pidfd):
         self.install_guard(target)
         self.systemd("stop", "--no-block", target["unit"])
@@ -240,6 +293,8 @@ def main():
     parser.add_argument("--proc-root", default="/proc", help=argparse.SUPPRESS)
     parser.add_argument("--stale-after", type=float, default=60)
     parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print one verdict per takeover target and exit; no pidfd, no lock, no signal")
     args = parser.parse_args()
     if args.stale_after <= 0 or args.limit < 1:
         parser.error("invalid freshness/retirement limit")
@@ -251,8 +306,12 @@ def main():
     try:
         manifest = manifest_read(args.manifest)
         takeover = Takeover(args, manifest)
-        with locked(takeover.state_path):
-            print(json.dumps(takeover.retire(args.limit)))
+        if args.dry_run:
+            # A rehearsal races no live run and mutates nothing: no state lock.
+            print(json.dumps(takeover.rehearse()))
+        else:
+            with locked(takeover.state_path):
+                print(json.dumps(takeover.retire(args.limit)))
     except Exception as error:
         print(f"zai-takeover: operation failed ({type(error).__name__})", file=sys.stderr)
         return 1
