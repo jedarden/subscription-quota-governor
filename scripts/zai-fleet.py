@@ -12,7 +12,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from subgov_adapter_common import atomic_json, atomic_text, locked, read_json
+from subgov_adapter_common import atomic_json, atomic_text, live_children, locked, read_json
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 AGENT = re.compile(r"^claude-code-glm-[A-Za-z0-9_.-]+$")
@@ -159,7 +159,7 @@ class Fleet:
                     return False
                 time.sleep(0.01)
             # Every thread can spawn children, not only the main thread.
-            if any((task / "children").read_text().strip() for task in tasks):
+            if any(live_children(task, self.proc) for task in tasks):
                 return False
             if not self.idle(self.heartbeat(worker, pid)) or self.status(worker)["pid"] != pid or self.process_identity(worker, pid) != generation:
                 return False

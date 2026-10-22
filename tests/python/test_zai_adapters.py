@@ -390,6 +390,18 @@ class FleetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fleet_module.Fleet.process_identity(self.fleet, worker, 100)
 
+    def test_zombie_child_does_not_prevent_stop(self):
+        worker = self.roster['workers'][0]
+        info = dict(pid=100, ActiveState='active', masked=False)
+        self.fleet.statuses[worker['unit']] = info.copy()
+        self.proc_fixture('4321')
+        zombie = self.root/'proc'/'4321'
+        zombie.mkdir()
+        (zombie/'stat').write_text('4321 (git) Z 100 100 100 0 -1\n')
+        with patch.object(os, 'pidfd_open', return_value=987), patch.object(os, 'close'), patch.object(fleet_module.signal, 'pidfd_send_signal'):
+            self.assertTrue(self.fleet.stop_idle(worker, info))
+        self.assertIn(('stop', '--no-block', worker['unit']), self.fleet.events)
+
     def test_stop_failure_always_resumes(self):
         worker = self.roster['workers'][0]
         self.fleet.statuses[worker['unit']].update(pid=100, ActiveState='active')

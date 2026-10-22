@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 
-from subgov_adapter_common import atomic_json, atomic_text, locked, read_json
+from subgov_adapter_common import atomic_json, atomic_text, live_children, locked, read_json
 
 IDLE = {"SELECTING", "IDLE", "WAITING", "BACKOFF", "SLEEPING", "EXHAUSTED", "ADMISSION_BLOCKED"}
 
@@ -382,7 +382,7 @@ def retention_order(worker):
         return (0, worker["worker_id"])
     try:
         tasks = list(Path("/proc", str(worker["pid"]), "task").iterdir())
-        child_bearing = not tasks or any((task / "children").read_text().strip() for task in tasks)
+        child_bearing = not tasks or any(live_children(task) for task in tasks)
     except (OSError, KeyError):
         child_bearing = True
     # Prefer keeping an idle supervisor with children over a child-free idle
@@ -411,7 +411,7 @@ def stop_idle(settings, worker):
             if time.monotonic() > limit:
                 return False
             time.sleep(.01)
-        if any((task / "children").read_text().strip() for task in tasks):
+        if any(live_children(task) for task in tasks):
             return False
         current = next((value for value in workers(settings) if value["pid"] == pid), None)
         if not current or not idle(current) or identity(pid, agent, name) != generation:

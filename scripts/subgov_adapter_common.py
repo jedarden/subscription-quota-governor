@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from contextlib import contextmanager
+from pathlib import Path
 
 
 def read_json(path, default=None):
@@ -52,3 +53,25 @@ def locked(path):
         yield
     finally:
         os.close(fd)
+
+
+def live_children(task, proc_root="/proc"):
+    """Return the child PIDs of a /proc/<pid>/task/<tid> entry that can still act.
+
+    A zombie (state Z) or dead (X) child has already exited and cannot run
+    work, so it must not block retiring an idle supervisor: a supervisor that
+    never reaps one of its children would otherwise be unretirable forever.
+    A child whose state cannot be read is treated as live, which keeps the
+    check conservative (the worker is simply not stopped this cycle).
+    """
+    live = []
+    for child in (Path(task) / "children").read_text().split():
+        try:
+            stat = (Path(proc_root) / child / "stat").read_text()
+            state = stat.rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            live.append(child)
+            continue
+        if state not in ("Z", "X"):
+            live.append(child)
+    return live

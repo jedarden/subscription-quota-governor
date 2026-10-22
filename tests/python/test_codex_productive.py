@@ -150,6 +150,30 @@ class ProductiveTests(unittest.TestCase):
                 self.assertFalse(adapter.stop_idle({"agent": "codex-test"}, worker))
             self.assertEqual([call.args[1] for call in send.call_args_list], [signal.SIGSTOP, signal.SIGCONT])
 
+    def test_zombie_child_does_not_block_retiring_an_idle_supervisor(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as proc_root:
+            task = Path(root) / "1"
+            task.mkdir()
+            (task / "status").write_text("State:\tT (stopped)\n")
+            (task / "children").write_text("88")
+            proc = Path(proc_root)
+            (proc / "88").mkdir(parents=True)
+            (proc / "88" / "stat").write_text("88 (git) Z 123 123 123 0 -1\n")
+            real_path = Path
+            def path(*parts):
+                return real_path(root) if parts == ("/proc", "123", "task") else real_path(*parts)
+            worker = {"pid": 123, "worker_id": "sg-codex-1", "state": "SELECTING", "is_idle": True,
+                      "current_bead": None, "current_task": None}
+            real_live_children = adapter.live_children
+            with patch.object(adapter, "Path", side_effect=path), patch.object(adapter, "identity", return_value="generation"), \
+                 patch.object(adapter, "live_children", side_effect=lambda t: real_live_children(t, proc)), \
+                 patch.object(adapter, "workers", return_value=[worker]), \
+                 patch.object(adapter.os, "pidfd_open", return_value=9), patch.object(adapter.os, "close"), \
+                 patch.object(adapter.signal, "pidfd_send_signal") as send:
+                self.assertTrue(adapter.stop_idle({"agent": "codex-test"}, worker))
+            self.assertEqual([call.args[1] for call in send.call_args_list],
+                             [signal.SIGSTOP, signal.SIGTERM, signal.SIGCONT])
+
     def test_lane_install_preserves_unrelated_bytes_and_exact_scope(self):
         with tempfile.TemporaryDirectory() as root:
             s = self.settings(Path(root))
