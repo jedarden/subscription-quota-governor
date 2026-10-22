@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from subgov_adapter_common import atomic_text, live_children, locked, read_json
+from subgov_adapter_common import atomic_json, atomic_text, live_children, locked, read_json
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 IDLE_STATES = {"SELECTING", "IDLE", "WAITING", "BACKOFF", "SLEEPING", "EXHAUSTED"}
@@ -211,6 +211,17 @@ class Takeover:
         except ProcessLookupError:
             pass
 
+    def record(self, retired):
+        """The durable retirement record at --state: what the §26.2 cutover
+        evidence and the restart-guard markers both key off, appended under
+        the manifest identity so a rebuilt manifest starts a new history."""
+        state = read_json(self.state_path, {})
+        history = state.get("retirements")
+        if not isinstance(history, list):
+            history = []
+        history.extend(retired)
+        atomic_json(self.state_path, {"manifest": self.identity, "retirements": history})
+
     def retire(self, limit):
         fresh = self.replacements()
         budget = min(limit, fresh)
@@ -220,9 +231,12 @@ class Takeover:
         for target in self.manifest["targets"]:
             if len(retired) >= budget:
                 break
-            if self.stop_idle(target):
-                retired.append(target["worker_id"])
-        return {"retired": retired}
+            record = self.stop_idle(target)
+            if record:
+                retired.append(record)
+        if retired:
+            self.record(retired)
+        return {"retired": [entry["worker_id"] for entry in retired]}
 
     def stop_idle(self, target):
         try:
@@ -261,10 +275,19 @@ class Takeover:
                     return False
                 if target.get("unit"):
                     self.stop_unit(target, pidfd)
+                    method = "unit"
                 else:
                     self.stop_straggler(target, pidfd)
                     self.await_exit(pid)
-                return True
+                    method = "signal"
+                return {
+                    "worker_id": target["worker_id"],
+                    "agent": target["agent"],
+                    "unit": target.get("unit", ""),
+                    "pid": pid,
+                    "method": method,
+                    "retired_at": datetime.now(timezone.utc).isoformat(),
+                }
             finally:
                 if frozen:
                     try:

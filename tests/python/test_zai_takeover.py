@@ -189,6 +189,33 @@ class TakeoverTests(unittest.TestCase):
         self.assertEqual(sent[0], takeover_module.signal.SIGSTOP)
         self.assertEqual(sent[-1], takeover_module.signal.SIGCONT)
 
+    def test_retirement_appends_a_durable_record_at_state(self):
+        target = manifest()["targets"][0]
+        self.running(target)
+        self.make_proc_tree()
+        with patch.object(os, "pidfd_open", return_value=os.open(os.devnull, os.O_RDONLY)), \
+             patch.object(takeover_module.signal, "pidfd_send_signal"), \
+             patch.object(takeover_module, "live_children", return_value=[]):
+            self.fleet.retire(1)
+        state = read_json(str(self.root / "state.json"))
+        self.assertEqual(state["manifest"], self.fleet.identity)
+        self.assertEqual(len(state["retirements"]), 1)
+        record = state["retirements"][0]
+        self.assertEqual(record["worker_id"], target["worker_id"])
+        self.assertEqual(record["unit"], target["unit"])
+        self.assertEqual(record["pid"], 100)
+        self.assertEqual(record["method"], "unit")
+        self.assertIn("retired_at", record)
+
+    def test_no_retirement_writes_no_state(self):
+        self.fleet.busy = {manifest()["targets"][0]["worker_id"]}
+        self.running(manifest()["targets"][0])
+        self.make_proc_tree()
+        with patch.object(os, "pidfd_open", side_effect=AssertionError("must not open a pidfd")), \
+             patch.object(takeover_module.signal, "pidfd_send_signal", side_effect=AssertionError("must not signal")):
+            self.assertEqual(self.fleet.retire(1), {"retired": []})
+        self.assertFalse((self.root / "state.json").exists())
+
     def test_live_thread_child_blocks_and_resume_still_happens(self):
         self.running(manifest()["targets"][0])
         self.make_proc_tree(child_state="S")

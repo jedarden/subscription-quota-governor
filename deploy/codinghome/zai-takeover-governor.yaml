@@ -1,0 +1,124 @@
+# Deployed cutover config for the §26.2 Z.AI takeover (installed mode 600 as
+# ~/.config/subgov/claude-zai-takeover.yaml; the takeover list mirrors
+# zai-takeover-manifest.json exactly). Shape and comments: the example.
+version: 1
+poll_interval_seconds: 300
+state_path: /home/coding/.local/state/subgov/claude-zai.json
+# Plan §26.2: takeover of the static Z.AI roster. sg-zai- elastic workers are
+# launched exactly as in elastic-claude-zai.yaml; each cycle's elastic
+# reconcile is followed by one idle-only retirement step through the takeover
+# helper, and only while an sg-zai- replacement is running. The listed roster
+# units leave the §23 unowned floor the moment the prefix is configured, so
+# the pool converges to fully elastic as the fixed workers drain. The
+# manifest mirrors the takeover list; both come from the §25 managed roster
+# (zai-saturation-roster.json) plus any adopted stragglers. Deploy the
+# manifest mode 600 as ~/.config/subgov/zai-takeover-manifest.json and the
+# helper via scripts/install-adapter-scripts.sh.
+accounts:
+  claude-zai:
+    source:
+      type: command
+      argv: [/home/coding/.local/bin/subgov-zai-quota]
+    fleet:
+      min_workers: 0
+      max_workers: 18
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 1
+      observer:
+        type: needle_status
+        agent: claude-code-glm-5.3-flash
+        identifier_prefix: sg-zai-
+        stale_after_seconds: 60
+      actuator:
+        type: needle_run
+        repo: /home/coding/SEAM
+        adapter: claude-code-glm-5.3-flash
+        identifier_prefix: sg-zai-
+        # Plan §26.5: seed each new worker with the ready workspace that has
+        # the fewest running workers. Without a readable demand state
+        # scale-up fails closed, and `repo` remains the single seed if these
+        # are removed.
+        seed_demand_state: /home/coding/.local/state/subgov/zai-ready-demand.json
+        seed_heartbeats: /home/coding/.needle/state/heartbeats
+      takeover:
+        - worker_id: glm-beadrs-2
+          agent: claude-code-glm-5.3
+          unit: needle-worker@glm-beadrs-2.service
+        - worker_id: glm-front-archivist
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-archivist.service
+        - worker_id: glm-front-argowf
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-argowf.service
+        - worker_id: glm-front-chess
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-chess.service
+        - worker_id: glm-front-clasp
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-clasp.service
+        - worker_id: glm-front-dashboard
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-dashboard.service
+        - worker_id: glm-front-herdr
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-herdr.service
+        - worker_id: glm-front-hoop
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-hoop.service
+        - worker_id: glm-front-ibkr
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-ibkr.service
+        - worker_id: glm-front-icg
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-icg.service
+        - worker_id: glm-front-loom
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-loom.service
+        - worker_id: glm-front-nativeads
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-nativeads.service
+        - worker_id: glm-front-nixosast
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-nixosast.service
+        - worker_id: glm-front-orproxy
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-orproxy.service
+        - worker_id: glm-front-polish
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-polish.service
+        - worker_id: glm-front-twill
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-twill.service
+        - worker_id: glm-front-twproxy
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-front-twproxy.service
+        - worker_id: glm-seam
+          agent: claude-code-glm-5.3-flash
+          unit: needle-worker@glm-seam.service
+        - worker_id: glm-roam-25
+          agent: claude-code-glm-5.3-flash
+      takeover_helper:
+        - /run/current-system/sw/bin/systemd-run
+        - --user
+        - --wait
+        - --pipe
+        - --collect
+        - --quiet
+        - --property=NoNewPrivileges=yes
+        - /run/current-system/sw/bin/python3
+        - -B
+        - /home/coding/.local/lib/subgov-zai/zai-takeover.py
+        - --manifest
+        - /home/coding/.config/subgov/zai-takeover-manifest.json
+        - --state
+        - /home/coding/.local/state/subgov/zai-takeover.json
+    utilization:
+      reserve_fraction: 0.10
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      minimum_sample_seconds: 240
+      windows:
+        five_hour:
+          reserve_fraction: 0.15
