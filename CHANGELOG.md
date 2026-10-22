@@ -21,7 +21,12 @@ versioned config-schema contract; see
   for the Z.AI pool (identity, idleness, live-children and unit MainPID
   verification, pidfd/SIGSTOP/SIGTERM, restart-guard drop-ins for unit
   targets, straggler adoption without a unit; never `needle cleanup`).
-  See `examples/takeover-claude-zai.yaml` and
+  Each successful retirement appends a durable record (worker_id, agent,
+  unit, pid, method, retired_at) at `--state` under the manifest identity
+  hash, written atomically mode 0600 under the state lock; a cycle that
+  retires nothing writes nothing. See `examples/takeover-claude-zai.yaml`,
+  the deployed `deploy/codinghome/zai-takeover-governor.yaml` (full
+  19-target list mirroring the manifest), and
   `deploy/codinghome/zai-takeover-manifest.json`.
 - Plan §26.2 cutover rehearsal: `scripts/zai-takeover.py --dry-run` prints one
   verdict per takeover target (eligible / busy / identity mismatch / unit

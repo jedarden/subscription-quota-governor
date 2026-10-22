@@ -1749,8 +1749,11 @@ pool's ready demand, and scale-down takes idle workers first.
   floor; after each cycle's elastic reconcile the `takeover_helper` runs one
   idle-only retirement, gated on fresh prefixed heartbeats;
   `scripts/zai-takeover.py` verifies identity, idleness, children, and unit
-  MainPID before pidfd/SIGSTOP/SIGTERM — never `needle cleanup`;
-  `examples/takeover-claude-zai.yaml` and
+  MainPID before pidfd/SIGSTOP/SIGTERM — never `needle cleanup` — and
+  records each retirement durably at `--state`; `--dry-run` rehearses the
+  read-only gates against the live roster;
+  `examples/takeover-claude-zai.yaml`, the deployed
+  `deploy/codinghome/zai-takeover-governor.yaml`, and
   `deploy/codinghome/zai-takeover-manifest.json` carry the cutover config).
 - WP26 seed-workspace selection.
 - Already tracked: one binary and one adapter installer (done 2026-10-22, all
