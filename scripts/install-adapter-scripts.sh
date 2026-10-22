@@ -79,7 +79,7 @@ fi
 adapter_dirs=(subgov-codex subgov-zai subgov-anthropic)
 declare -A adapter_files=(
     [subgov-codex]='codex-productive.py subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-source-refresh.py'
-    [subgov-zai]='subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-collector.py zai-fleet.py zai-source-refresh.py'
+    [subgov-zai]='subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-collector.py zai-fleet.py zai-source-refresh.py zai-takeover.py'
     [subgov-anthropic]='anthropic-productive.py codex-productive.py subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-source-refresh.py'
 )
 
