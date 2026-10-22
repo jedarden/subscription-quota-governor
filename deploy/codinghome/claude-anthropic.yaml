@@ -14,13 +14,25 @@ accounts:
       max_scale_up_per_cycle: 1
       max_scale_down_per_cycle: 1
       observer:
-        type: needle_status
-        identifier_prefix: sg-claude-anthropic-
-        agent: claude-print
-        heartbeat_dir: ~/.needle/state/heartbeats
-        stale_after_seconds: 60
+        type: command
+        argv:
+        - /run/current-system/sw/bin/systemd-run
+        - --user
+        - --wait
+        - --pipe
+        - --collect
+        - --quiet
+        - --property=NoNewPrivileges=yes
+        - --setenv=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
+        - /run/current-system/sw/bin/python3
+        - -B
+        - /home/coding/.local/lib/subgov-anthropic/anthropic-productive.py
+        - --settings
+        - /home/coding/.config/subgov/anthropic-productive.json
+        - observe
       actuator:
         type: command
+        reconcile_unchanged: true
         argv:
         - /run/current-system/sw/bin/systemd-run
         - --user

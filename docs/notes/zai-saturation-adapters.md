@@ -149,6 +149,11 @@ argv: [python3, /installed/zai-fleet.py, --roster, /persistent/zai-roster.json,
 ```
 
 The actuator uses the same prefix followed by `actuate, '{desired_workers}'`.
+For WP24 host admission, set `reconcile_unchanged: true` on that command actuator
+and install the shared configuration described in
+[measured host admission](measured-host-ceiling.md). Both Z.AI subcommands use
+`~/.config/subgov/host-capacity.json` by default; supply `--host-capacity` before
+the subcommand to use an alternate shared path.
 `observe` returns `{"current_workers": N}` without service changes. Current
 includes pending retirees until their MainPID has actually stopped, ensuring a
 subsequent governor cycle still sees the unresolved scale-down difference.

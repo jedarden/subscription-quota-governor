@@ -207,6 +207,10 @@ pub enum ActuatorConfig {
     },
     Command {
         argv: Vec<String>,
+        /// Run each cycle even when quota desired equals observed, for
+        /// adapters that reconcile a separate measured host ceiling.
+        #[serde(default)]
+        reconcile_unchanged: bool,
     },
     NeedleRun {
         repo: PathBuf,
@@ -653,7 +657,7 @@ fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
             &format!("account {account} observer needle_status"),
         )?;
     }
-    if let ActuatorConfig::Command { argv } = &fleet.actuator {
+    if let ActuatorConfig::Command { argv, .. } = &fleet.actuator {
         validate_argv(argv, &format!("account {account} actuator command"), true)?;
     }
     if let ActuatorConfig::NeedleRun {
@@ -745,7 +749,7 @@ fn validate_host(
             &format!("account {account} host {host_name} observer needle_status"),
         )?;
     }
-    if let ActuatorConfig::Command { argv } = &host.actuator {
+    if let ActuatorConfig::Command { argv, .. } = &host.actuator {
         validate_argv(
             argv,
             &format!("account {account} host {host_name} actuator command"),

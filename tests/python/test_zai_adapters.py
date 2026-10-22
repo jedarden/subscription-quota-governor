@@ -308,6 +308,28 @@ class FleetTests(unittest.TestCase):
         self.assertIn('ConditionPathExists=!', dropin.read_text())
         self.assertTrue(marker.exists())
 
+    def test_host_downscale_selects_idle_before_busy_in_roster_order(self):
+        first, second = self.roster['workers']
+        for worker in (first, second):
+            self.fleet.statuses[worker['unit']].update(pid=100, ActiveState='active')
+        self.fleet.busy.add(second['unit'])
+        with patch.object(self.fleet, 'stop_idle', return_value=True) as stop:
+            self.fleet.reconcile(1, self.fleet.load_state())
+        self.assertEqual(stop.call_args.args[0]['unit'], first['unit'])
+        self.assertFalse(self.fleet.paths(second)[1].exists())
+
+    def test_host_brake_prevents_roster_start(self):
+        from contextlib import contextmanager
+        @contextmanager
+        def no_capacity(settings, desired, current):
+            self.assertEqual(desired, 2)
+            self.assertEqual(current, 0)
+            yield 0
+        with patch.object(fleet_module, 'admission', no_capacity):
+            self.fleet.reconcile(2, self.fleet.load_state())
+        self.assertFalse(any(event[0] == 'start' for event in self.fleet.events))
+        self.assertEqual(read_json(self.args.state)['desired'], 0)
+
     def test_masked_never_started_or_unmasked(self):
         self.fleet.statuses[self.roster['workers'][0]['unit']]['masked'] = True
         self.fleet.reconcile(1, self.fleet.load_state())

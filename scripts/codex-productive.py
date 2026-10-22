@@ -17,6 +17,7 @@ import sys
 import time
 
 from subgov_adapter_common import atomic_json, atomic_text, live_children, locked, read_json
+from subgov_host_capacity import admission
 from subgov_ready_beads import allowed, native_internal_artifact, policy_ok, observe as ready_demand
 
 IDLE = {"SELECTING", "IDLE", "WAITING", "BACKOFF", "SLEEPING", "EXHAUSTED", "ADMISSION_BLOCKED"}
@@ -337,71 +338,82 @@ def actuate(settings, desired):
     with locked(settings["actuator_state"]):
         observed = inspect_fleet(settings) if settings.get("adopted_workers") else workers(settings, fresh=False)
         live = [worker for worker in observed if owned(settings, worker)]
-        pending = []
-        # Preserve busy workers first. A retirement marker must never remain on
-        # a slot selected to stay merely because an earlier stop was deferred.
-        keep = {worker["worker_id"] for worker in sorted(live, key=retention_order)[:desired]}
-        for worker in live:
+        with admission(settings, desired, current=len(live)) as limited:
+            reconcile(settings, limited, live)
+
+
+def observe(settings):
+    count = sum(owned(settings, value) for value in inspect_fleet(settings))
+    with admission(settings, current=count):
+        return {"current_workers": count}
+
+
+def reconcile(settings, desired, live):
+    pending = []
+    # Preserve busy workers first. A retirement marker must never remain on
+    # a slot selected to stay merely because an earlier stop was deferred.
+    keep = {worker["worker_id"] for worker in sorted(live, key=retention_order)[:desired]}
+    for worker in live:
+        entry = adopted(settings, worker)
+        if entry and entry.get("unit") and worker["worker_id"] in keep:
+            _, marker = retirement_paths(settings, entry)
+            marker.unlink(missing_ok=True)
+    if len(live) > desired:
+        for worker in sorted(live, key=lambda value: value["worker_id"]):
+            if worker["worker_id"] in keep:
+                continue
             entry = adopted(settings, worker)
-            if entry and entry.get("unit") and worker["worker_id"] in keep:
+            if entry and entry.get("unit"):
+                _, marker = retirement_paths(settings, entry)
+                atomic_text(str(marker), "subgov-codex\n")
+            if not stop_idle(settings, worker):
+                pending.append(worker["worker_id"])
+    elif len(live) < desired:
+        measured = demand(settings)  # Revalidate actual work immediately before launch.
+        available = measured["ready"][:desired - len(live)]
+        taken = {worker["worker_id"] for worker in live}
+        candidates = []
+        for entry in settings.get("adopted_workers", []):
+            if entry["worker_id"] in taken:
+                continue
+            info = unit_info(entry["unit"]) if entry.get("unit") else None
+            if info and (info["LoadState"] == "masked" or info["UnitFileState"].startswith("masked")):
+                continue
+            candidates.append(entry)
+        for job in available:
+            # Restore an adopted slot first, retaining its model and home
+            # routing. New elastic slots use the configured Luna adapter.
+            entry = candidates.pop(0) if candidates else None
+            if entry and entry.get("unit"):
+                info = unit_info(entry["unit"])
+                if info["LoadState"] == "masked" or info["UnitFileState"].startswith("masked"):
+                    continue
                 _, marker = retirement_paths(settings, entry)
                 marker.unlink(missing_ok=True)
-        if len(live) > desired:
-            for worker in sorted(live, key=lambda value: value["worker_id"]):
-                if worker["worker_id"] in keep:
-                    continue
-                entry = adopted(settings, worker)
-                if entry and entry.get("unit"):
-                    _, marker = retirement_paths(settings, entry)
-                    atomic_text(str(marker), "subgov-codex\n")
-                if not stop_idle(settings, worker):
-                    pending.append(worker["worker_id"])
-        elif len(live) < desired:
-            measured = demand(settings)  # Revalidate actual work immediately before launch.
-            available = measured["ready"][:desired - len(live)]
-            taken = {worker["worker_id"] for worker in live}
-            candidates = []
-            for entry in settings.get("adopted_workers", []):
-                if entry["worker_id"] in taken:
-                    continue
-                info = unit_info(entry["unit"]) if entry.get("unit") else None
-                if info and (info["LoadState"] == "masked" or info["UnitFileState"].startswith("masked")):
-                    continue
-                candidates.append(entry)
-            for job in available:
-                # Restore an adopted slot first, retaining its model and home
-                # routing. New elastic slots use the configured Luna adapter.
-                entry = candidates.pop(0) if candidates else None
-                if entry and entry.get("unit"):
-                    info = unit_info(entry["unit"])
-                    if info["LoadState"] == "masked" or info["UnitFileState"].startswith("masked"):
-                        continue
-                    _, marker = retirement_paths(settings, entry)
-                    marker.unlink(missing_ok=True)
-                    run(["systemctl", "--user", "start", "--no-block", entry["unit"]])
-                    taken.add(entry["worker_id"])
-                    continue
-                number = next(i for i in range(1, settings["max_workers"] + 1)
-                              if settings["prefix"] + str(i) not in taken)
-                name = entry["worker_id"] if entry else settings["prefix"] + str(number)
-                # Reuse NEEDLE's inner tmux entry point, with non-secret,
-                # per-worker environment overrides. This does not alter the
-                # tmux server environment or other workers. Disable Weave's
-                # generation gate so spare quota cannot generate make-work.
-                binary = shutil.which("needle")
-                if not binary:
-                    raise ValueError("NEEDLE not installed")
-                agent = entry["agent"] if entry else settings["agent"]
-                route = entry["workspace"] if entry else job["workspace"]
-                argv = [binary, "run", "--agent", agent, "--workspace", route,
-                        "--identifier", name, "--count", "1"]
-                session = "needle-" + agent.replace(".", "_") + "-" + name
-                run(["tmux", "new-session", "-d", "-s", session,
-                     "-e", "NEEDLE_INNER=1", "-e", "NEEDLE_STRANDS__GENERATION__ENABLED=false",
-                     shlex.join(argv)], timeout=5)
-                taken.add(name)
-        atomic_json(settings["actuator_state"], {"desired": desired, "pending_retirees": pending,
-                                                "observed_at": current_time().isoformat()})
+                run(["systemctl", "--user", "start", "--no-block", entry["unit"]])
+                taken.add(entry["worker_id"])
+                continue
+            number = next(i for i in range(1, settings["max_workers"] + 1)
+                          if settings["prefix"] + str(i) not in taken)
+            name = entry["worker_id"] if entry else settings["prefix"] + str(number)
+            # Reuse NEEDLE's inner tmux entry point, with non-secret,
+            # per-worker environment overrides. This does not alter the
+            # tmux server environment or other workers. Disable Weave's
+            # generation gate so spare quota cannot generate make-work.
+            binary = shutil.which("needle")
+            if not binary:
+                raise ValueError("NEEDLE not installed")
+            agent = entry["agent"] if entry else settings["agent"]
+            route = entry["workspace"] if entry else job["workspace"]
+            argv = [binary, "run", "--agent", agent, "--workspace", route,
+                    "--identifier", name, "--count", "1"]
+            session = "needle-" + agent.replace(".", "_") + "-" + name
+            run(["tmux", "new-session", "-d", "-s", session,
+                 "-e", "NEEDLE_INNER=1", "-e", "NEEDLE_STRANDS__GENERATION__ENABLED=false",
+                 shlex.join(argv)], timeout=5)
+            taken.add(name)
+    atomic_json(settings["actuator_state"], {"desired": desired, "pending_retirees": pending,
+                                            "observed_at": current_time().isoformat()})
 
 
 def install_lane(settings, config, remove=False):
@@ -484,7 +496,7 @@ def main():
     elif args.mode == "actuate":
         actuate(settings, args.desired)
     elif args.mode == "observe":
-        print(json.dumps({"current_workers": sum(owned(settings, value) for value in inspect_fleet(settings))}))
+        print(json.dumps(observe(settings)))
     elif args.mode == "install-adoption":
         install_adoption(settings)
     else:

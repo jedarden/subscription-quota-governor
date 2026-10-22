@@ -13,11 +13,13 @@ MANIFEST = {
         "codex-productive.py",
         "subgov_adapter_common.py",
         "subgov_ready_beads.py",
+        "subgov_host_capacity.py",
         "zai-source-refresh.py",
     ],
     "subgov-zai": [
         "subgov_adapter_common.py",
         "subgov_ready_beads.py",
+        "subgov_host_capacity.py",
         "zai-collector.py",
         "zai-fleet.py",
         "zai-source-refresh.py",
@@ -27,6 +29,7 @@ MANIFEST = {
         "codex-productive.py",
         "subgov_adapter_common.py",
         "subgov_ready_beads.py",
+        "subgov_host_capacity.py",
         "zai-source-refresh.py",
     ],
 }

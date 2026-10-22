@@ -14,7 +14,7 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--settings", required=True)
-    parser.add_argument("mode", choices=["demand", "refresh", "actuate", "install-lane", "remove-lane"])
+    parser.add_argument("mode", choices=["demand", "refresh", "observe", "actuate", "install-lane", "remove-lane"])
     parser.add_argument("value", nargs="?")
     args = parser.parse_args()
     settings = json.loads(Path(args.settings).read_text())
@@ -34,6 +34,8 @@ def main():
         print(json.dumps(module.demand(settings)))
     elif args.mode == "refresh":
         module.refresh(settings)
+    elif args.mode == "observe":
+        print(json.dumps(module.observe(settings)))
     elif args.mode == "actuate":
         module.actuate(settings, int(args.value))
     else:

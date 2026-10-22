@@ -65,10 +65,13 @@ pub trait Actuator {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActuationOutcome {
     /// Whether the actuator was actually invoked. `false` when `desired`
-    /// equals `observed` (nothing to reconcile) or when the configured
+    /// equals `observed` without `reconcile_unchanged`, or when the configured
     /// actuator is `none` (mutation is deliberately disabled), even though
     /// those two cases differ in whether there was something to do.
     pub actuated: bool,
+    /// Fresh post-actuation count for adapters whose granted target can differ
+    /// from the quota request, including busy workers pending retirement.
+    pub observed_workers: Option<u32>,
 }
 
 /// Builds the concrete `Observer` described by an account's fleet config.
@@ -96,7 +99,7 @@ pub fn actuator_for(config: &ActuatorConfig) -> Box<dyn Actuator> {
     match config {
         ActuatorConfig::None => Box::new(NoneActuator),
         ActuatorConfig::TargetFile { path } => Box::new(TargetFileActuator { path: path.clone() }),
-        ActuatorConfig::Command { argv } => Box::new(CommandActuator { argv: argv.clone() }),
+        ActuatorConfig::Command { argv, .. } => Box::new(CommandActuator { argv: argv.clone() }),
         ActuatorConfig::NeedleRun {
             repo,
             adapter,
@@ -201,8 +204,17 @@ pub fn actuate_host_targets(
         .iter()
         .map(|(host_id, host)| {
             let placement = by_host[host_id.as_str()];
-            let outcome = actuate_config(&host.actuator, placement.current, placement.target)
+            let mut outcome = actuate_config(&host.actuator, placement.current, placement.target)
                 .with_context(|| format!("host {host_id} actuator failed"))?;
+            if reconcile_unchanged(&host.actuator) {
+                outcome.observed_workers = Some(
+                    observer_for(&host.observer)
+                        .current_workers()
+                        .with_context(|| {
+                            format!("host {host_id} post-actuation observer failed")
+                        })?,
+                );
+            }
             Ok((host_id.clone(), outcome))
         })
         .collect()
@@ -238,7 +250,7 @@ fn reconcile_observed_range(observed: u32, config: &FleetConfig) -> Result<u32> 
 
 /// Actuates a fleet toward `desired`, applying plan.md §11.2's policy:
 ///
-/// - skip invocation entirely when `desired == observed` (nothing to do);
+/// - skip when `desired == observed` unless a command opts into per-cycle reconciliation;
 /// - always report `actuated: false` for the `none` actuator, even when
 ///   `desired` differs from `observed`.
 ///
@@ -251,7 +263,11 @@ fn reconcile_observed_range(observed: u32, config: &FleetConfig) -> Result<u32> 
 /// must not treat this cycle's observation as authoritative -- retaining
 /// whatever state it already holds is what lets the next cycle reconcile.
 pub fn actuate(config: &FleetConfig, observed: u32, desired: u32) -> Result<ActuationOutcome> {
-    actuate_config(&config.actuator, observed, desired)
+    let mut outcome = actuate_config(&config.actuator, observed, desired)?;
+    if reconcile_unchanged(&config.actuator) {
+        outcome.observed_workers = Some(current_workers(config)?);
+    }
+    Ok(outcome)
 }
 
 fn actuate_config(
@@ -259,14 +275,33 @@ fn actuate_config(
     observed: u32,
     desired: u32,
 ) -> Result<ActuationOutcome> {
-    if desired == observed {
-        return Ok(ActuationOutcome { actuated: false });
+    if desired == observed && !reconcile_unchanged(actuator) {
+        return Ok(ActuationOutcome {
+            actuated: false,
+            observed_workers: None,
+        });
     }
     if matches!(actuator, ActuatorConfig::None) {
-        return Ok(ActuationOutcome { actuated: false });
+        return Ok(ActuationOutcome {
+            actuated: false,
+            observed_workers: None,
+        });
     }
     actuator_for(actuator).actuate(desired)?;
-    Ok(ActuationOutcome { actuated: true })
+    Ok(ActuationOutcome {
+        actuated: true,
+        observed_workers: None,
+    })
+}
+
+fn reconcile_unchanged(actuator: &ActuatorConfig) -> bool {
+    matches!(
+        actuator,
+        ActuatorConfig::Command {
+            reconcile_unchanged: true,
+            ..
+        }
+    )
 }
 
 struct StaticObserver {
@@ -1178,6 +1213,7 @@ mod tests {
         // Returning Ok with actuated:false proves the invocation was
         // skipped, not merely that it happened to succeed.
         let config = fleet_config_with_actuator(ActuatorConfig::Command {
+            reconcile_unchanged: false,
             argv: vec!["/nonexistent/subgov-test-actuator".to_string()],
         });
         let outcome = actuate(&config, 5, 5).unwrap();
@@ -1206,6 +1242,7 @@ mod tests {
     #[test]
     fn actuate_propagates_a_real_actuation_failure() {
         let config = fleet_config_with_actuator(ActuatorConfig::Command {
+            reconcile_unchanged: false,
             argv: vec!["/nonexistent/subgov-test-actuator".to_string()],
         });
         assert!(actuate(&config, 3, 8).is_err());

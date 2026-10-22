@@ -1,5 +1,7 @@
 {
   "version": 1,
+  "host_capacity": "/home/coding/.config/subgov/host-capacity.json",
+  "host_pool": "anthropic",
   "host": "codinghome",
   "agent": "claude-print",
   "prefix": "sg-claude-anthropic-",

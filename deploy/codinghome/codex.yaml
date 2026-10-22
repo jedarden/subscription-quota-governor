@@ -33,6 +33,7 @@ accounts:
         - observe
       actuator:
         type: command
+        reconcile_unchanged: true
         argv:
         - /run/current-system/sw/bin/systemd-run
         - --user

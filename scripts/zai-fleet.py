@@ -12,6 +12,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from subgov_host_capacity import admission
 from subgov_adapter_common import atomic_json, atomic_text, live_children, locked, read_json
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -175,11 +176,23 @@ class Fleet:
 
     def reconcile(self, desired, state):
         items = self.inspect()  # Validate the complete roster before any mutation.
+        settings = {"host_capacity": getattr(self.args, "host_capacity", None),
+                    "host_pool": "zai"}
+        with admission(settings, desired, current=sum(bool(info["pid"]) for _, info in items)) as limited:
+            self.reconcile_items(limited, state, items)
+
+    def reconcile_items(self, desired, state, items):
         permitted = [(worker, info) for worker, info in items if not info["masked"]]
         if desired > len(permitted):
             raise ValueError("desired count exceeds unmasked explicit roster")
-        # Keep already active workers first; stable roster order determines ties.
-        ordered = sorted(permitted, key=lambda item: not bool(item[1]["pid"]))
+        # Keep busy workers before idle ones, then inactive slots. An idle
+        # candidate is still frozen and revalidated by stop_idle before exit.
+        def retention(item):
+            worker, info = item
+            if not info["pid"]:
+                return 2
+            return 1 if self.idle(self.heartbeat(worker, info["pid"])) else 0
+        ordered = sorted(permitted, key=retention)
         keep = {worker["unit"] for worker, _ in ordered[:desired]}
         retirees = [worker["unit"] for worker, info in items if worker["unit"] not in keep]
         state.update(desired=desired, pending_retirees=retirees)
@@ -222,6 +235,7 @@ class Fleet:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host-capacity", default=str(Path.home() / ".config/subgov/host-capacity.json"))
     parser.add_argument("--roster", required=True)
     parser.add_argument("--state", required=True)
     parser.add_argument("--heartbeat-dir", default="~/.needle/state/heartbeats")
@@ -248,7 +262,8 @@ def main():
             if args.mode == "observe":
                 # Drainers remain current until their MainPID is actually gone.
                 count = sum(bool(info["pid"]) for _, info in fleet.inspect())
-                print(json.dumps({"current_workers": count}))
+                with admission({"host_capacity": args.host_capacity, "host_pool": "zai"}, current=count):
+                    print(json.dumps({"current_workers": count}))
             else:
                 fleet.reconcile(args.desired, state)
     except Exception as error:

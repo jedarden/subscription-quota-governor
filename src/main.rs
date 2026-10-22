@@ -921,6 +921,7 @@ fn run_cycle(
         let mut host_current: Option<BTreeMap<String, u32>> = None;
         let mut host_placements: Option<Vec<HostPlacement>> = None;
         let mut host_records: Option<Vec<HostDecisionRecord>> = None;
+        let mut observed_after_actuation = None;
         let mut host_actuation: Option<BTreeMap<String, fleet::ActuationOutcome>> = None;
         let result: Result<(), AccountFailure> = (|| {
             let snapshot =
@@ -1041,6 +1042,28 @@ fn run_cycle(
                     .map_err(AccountFailure::Actuation)?;
                 metrics.actuation_succeeded = Some(true);
                 let any_actuated = outcomes.values().any(|outcome| outcome.actuated);
+                if outcomes
+                    .values()
+                    .any(|outcome| outcome.observed_workers.is_some())
+                {
+                    observed_after_actuation = Some(
+                        placements
+                            .iter()
+                            .try_fold(0u32, |total, placement| {
+                                let outcome = &outcomes[&placement.host_id];
+                                let actual =
+                                    outcome.observed_workers.unwrap_or(if outcome.actuated {
+                                        placement.target
+                                    } else {
+                                        placement.current
+                                    });
+                                total
+                                    .checked_add(actual)
+                                    .context("post-actuation worker total exceeds u32")
+                            })
+                            .map_err(AccountFailure::Observation)?,
+                    );
+                }
                 host_actuation = Some(outcomes);
                 any_actuated
             } else {
@@ -1048,6 +1071,7 @@ fn run_cycle(
                     fleet::actuate(&account_config.fleet, workers, decision.desired_workers)
                         .map_err(AccountFailure::Actuation)?;
                 metrics.actuation_succeeded = Some(true);
+                observed_after_actuation = actuation.observed_workers;
                 actuation.actuated
             };
             let mut event = json!({
@@ -1056,6 +1080,9 @@ fn run_cycle(
                 "actuated": actuated,
                 "decision": decision,
             });
+            if let Some(actual) = observed_after_actuation {
+                event["actual_workers"] = json!(actual);
+            }
             if let Some(hosts) = &host_records {
                 event["hosts"] = serde_json::to_value(hosts)
                     .map_err(|error| AccountFailure::Observation(error.into()))?;
@@ -1071,11 +1098,11 @@ fn run_cycle(
             } else {
                 // Burn is attributed to the whole pool (§23.4), so samples and
                 // the recorded target carry the unowned floor as well.
-                let sample_workers = if actuated {
+                let sample_workers = observed_after_actuation.unwrap_or(if actuated {
                     decision.desired_workers
                 } else {
                     workers
-                } + unowned;
+                }) + unowned;
                 account_state.record(
                     &snapshot,
                     sample_workers,
@@ -1102,15 +1129,18 @@ fn run_cycle(
                 }
                 if let (Some(current), Some(placements)) = (&host_current, &host_placements) {
                     for placement in placements {
-                        let sample_workers = if host_actuation
+                        let actual = host_actuation
                             .as_ref()
-                            .and_then(|outcomes| outcomes.get(&placement.host_id))
-                            .is_some_and(|outcome| outcome.actuated)
-                        {
-                            placement.target
-                        } else {
-                            current[&placement.host_id]
-                        };
+                            .and_then(|outcomes| outcomes.get(&placement.host_id));
+                        let sample_workers = actual
+                            .and_then(|outcome| outcome.observed_workers)
+                            .unwrap_or_else(|| {
+                                if actual.is_some_and(|outcome| outcome.actuated) {
+                                    placement.target
+                                } else {
+                                    current[&placement.host_id]
+                                }
+                            });
                         state.record_host(name, &placement.host_id, &snapshot, sample_workers);
                     }
                 }
@@ -1390,6 +1420,7 @@ mod exit_code_tests {
                 max_scale_down_per_cycle: 10,
                 observer: Some(WorkerObserverConfig::Static { workers: 0 }),
                 actuator: ActuatorConfig::Command {
+                    reconcile_unchanged: false,
                     argv: vec!["/nonexistent/subgov-test-actuator".to_string()],
                 },
                 observer_reconciliation: ObserverReconciliation::default(),

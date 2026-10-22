@@ -82,7 +82,7 @@ fn live_workers(account: &AccountConfig, now: DateTime<Utc>) -> (Option<LiveWork
     let argv = match &account.fleet.observer {
         Some(WorkerObserverConfig::Command { argv }) => Some(argv.as_slice()),
         _ => match &account.fleet.actuator {
-            ActuatorConfig::Command { argv } => Some(argv.as_slice()),
+            ActuatorConfig::Command { argv, .. } => Some(argv.as_slice()),
             _ => None,
         },
     };

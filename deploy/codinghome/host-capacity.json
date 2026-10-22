@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "state_path": "/home/coding/.local/state/subgov/host-capacity.json",
+  "pools": {
+    "codex": {
+      "prefixes": [
+        "sg-codex-"
+      ],
+      "identifiers": [
+        "codex-sol-commitgraph",
+        "codex-sol-armor",
+        "codex-sol-pdftract",
+        "codex-sol-rmp",
+        "codex-luna-trace",
+        "codex-luna-tgplat-01",
+        "reset-subgov",
+        "reset-hstart"
+      ],
+      "demand_state": "/home/coding/.local/state/subgov/codex-productive-demand.json"
+    },
+    "anthropic": {
+      "prefixes": [
+        "sg-claude-anthropic-"
+      ],
+      "demand_state": "/home/coding/.local/state/subgov/anthropic-productive-demand.json"
+    },
+    "zai": {
+      "prefixes": [
+        "sg-zai-",
+        "glm-"
+      ],
+      "demand_state": "/home/coding/.local/state/subgov/zai-ready-demand.json"
+    }
+  }
+}

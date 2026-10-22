@@ -214,6 +214,11 @@
           "additionalProperties": false,
           "properties": {
             "type": { "const": "command" },
+            "reconcile_unchanged": {
+              "type": "boolean",
+              "default": false,
+              "description": "Run every cycle and re-observe actual workers after command success, including when desired equals observed. Used by measured host admission adapters."
+            },
             "argv": {
               "allOf": [
                 { "$ref": "#/$defs/argv" },
