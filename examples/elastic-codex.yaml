@@ -23,6 +23,13 @@ accounts:
         repo: /home/coding/NEEDLE
         adapter: codex-gpt-5.6-luna-xhigh
         identifier_prefix: sg-codex-
+        # Plan §26.5: seed each new worker with the ready workspace that has
+        # the fewest running workers, from the WP23 demand state and NEEDLE's
+        # heartbeat directory. The demand state exists only while the WP23
+        # refresh publishes it; without a readable state scale-up fails
+        # closed, and `repo` remains the single seed if these are removed.
+        seed_demand_state: /home/coding/.local/state/subgov/codex-productive-demand.json
+        seed_heartbeats: /home/coding/.needle/state/heartbeats
     utilization:
       reserve_fraction: 0.15
       strategy: linear_to_reset

@@ -42,8 +42,9 @@ is the launchable subset after slot limits; it is not a persistent assignment.
 capacity and is bounded by the pool's `max_workers`. An executing claim consumes
 its workspace slot and never appears as new ready demand. Existing busy claims
 are retained even when workspace eligibility changes. Worker retirement still
-uses the existing idle-only safety checks. Pool arbitration/host limits and
-least-loaded seed selection are separate WP24/WP26 work.
+uses the existing idle-only safety checks. Pool arbitration/host limits are
+WP24 work; WP26 orders `ready` into per-launch seeds — see
+[seed-workspace-selection.md](seed-workspace-selection.md).
 
 Each publisher atomically writes `demand_state`, with `observed_at` and these
 fields. Codex and Anthropic use the shared `refresh` implementation, with separate

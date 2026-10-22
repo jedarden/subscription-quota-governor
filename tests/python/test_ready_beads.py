@@ -171,6 +171,42 @@ class ReadyBeadsTests(unittest.TestCase):
             with patch.object(demand, 'ready_issues', return_value=[{'id': 'held', 'status': 'open', 'labels': []}]):
                 self.assertEqual(demand.observe(settings)['eligible_backlog_capacity'], 0)
 
+    def test_seed_order_spreads_new_workers_across_workspaces(self):
+        # Plan §26.5: each new worker takes the ready workspace with the
+        # fewest running workers, not the first route in enumeration order.
+        with tempfile.TemporaryDirectory() as temp:
+            first, second = self.workspace(Path(temp), 'a-repo'), self.workspace(Path(temp), 'b-repo')
+            jobs = [{'workspace': str(first), 'id': 'j1'}, {'workspace': str(first), 'id': 'j2'},
+                    {'workspace': str(second), 'id': 'j3'}]
+            seeds = demand.seed_order(jobs, {})
+            self.assertEqual(seeds.count(str(first)), 2)
+            self.assertEqual(seeds.count(str(second)), 1)
+            self.assertEqual(seeds[0], str(first))
+            self.assertEqual(seeds[1], str(second), seeds)
+            self.assertEqual(seeds[2], str(first))
+
+    def test_seed_order_prefers_the_least_occupied_ready_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            busy_repo, idle_repo = self.workspace(Path(temp), 'a-repo'), self.workspace(Path(temp), 'b-repo')
+            jobs = [{'workspace': str(busy_repo), 'id': 'j1'}, {'workspace': str(idle_repo), 'id': 'j2'}]
+            seeds = demand.seed_order(jobs, {str(busy_repo): 2, str(idle_repo): 0})
+            self.assertEqual(seeds, [str(idle_repo), str(busy_repo)])
+
+    def test_seed_order_ties_resolve_deterministically_and_normalize_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            first, second = self.workspace(Path(temp), 'a-repo'), self.workspace(Path(temp), 'b-repo')
+            jobs = [{'workspace': str(first), 'id': 'j1'}, {'workspace': str(second), 'id': 'j2'}]
+            # Unresolved keys on the occupancy side must not skew the pick.
+            seeds = demand.seed_order(jobs, {str(first) + '/./': 0, str(second): 0})
+            self.assertEqual(seeds, [str(first), str(second)])
+
+    def test_seed_order_returns_one_seed_per_ready_job_and_no_bare_extras(self):
+        with tempfile.TemporaryDirectory() as temp:
+            route = self.workspace(Path(temp))
+            self.assertEqual(demand.seed_order([], {}), [])
+            jobs = [{'workspace': str(route), 'id': 'j1'}]
+            self.assertEqual(demand.seed_order(jobs, {str(route): 9}), [str(route)])
+
 
 if __name__ == '__main__':
     unittest.main()

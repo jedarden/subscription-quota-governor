@@ -238,6 +238,16 @@
             "type": { "const": "needle_run" },
             "repo": { "type": "string", "minLength": 1 },
             "identifier_prefix": { "$ref": "#/$defs/identifierPrefix" },
+            "seed_demand_state": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Plan §26.5: WP23 demand-state JSON naming the ready workspaces each new worker is seeded with. Configure together with seed_heartbeats or neither; without them repo is the permanent single seed."
+            },
+            "seed_heartbeats": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Plan §26.5: NEEDLE heartbeat directory used to count running workers per workspace when ordering seed workspaces. Configure together with seed_demand_state or neither."
+            },
             "adapter": {
               "type": "string",
               "minLength": 1,

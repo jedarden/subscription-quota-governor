@@ -104,10 +104,14 @@ pub fn actuator_for(config: &ActuatorConfig) -> Box<dyn Actuator> {
             repo,
             adapter,
             identifier_prefix,
+            seed_demand_state,
+            seed_heartbeats,
         } => Box::new(needle::NeedleRunActuator {
             repo: repo.clone(),
             adapter: adapter.clone(),
             identifier_prefix: identifier_prefix.clone(),
+            seed_demand_state: seed_demand_state.clone(),
+            seed_heartbeats: seed_heartbeats.clone(),
         }),
     }
 }

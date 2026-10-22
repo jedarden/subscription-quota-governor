@@ -18,7 +18,7 @@ import time
 
 from subgov_adapter_common import atomic_json, atomic_text, live_children, locked, read_json
 from subgov_host_capacity import admission
-from subgov_ready_beads import allowed, native_internal_artifact, policy_ok, observe as ready_demand
+from subgov_ready_beads import allowed, native_internal_artifact, policy_ok, seed_order, observe as ready_demand
 
 IDLE = {"SELECTING", "IDLE", "WAITING", "BACKOFF", "SLEEPING", "EXHAUSTED", "ADMISSION_BLOCKED"}
 
@@ -370,6 +370,19 @@ def reconcile(settings, desired, live):
                 pending.append(worker["worker_id"])
     elif len(live) < desired:
         measured = demand(settings)  # Revalidate actual work immediately before launch.
+        # Plan §26.5: each new elastic worker is seeded with the ready
+        # workspace having the fewest running workers, counted from live
+        # owned supervisors. The order spans the whole ready list -- a delta
+        # trimmed from the front would stack every launch on the first
+        # route. Adoption restores its reviewed routing instead.
+        running = {}
+        for worker in live:
+            route = worker.get("workspace")
+            if not route:
+                continue
+            route = str(Path(route).resolve())
+            running[route] = running.get(route, 0) + 1
+        seeds = iter(seed_order(measured["ready"], running)[:desired - len(live)])
         available = measured["ready"][:desired - len(live)]
         taken = {worker["worker_id"] for worker in live}
         candidates = []
@@ -404,7 +417,7 @@ def reconcile(settings, desired, live):
             if not binary:
                 raise ValueError("NEEDLE not installed")
             agent = entry["agent"] if entry else settings["agent"]
-            route = entry["workspace"] if entry else job["workspace"]
+            route = entry["workspace"] if entry else next(seeds)
             argv = [binary, "run", "--agent", agent, "--workspace", route,
                     "--identifier", name, "--count", "1"]
             session = "needle-" + agent.replace(".", "_") + "-" + name

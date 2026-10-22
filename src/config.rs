@@ -219,6 +219,14 @@ pub enum ActuatorConfig {
         /// sessions carrying the prefix. Absent = unscoped (v1 behaviour).
         #[serde(default)]
         identifier_prefix: Option<String>,
+        /// Plan §26.5: seed each new worker with the ready workspace that
+        /// has the fewest running workers, read from the WP23 demand-state
+        /// file and the NEEDLE heartbeat directory. Configure both or
+        /// neither; without them `repo` is the permanent single seed.
+        #[serde(default)]
+        seed_demand_state: Option<PathBuf>,
+        #[serde(default)]
+        seed_heartbeats: Option<PathBuf>,
     },
 }
 
@@ -521,7 +529,20 @@ fn expand_observer_path(observer: &mut WorkerObserverConfig) {
 fn expand_actuator_path(actuator: &mut ActuatorConfig) {
     match actuator {
         ActuatorConfig::TargetFile { path } => *path = expand_tilde(path),
-        ActuatorConfig::NeedleRun { repo, .. } => *repo = expand_tilde(repo),
+        ActuatorConfig::NeedleRun {
+            repo,
+            seed_demand_state,
+            seed_heartbeats,
+            ..
+        } => {
+            *repo = expand_tilde(repo);
+            if let Some(path) = seed_demand_state {
+                *path = expand_tilde(path);
+            }
+            if let Some(path) = seed_heartbeats {
+                *path = expand_tilde(path);
+            }
+        }
         ActuatorConfig::None | ActuatorConfig::Command { .. } => {}
     }
 }
@@ -664,11 +685,18 @@ fn validate_fleet(fleet: &FleetConfig, account: &str) -> Result<()> {
         repo,
         adapter,
         identifier_prefix,
+        seed_demand_state,
+        seed_heartbeats,
     } = &fleet.actuator
     {
         validate_needle_run(
             repo,
             adapter,
+            &format!("account {account} actuator needle_run"),
+        )?;
+        validate_needle_seeds(
+            seed_demand_state.as_deref(),
+            seed_heartbeats.as_deref(),
             &format!("account {account} actuator needle_run"),
         )?;
         validate_identifier_prefix(
@@ -756,10 +784,22 @@ fn validate_host(
             true,
         )?;
     }
-    if let ActuatorConfig::NeedleRun { repo, adapter, .. } = &host.actuator {
+    if let ActuatorConfig::NeedleRun {
+        repo,
+        adapter,
+        seed_demand_state,
+        seed_heartbeats,
+        ..
+    } = &host.actuator
+    {
         validate_needle_run(
             repo,
             adapter,
+            &format!("account {account} host {host_name} actuator needle_run"),
+        )?;
+        validate_needle_seeds(
+            seed_demand_state.as_deref(),
+            seed_heartbeats.as_deref(),
             &format!("account {account} host {host_name} actuator needle_run"),
         )?;
     }
@@ -839,6 +879,28 @@ fn validate_needle_run(repo: &Path, adapter: &str, context: &str) -> Result<()> 
         bail!("{context}: adapter must contain only ASCII letters, digits, '.', '_' or '-'");
     }
     Ok(())
+}
+
+/// Plan §26.5 seed selection is configured as a pair: ready workspaces come
+/// from the WP23 demand state, running-worker occupancy from the heartbeat
+/// directory. Half a pair would silently change what the other half means.
+fn validate_needle_seeds(
+    demand_state: Option<&Path>,
+    heartbeats: Option<&Path>,
+    context: &str,
+) -> Result<()> {
+    match (demand_state, heartbeats) {
+        (None, None) => Ok(()),
+        (Some(demand_state), Some(heartbeats)) => {
+            for path in [demand_state, heartbeats] {
+                if path.as_os_str().is_empty() {
+                    bail!("{context}: seed_demand_state and seed_heartbeats must not be empty");
+                }
+            }
+            Ok(())
+        }
+        _ => bail!("{context}: seed_demand_state and seed_heartbeats must be configured together"),
+    }
 }
 
 fn validate_needle_status(
@@ -1157,6 +1219,68 @@ actuator: { type: needle_run, repo: /workspace, adapter: "agent *" }"#,
             err.contains("adapter must contain only ASCII letters"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn needle_seed_sources_expand_and_must_be_configured_as_a_pair() {
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: static, workers: 1 }
+actuator:
+  type: needle_run
+  repo: /workspace
+  adapter: codex
+  seed_demand_state: "~/state/demand.json"
+  seed_heartbeats: "~/.needle/state/heartbeats""#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let Config { mut accounts, .. } = config;
+        accounts.get_mut("acct").unwrap().fleet.expand_paths();
+        let ActuatorConfig::NeedleRun {
+            seed_demand_state,
+            seed_heartbeats,
+            ..
+        } = &accounts["acct"].fleet.actuator
+        else {
+            panic!("expected needle_run actuator");
+        };
+        assert_eq!(
+            seed_demand_state.as_deref(),
+            Some(expand_tilde(Path::new("~/state/demand.json")).as_path())
+        );
+        assert!(seed_heartbeats.is_some());
+
+        for partial in [
+            r#"seed_demand_state: /state/demand.json"#,
+            r#"seed_heartbeats: ~/.needle/state/heartbeats"#,
+        ] {
+            let yaml = base_config(&indent(&format!(
+                r#"max_workers: 4
+observer: {{ type: static, workers: 1 }}
+actuator: {{ type: needle_run, repo: /workspace, adapter: codex, {partial} }}"#
+            )));
+            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("must be configured together"),
+                "{partial}: {err}"
+            );
+        }
+
+        let yaml = base_config(&indent(
+            r#"max_workers: 4
+observer: { type: static, workers: 1 }
+actuator:
+  type: needle_run
+  repo: /workspace
+  adapter: codex
+  seed_demand_state: ""
+  seed_heartbeats: ~/.needle/state/heartbeats"#,
+        ));
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "{err}");
     }
 
     #[test]

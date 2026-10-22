@@ -23,6 +23,13 @@ accounts:
         repo: /home/coding/SEAM
         adapter: claude-code-glm-5.3-flash
         identifier_prefix: sg-zai-
+        # Plan §26.5: seed each new worker with the ready workspace that has
+        # the fewest running workers, from the WP23 demand state and NEEDLE's
+        # heartbeat directory. The demand state exists only while the WP23
+        # refresh publishes it; without a readable state scale-up fails
+        # closed, and `repo` remains the single seed if these are removed.
+        seed_demand_state: /home/coding/.local/state/subgov/zai-ready-demand.json
+        seed_heartbeats: /home/coding/.needle/state/heartbeats
     utilization:
       reserve_fraction: 0.10
       strategy: linear_to_reset

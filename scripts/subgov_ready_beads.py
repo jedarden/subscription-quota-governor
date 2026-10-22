@@ -305,6 +305,39 @@ def observe(settings, busy=(), unowned_floor=0):
             'eligible_backlog_capacity': min(settings['max_workers'], capacity)}
 
 
+def seed_order(jobs, running):
+    """Order launch seeds for new elastic workers (plan.md §26.5).
+
+    Each new worker is seeded with the ready workspace having the fewest
+    running workers; NEEDLE's own roaming takes over after the seed. `jobs`
+    is observe()'s ready list -- the launchable subset after per-workspace
+    slot limits -- and `running` maps workspace path to the count of workers
+    currently running there. Keys on both sides are resolved, and unresolved
+    inputs are normalized here so callers cannot skew the comparison.
+
+    Every pick consumes one ready entry of that workspace and raises its
+    occupancy, so a batch of new workers spreads across workspaces instead
+    of stacking on the first route. Ties resolve to the lexicographically
+    smallest resolved path, keeping the selection deterministic across
+    cycles. The result is never a bare seed: it simply holds fewer entries
+    than the requested launch count when no ready workspace slot remains,
+    and a caller must not launch without a seed.
+    """
+    remaining = {}
+    for job in jobs:
+        route = str(Path(job['workspace']).resolve())
+        remaining[route] = remaining.get(route, 0) + 1
+    occupancy = {str(Path(route).resolve()): count for route, count in running.items()}
+    seeds = []
+    for _ in range(len(jobs)):
+        route = min((route for route in remaining if remaining[route]),
+                    key=lambda route: (occupancy.get(route, 0), route))
+        seeds.append(route)
+        remaining[route] -= 1
+        occupancy[route] = occupancy.get(route, 0) + 1
+    return seeds
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--settings', required=True)

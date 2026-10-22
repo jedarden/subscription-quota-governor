@@ -9,7 +9,15 @@ versioned config-schema contract; see
 
 ## [Unreleased]
 
-No unreleased changes.
+### Added
+
+- Plan §26.5 seed-workspace selection: new workers are launched with
+  `-w <ready workspace with fewest running workers>` and never bare. The
+  productive pool adapters seed each launch from live supervisor occupancy;
+  `needle_run` actuators accept an optional `seed_demand_state` /
+  `seed_heartbeats` pair to seed from the WP23 demand state and NEEDLE
+  heartbeats, failing closed when the demand evidence is missing or failed.
+  Without the pair the configured `repo` remains the permanent single seed.
 
 ## [1.0.0-rc.1] - 2026-10-03
 

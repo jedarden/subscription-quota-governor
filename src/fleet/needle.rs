@@ -8,6 +8,7 @@ use super::{new_process_group_command, wait_with_timeout, Actuator, Observer, CH
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read;
@@ -164,19 +165,175 @@ pub(super) struct NeedleRunActuator {
     pub(super) repo: PathBuf,
     pub(super) adapter: String,
     pub(super) identifier_prefix: Option<String>,
+    pub(super) seed_demand_state: Option<PathBuf>,
+    pub(super) seed_heartbeats: Option<PathBuf>,
 }
 
 impl Actuator for NeedleRunActuator {
     fn actuate(&self, desired: u32) -> Result<()> {
+        let seeds = match (&self.seed_demand_state, &self.seed_heartbeats) {
+            (Some(demand_state), Some(heartbeats)) => Some(SeedSources {
+                demand_state,
+                heartbeats,
+            }),
+            _ => None,
+        };
         reconcile_needle_workers(
             "needle",
             "tmux",
             &self.repo,
             &self.adapter,
             self.identifier_prefix.as_deref(),
+            seeds.as_ref(),
             desired,
         )
     }
+}
+
+/// Plan §26.5 seed sources: the WP23 demand-state document naming ready
+/// workspaces, and the NEEDLE heartbeat directory used to count running
+/// workers per workspace. Configured as a pair or not at all; without them
+/// the configured `repo` stays the permanent single seed.
+struct SeedSources<'a> {
+    demand_state: &'a Path,
+    heartbeats: &'a Path,
+}
+
+/// A launchable ready job from the WP23 demand-state document.
+#[derive(Deserialize)]
+struct SeedReadyJob {
+    workspace: PathBuf,
+}
+
+/// The demand-state document the WP23 adapters atomically publish every
+/// cycle. `backlog_unavailable` is set instead of `ready` when the demand
+/// query failed: unknown demand must never seed a launch (a failed query is
+/// unknown, never zero). Unknown fields are ignored, so future publishers
+/// stay readable.
+#[derive(Deserialize)]
+struct SeedDemandState {
+    #[serde(default)]
+    backlog_unavailable: Option<String>,
+    #[serde(default)]
+    ready: Vec<SeedReadyJob>,
+}
+
+/// The heartbeat fields the seed occupancy count relies on. NEEDLE refreshes
+/// heartbeats while a worker runs, so freshness is the running test.
+#[derive(Deserialize)]
+struct SeedHeartbeat {
+    workspace: PathBuf,
+    #[serde(rename = "last_heartbeat", alias = "timestamp")]
+    last_heartbeat: DateTime<Utc>,
+}
+
+/// Same freshness window the productive adapters apply when treating a
+/// heartbeat as a running worker: `0 <= age < 60` seconds.
+const SEED_STALE_AFTER_SECONDS: i64 = 60;
+
+/// Reads the ready workspaces from a WP23 demand-state document. A missing,
+/// failed or malformed query fails closed: seeding from no evidence would
+/// either stack workers on the fallback repo or launch bare.
+fn read_seed_demand(path: &Path) -> Result<Vec<PathBuf>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read seed demand state {}", path.display()))?;
+    let state: SeedDemandState = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid seed demand state {}", path.display()))?;
+    if let Some(reason) = state.backlog_unavailable {
+        bail!(
+            "seed demand state {} is unavailable: {reason}",
+            path.display()
+        );
+    }
+    Ok(state.ready.into_iter().map(|job| job.workspace).collect())
+}
+
+/// Counts fresh NEEDLE heartbeats per workspace across every adapter, because
+/// §26.5 occupancy is workers at a workspace, not this pool's claims. Like
+/// the heartbeat observer, a malformed or unreadable heartbeat fails closed;
+/// a missing directory counts as no running workers.
+fn seed_occupancy(dir: &Path, now: DateTime<Utc>) -> Result<BTreeMap<PathBuf, u32>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read NEEDLE heartbeat directory {}",
+                    dir.display()
+                )
+            });
+        }
+    };
+
+    let mut occupancy = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read an entry in NEEDLE heartbeat directory {}",
+                dir.display()
+            )
+        })?;
+        if !entry
+            .file_type()
+            .with_context(|| {
+                format!(
+                    "failed to inspect NEEDLE heartbeat {}",
+                    entry.path().display()
+                )
+            })?
+            .is_file()
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.extension().and_then(|name| name.to_str()) != Some("json") {
+            continue;
+        }
+        let mut file = File::open(&path)
+            .with_context(|| format!("failed to open NEEDLE heartbeat {}", path.display()))?;
+        let bytes = super::read_bounded(&mut file, super::MAX_OBSERVER_BYTES)
+            .with_context(|| format!("NEEDLE heartbeat {}", path.display()))?;
+        let heartbeat: SeedHeartbeat = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid NEEDLE heartbeat {}", path.display()))?;
+        let age = now
+            .signed_duration_since(heartbeat.last_heartbeat)
+            .num_seconds();
+        if (0..SEED_STALE_AFTER_SECONDS).contains(&age) {
+            *occupancy.entry(heartbeat.workspace).or_insert(0) += 1;
+        }
+    }
+
+    Ok(occupancy)
+}
+
+/// Orders scale-up seeds (plan §26.5): repeatedly take the ready workspace
+/// with the fewest running workers, ties resolving to the lexicographically
+/// smallest path so the choice is deterministic across cycles. Every pick
+/// consumes one ready entry of that workspace and raises its occupancy, so a
+/// batch spreads across workspaces instead of stacking on the first route.
+/// The result never outlives the ready frontier; a caller must not launch
+/// without a seed.
+fn seed_order(ready: &[PathBuf], running: &BTreeMap<PathBuf, u32>) -> Vec<PathBuf> {
+    let mut remaining: BTreeMap<PathBuf, u32> = BTreeMap::new();
+    for route in ready {
+        *remaining.entry(route.clone()).or_insert(0) += 1;
+    }
+    let mut occupancy = running.clone();
+    let mut seeds = Vec::with_capacity(ready.len());
+    for _ in 0..ready.len() {
+        let next = remaining
+            .iter()
+            .filter(|(_, left)| **left > 0)
+            .map(|(route, _)| route.clone())
+            .min_by_key(|route| (occupancy.get(route).copied().unwrap_or(0), route.clone()));
+        let Some(route) = next else { break };
+        *remaining.get_mut(&route).expect("tracked ready route") -= 1;
+        *occupancy.entry(route.clone()).or_insert(0) += 1;
+        seeds.push(route);
+    }
+    seeds
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,6 +348,7 @@ fn reconcile_needle_workers(
     repo: &Path,
     adapter: &str,
     identifier_prefix: Option<&str>,
+    seeds: Option<&SeedSources>,
     desired: u32,
 ) -> Result<()> {
     check_needle_adapter_with_program(needle_program, adapter)?;
@@ -210,26 +368,47 @@ fn reconcile_needle_workers(
         std::cmp::Ordering::Equal => Ok(()),
         std::cmp::Ordering::Greater => {
             let delta = desired - matching.len() as u32;
-            let Some(identifier_prefix) = identifier_prefix else {
+            // Plan §26.5: with seeds configured, every scale-up worker is
+            // launched with the ready workspace that has the fewest running
+            // workers, read from the WP23 demand state and the NEEDLE
+            // heartbeat directory; NEEDLE's own roaming takes over after the
+            // seed. Never bare: fewer ready seeds than the delta launches
+            // fewer workers and the next cycle reconciles the rest. Without
+            // seeds the configured repo stays the permanent single seed.
+            if identifier_prefix.is_none() && seeds.is_none() {
                 return run_needle(needle_program, &needle_run_args(repo, adapter, delta));
+            }
+            let launches: Vec<PathBuf> = match seeds {
+                Some(sources) => {
+                    let ready = read_seed_demand(sources.demand_state)?;
+                    let occupancy = seed_occupancy(sources.heartbeats, Utc::now())?;
+                    seed_order(&ready, &occupancy)
+                        .into_iter()
+                        .take(delta as usize)
+                        .collect()
+                }
+                None => vec![repo.to_path_buf(); delta as usize],
             };
-            // Plan §23.3: one launch per worker, each with a distinct
-            // `<prefix><n>` identifier so the worker is recognisably ours.
+            // One launch per worker: each seed differs, and a prefixed pool
+            // needs distinct `<prefix><n>` identifiers so the worker is
+            // recognisably ours (plan §23.3).
             let mut taken: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
             let mut next = 1_u32;
-            for _ in 0..delta {
-                let (identifier, session) = loop {
-                    let identifier = format!("{identifier_prefix}{next}");
-                    let session = format!("{}{identifier}", session_prefix(adapter));
-                    next += 1;
-                    if !taken.contains(&session) {
-                        break (identifier, session);
-                    }
-                };
-                let mut args = needle_run_args(repo, adapter, 1);
-                args.extend([OsString::from("--identifier"), OsString::from(identifier)]);
+            for route in launches {
+                let mut args = needle_run_args(&route, adapter, 1);
+                if let Some(identifier_prefix) = identifier_prefix {
+                    let (identifier, session) = loop {
+                        let identifier = format!("{identifier_prefix}{next}");
+                        let session = format!("{}{identifier}", session_prefix(adapter));
+                        next += 1;
+                        if !taken.contains(&session) {
+                            break (identifier, session);
+                        }
+                    };
+                    args.extend([OsString::from("--identifier"), OsString::from(identifier)]);
+                    taken.push(session);
+                }
                 run_needle(needle_program, &args)?;
-                taken.push(session);
             }
             Ok(())
         }
@@ -721,6 +900,7 @@ mod tests {
             Path::new("/repo/project"),
             "codex",
             None,
+            None,
             2,
         )
         .unwrap();
@@ -748,6 +928,7 @@ mod tests {
             tmux.to_str().unwrap(),
             Path::new("/repo/project"),
             "codex",
+            None,
             None,
             1,
         )
@@ -778,6 +959,7 @@ mod tests {
             Path::new("/repo/project"),
             "codex",
             Some("sg-codex-"),
+            None,
             0,
         )
         .unwrap();
@@ -846,6 +1028,7 @@ mod tests {
             Path::new("/repo/project"),
             "codex",
             None,
+            None,
             2,
         )
         .unwrap_err()
@@ -909,6 +1092,7 @@ mod tests {
             Path::new("/repo/project"),
             "codex",
             Some("sg-codex-"),
+            None,
             3,
         )
         .unwrap();
@@ -918,5 +1102,313 @@ mod tests {
         assert!(logged.contains("--identifier sg-codex-3"), "{logged}");
         assert!(!logged.contains("--identifier sg-codex-1\n"), "{logged}");
         assert_eq!(logged.matches("run -w").count(), 2, "{logged}");
+    }
+
+    fn write_demand(path: &Path, ready: &[&Path]) {
+        let document = serde_json::json!({
+            "observed_at": Utc::now().to_rfc3339(),
+            "ready": ready.iter().map(|route| serde_json::json!({
+                "id": "j1", "workspace": route.display().to_string(),
+            })).collect::<Vec<_>>(),
+        });
+        fs::write(path, document.to_string()).unwrap();
+    }
+
+    fn write_seed_heartbeat(dir: &Path, name: &str, workspace: &Path, timestamp: DateTime<Utc>) {
+        fs::write(
+            dir.join(format!("{name}.json")),
+            serde_json::json!({
+                "qualified_id": name,
+                "worker_id": "worker",
+                "workspace": workspace.display().to_string(),
+                "last_heartbeat": timestamp.to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn seed_order_spreads_a_batch_across_ready_workspaces() {
+        let first = PathBuf::from("/repos/a");
+        let second = PathBuf::from("/repos/b");
+        let expected = [first.clone(), second.clone(), first.clone()];
+        let seeds = seed_order(&[first.clone(), first, second], &BTreeMap::new());
+        assert_eq!(seeds, expected);
+    }
+
+    #[test]
+    fn seed_order_prefers_the_least_occupied_ready_workspace() {
+        let busy = PathBuf::from("/repos/a");
+        let idle = PathBuf::from("/repos/b");
+        let running = BTreeMap::from([(busy.clone(), 2), (idle.clone(), 0)]);
+        let expected = [idle.clone(), busy.clone()];
+        let seeds = seed_order(&[busy, idle], &running);
+        assert_eq!(seeds, expected);
+    }
+
+    #[test]
+    fn seed_order_ties_resolve_to_the_smallest_path_deterministically() {
+        let first = PathBuf::from("/repos/a");
+        let second = PathBuf::from("/repos/b");
+        let running = BTreeMap::from([(second.clone(), 0), (first.clone(), 0)]);
+        let seeds = seed_order(&[second.clone(), first.clone()], &running);
+        assert_eq!(seeds, [first, second]);
+    }
+
+    #[test]
+    fn seed_order_never_outlives_the_ready_frontier() {
+        let route = PathBuf::from("/repos/a");
+        let running = BTreeMap::from([(route.clone(), 9)]);
+        assert!(seed_order(&[], &running).is_empty());
+        assert_eq!(seed_order(std::slice::from_ref(&route), &running), [route]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn seed_scale_up_launches_each_worker_at_the_least_occupied_ready_workspace() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("a-repo");
+        let second = dir.path().join("b-repo");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::create_dir_all(dir.path().join("heartbeats")).unwrap();
+        write_demand(&dir.path().join("demand.json"), &[&first, &second]);
+        // One live worker at `first` pushes the first launch to `second`.
+        write_seed_heartbeat(
+            &dir.path().join("heartbeats"),
+            "codex-luna-roster-1",
+            &first,
+            Utc::now(),
+        );
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            "#!/bin/sh\necho 'no server running on test socket' >&2\nexit 1\n",
+        );
+        let log = dir.path().join("needle.log");
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
+        let seeds = SeedSources {
+            demand_state: &dir.path().join("demand.json"),
+            heartbeats: &dir.path().join("heartbeats"),
+        };
+
+        reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            Path::new("/repo/project"),
+            "codex",
+            Some("sg-codex-"),
+            Some(&seeds),
+            2,
+        )
+        .unwrap();
+
+        let logged = fs::read_to_string(&log).unwrap();
+        let first_line = logged.lines().next().unwrap();
+        assert!(
+            first_line.contains(&second.display().to_string()),
+            "{logged}"
+        );
+        assert!(first_line.contains("--identifier sg-codex-1"), "{logged}");
+        assert!(logged.contains(&first.display().to_string()), "{logged}");
+        assert!(!logged.contains("/repo/project"), "{logged}");
+        assert_eq!(logged.matches("run -w").count(), 2, "{logged}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn seed_scale_up_never_launches_more_than_the_ready_frontier() {
+        let dir = TempDir::new().unwrap();
+        let route = dir.path().join("a-repo");
+        fs::create_dir_all(&route).unwrap();
+        write_demand(&dir.path().join("demand.json"), &[&route]);
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            "#!/bin/sh\necho 'no server running on test socket' >&2\nexit 1\n",
+        );
+        let log = dir.path().join("needle.log");
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
+        let seeds = SeedSources {
+            demand_state: &dir.path().join("demand.json"),
+            heartbeats: &dir.path().join("heartbeats"),
+        };
+
+        reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            Path::new("/repo/project"),
+            "codex",
+            None,
+            Some(&seeds),
+            3,
+        )
+        .unwrap();
+
+        let logged = fs::read_to_string(&log).unwrap();
+        assert_eq!(logged.matches("run -w").count(), 1, "{logged}");
+        assert!(logged.contains(&route.display().to_string()), "{logged}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn seed_scale_up_without_ready_work_launches_nothing() {
+        let dir = TempDir::new().unwrap();
+        write_demand(&dir.path().join("demand.json"), &[]);
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            "#!/bin/sh\necho 'no server running on test socket' >&2\nexit 1\n",
+        );
+        let log = dir.path().join("needle.log");
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
+        let seeds = SeedSources {
+            demand_state: &dir.path().join("demand.json"),
+            heartbeats: &dir.path().join("heartbeats"),
+        };
+
+        reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            Path::new("/repo/project"),
+            "codex",
+            Some("sg-codex-"),
+            Some(&seeds),
+            2,
+        )
+        .unwrap();
+
+        assert!(!log.exists(), "a seedless launch would be bare");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn seed_scale_up_fails_closed_without_a_demand_state_document() {
+        let dir = TempDir::new().unwrap();
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            "#!/bin/sh\necho 'no server running on test socket' >&2\nexit 1\n",
+        );
+        let log = dir.path().join("needle.log");
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
+        let seeds = SeedSources {
+            demand_state: &dir.path().join("missing.json"),
+            heartbeats: &dir.path().join("heartbeats"),
+        };
+
+        let error = reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            Path::new("/repo/project"),
+            "codex",
+            None,
+            Some(&seeds),
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("failed to read seed demand state"),
+            "{error}"
+        );
+        assert!(!log.exists(), "unknown demand must not launch");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn seed_scale_up_fails_closed_on_an_unavailable_demand_query() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demand.json"),
+            serde_json::json!({
+                "observed_at": Utc::now().to_rfc3339(),
+                "backlog_unavailable": "ValueError",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            "#!/bin/sh\necho 'no server running on test socket' >&2\nexit 1\n",
+        );
+        let log = dir.path().join("needle.log");
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
+        let seeds = SeedSources {
+            demand_state: &dir.path().join("demand.json"),
+            heartbeats: &dir.path().join("heartbeats"),
+        };
+
+        let error = reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            Path::new("/repo/project"),
+            "codex",
+            None,
+            Some(&seeds),
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unavailable"), "{error}");
+        assert!(!log.exists(), "unknown demand must not launch");
+    }
+
+    #[test]
+    fn stale_heartbeats_do_not_count_as_running_workers() {
+        let dir = TempDir::new().unwrap();
+        let heartbeats = dir.path().join("heartbeats");
+        fs::create_dir_all(&heartbeats).unwrap();
+        let route = dir.path().join("a-repo");
+        write_seed_heartbeat(
+            &heartbeats,
+            "codex-gone",
+            &route,
+            Utc::now() - ChronoDuration::seconds(61),
+        );
+        fs::write(heartbeats.join("notes.txt"), "not a heartbeat").unwrap();
+
+        assert!(seed_occupancy(&heartbeats, Utc::now()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn seed_occupancy_counts_fresh_workers_across_adapters() {
+        let dir = TempDir::new().unwrap();
+        let heartbeats = dir.path().join("heartbeats");
+        fs::create_dir_all(&heartbeats).unwrap();
+        let first = dir.path().join("a-repo");
+        let second = dir.path().join("b-repo");
+        write_seed_heartbeat(&heartbeats, "codex-luna-1", &first, Utc::now());
+        write_seed_heartbeat(&heartbeats, "claude-code-glm-2", &first, Utc::now());
+        write_seed_heartbeat(&heartbeats, "codex-luna-3", &second, Utc::now());
+
+        let occupancy = seed_occupancy(&heartbeats, Utc::now()).unwrap();
+        assert_eq!(occupancy.get(&first), Some(&2));
+        assert_eq!(occupancy.get(&second), Some(&1));
+    }
+
+    #[test]
+    fn seed_occupancy_treats_a_missing_directory_as_no_running_workers() {
+        let dir = TempDir::new().unwrap();
+        assert!(seed_occupancy(&dir.path().join("missing"), Utc::now())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn seed_occupancy_fails_closed_on_a_malformed_heartbeat() {
+        let dir = TempDir::new().unwrap();
+        let heartbeats = dir.path().join("heartbeats");
+        fs::create_dir_all(&heartbeats).unwrap();
+        fs::write(heartbeats.join("codex-worker-1.json"), "not json").unwrap();
+
+        let error = seed_occupancy(&heartbeats, Utc::now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid NEEDLE heartbeat"), "{error}");
     }
 }

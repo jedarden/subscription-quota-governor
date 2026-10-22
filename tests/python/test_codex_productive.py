@@ -212,6 +212,46 @@ class ProductiveTests(unittest.TestCase):
             self.assertIn("NEEDLE_STRANDS__GENERATION__ENABLED=false", argv)
             self.assertIn("--identifier sg-codex-1", argv[-1])
 
+    def seed_routes(self, run):
+        routes = []
+        for call in run.call_args_list:
+            argv = call.args[0][-1]
+            self.assertIn("--workspace ", argv)
+            routes.append(argv.split("--workspace ", 1)[1].split(" --identifier", 1)[0])
+        return routes
+
+    def test_new_workers_spread_across_ready_workspaces_least_loaded_first(self):
+        # Plan §26.5: the second launch must not stack on the first route
+        # when another ready workspace has no running workers yet.
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            first, second = Path(root) / "a-repo", Path(root) / "b-repo"
+            first.mkdir()
+            second.mkdir()
+            ready = [{"workspace": first, "id": "j1"}, {"workspace": first, "id": "j2"},
+                     {"workspace": second, "id": "j3"}]
+            with patch.object(adapter, "workers", return_value=[]), \
+                 patch.object(adapter, "demand", return_value={"ready": ready}), \
+                 patch.object(adapter.shutil, "which", return_value="/usr/bin/needle"), \
+                 patch.object(adapter, "run") as run:
+                adapter.actuate(s, 2)
+            self.assertEqual(self.seed_routes(run), [str(first), str(second)])
+
+    def test_occupied_workspace_pushes_new_worker_seeds_elsewhere(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            busy_repo, idle_repo = Path(root) / "a-repo", Path(root) / "b-repo"
+            busy_repo.mkdir()
+            idle_repo.mkdir()
+            live = [{"worker_id": "sg-codex-1", "workspace": str(busy_repo)}]
+            ready = [{"workspace": busy_repo, "id": "j1"}, {"workspace": idle_repo, "id": "j2"}]
+            with patch.object(adapter, "workers", return_value=live), \
+                 patch.object(adapter, "demand", return_value={"ready": ready}), \
+                 patch.object(adapter.shutil, "which", return_value="/usr/bin/needle"), \
+                 patch.object(adapter, "run") as run:
+                adapter.actuate(s, 2)
+            self.assertEqual(self.seed_routes(run), [str(idle_repo)])
+
     def adoption_settings(self, root):
         settings = self.settings(root)
         settings["unit_dir"] = str(root / "units")
