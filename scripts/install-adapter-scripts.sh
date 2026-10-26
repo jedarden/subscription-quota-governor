@@ -3,6 +3,7 @@
 #
 # The three adapter directories intentionally have different manifests because
 # each provider's launch paths import a different subset of the shared scripts.
+# subgov-source-watch is the one cross-provider watchdog, deployed once.
 # Keep this manifest as the single source of truth for deployment.
 set -euo pipefail
 
@@ -13,7 +14,7 @@ Usage:
   install-adapter-scripts.sh [--root DIRECTORY] [install|verify]
 
 Without --verify (or the verify subcommand), install the committed adapter
-scripts into DIRECTORY/subgov-{codex,zai,anthropic}. The default DIRECTORY is
+scripts into DIRECTORY/subgov-{codex,zai,anthropic,source-watch}. The default DIRECTORY is
 $HOME/.local/lib. The source files are read from git HEAD, never from a dirty
 working tree. --verify only compares deployed bytes and never writes files.
 --source-root is only for a git-archive export that has no .git directory;
@@ -76,11 +77,12 @@ else
         fail "could not resolve repository HEAD"
 fi
 
-adapter_dirs=(subgov-codex subgov-zai subgov-anthropic)
+adapter_dirs=(subgov-codex subgov-zai subgov-anthropic subgov-source-watch)
 declare -A adapter_files=(
     [subgov-codex]='codex-productive.py subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-source-refresh.py'
     [subgov-zai]='subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-collector.py zai-fleet.py zai-source-refresh.py zai-takeover.py'
     [subgov-anthropic]='anthropic-productive.py codex-productive.py subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-source-refresh.py'
+    [subgov-source-watch]='subgov_source_watch.py'
 )
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/subgov-adapter-scripts.XXXXXX")

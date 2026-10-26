@@ -1,0 +1,22 @@
+# Codinghome user unit; on other hosts adjust paths and the --source list to
+# the publishers that host actually deploys. Requires the host's shared
+# repo-traffic-alert@ template (or an equivalent OnFailure pager).
+[Unit]
+Description=Watchdog: alert when a subgov source publisher fails or its snapshot goes stale
+# Detection only: a violation makes the script exit 1 and this hook pages
+# through the shared alert template, with the violation lines as the journal
+# excerpt. This is the backstop that also covers a source whose unit does not
+# fail cleanly: a dead timer, a hung publisher inside TimeoutStartSec, or a
+# snapshot that simply stopped being written (subgov-28a476df).
+OnFailure=repo-traffic-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
+# Three 300s publish cycles is the staleness bound; a source unit that failed
+# pages immediately via its own OnFailure=, this catches the silent cases.
+ExecStart=/run/current-system/sw/bin/python3 -B /home/coding/.local/lib/subgov-source-watch/subgov_source_watch.py --max-age-seconds 900 --source subgov-zai-source.service:/home/coding/.config/subgov/zai-source-refresh.json --source subgov-codex-source.service:/home/coding/.config/subgov/codex-productive.json --source subgov-anthropic-source.service:/home/coding/.config/subgov/anthropic-productive.json
+TimeoutStartSec=60s
+UMask=0077
+NoNewPrivileges=true
+SyslogIdentifier=subgov-source-watch

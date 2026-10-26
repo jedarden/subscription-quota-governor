@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the subgov source watchdog cycling
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=300s
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

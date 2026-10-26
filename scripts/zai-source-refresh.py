@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from subgov_adapter_common import atomic_json, locked, read_json
+from subgov_adapter_common import atomic_json, describe_error, locked, read_json
 from subgov_ready_beads import policy_ok, observe as ready_demand
 
 
@@ -63,6 +63,10 @@ def refresh(settings):
             if settings.get("demand_state"):
                 atomic_json(settings["demand_state"], demand)
         except Exception as error:
+            # Name the cause in the journal; the published state only records
+            # that demand is unknown, so existing capacity is held, never zero.
+            print(f"zai-source-refresh: demand unavailable "
+                  f"({type(error).__name__}: {describe_error(error)})", file=sys.stderr)
             snapshot["fresh"] = False
             demand = {"observed_at": datetime.now(timezone.utc).isoformat(),
                       "backlog_unavailable": type(error).__name__}
@@ -75,15 +79,16 @@ def refresh(settings):
                              if key in ("eligible_backlog_capacity", "ready_bead_count", "backlog_unavailable")}}))
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--settings", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         refresh(read_json(args.settings))
     except Exception as error:
         # Keep the prior snapshot unchanged and allow its freshness to expire.
-        print(f"zai-source-refresh: refresh failed ({type(error).__name__})", file=sys.stderr)
+        print(f"zai-source-refresh: refresh failed "
+              f"({type(error).__name__}: {describe_error(error)})", file=sys.stderr)
         return 1
     return 0
 

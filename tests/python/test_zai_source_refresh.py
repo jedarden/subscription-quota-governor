@@ -1,3 +1,5 @@
+import contextlib
+import io
 import importlib.util
 import json
 from pathlib import Path
@@ -65,6 +67,33 @@ class RefreshTests(unittest.TestCase):
             self.assertNotIn("eligible_backlog_capacity", json.loads(dest.read_text()))
             self.assertFalse(json.loads(dest.read_text())["fresh"])
 
+
+    def test_refresh_failure_names_the_underlying_cause(self):
+        # subgov-28a476df: a bare class name hid the replica-count mismatch.
+        with tempfile.TemporaryDirectory() as root:
+            settings_path = Path(root) / "settings.json"
+            settings_path.write_text(json.dumps(
+                {"snapshot": str(Path(root) / "snapshot.json"),
+                 "collector": "collector", "collector_args": []}))
+            error = subprocess.CalledProcessError(1, ["collector"],
+                                                  stderr="replica count 3 != 2\n")
+            with patch.object(refresh.subprocess, "run", side_effect=error), \
+                    contextlib.redirect_stderr(io.StringIO()) as captured:
+                self.assertEqual(refresh.main(["--settings", str(settings_path)]), 1)
+            self.assertIn("replica count 3 != 2", captured.getvalue())
+            self.assertIn("CalledProcessError", captured.getvalue())
+
+    def test_failed_demand_logs_the_exception_message(self):
+        with tempfile.TemporaryDirectory() as root:
+            dest = Path(root) / "snapshot.json"
+            settings = {"snapshot": str(dest), "collector": "collector", "collector_args": []}
+            sample = {"observed_at": "2026-10-13T22:00:00Z", "fresh": True, "windows": []}
+            result = subprocess.CompletedProcess([], 0, json.dumps(sample), "")
+            with patch.object(refresh.subprocess, "run", return_value=result), \
+                    patch.object(refresh, "backlog", side_effect=ValueError("busy claim identity mismatch")), \
+                    contextlib.redirect_stderr(io.StringIO()) as captured:
+                refresh.refresh(settings)
+            self.assertIn("busy claim identity mismatch", captured.getvalue())
 
 if __name__ == "__main__":
     unittest.main()

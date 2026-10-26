@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -400,6 +401,21 @@ class ProductiveTests(unittest.TestCase):
                  patch.object(adapter, "stop_idle", return_value=True) as stop:
                 adapter.actuate(settings, 2)
             stop.assert_called_once_with(settings, free)
+
+    def test_broken_settings_names_the_missing_block_on_stderr(self):
+        # subgov-28a476df: the 2026-10-22 demand-block requirement failed every
+        # cycle printing only "ValueError". The journal must carry the message.
+        with tempfile.TemporaryDirectory() as root:
+            settings = Path(root) / "codex-productive.json"
+            settings.write_text(json.dumps({"version": 1, "host": "codinghome",
+                                            "prefix": "sg-codex-", "max_workers": 2,
+                                            "agent": "codex-test"}))
+            result = subprocess.run(
+                [sys.executable, "-B", str(SCRIPTS / "codex-productive.py"),
+                 "--settings", str(settings), "refresh"],
+                capture_output=True, text=True, timeout=60, cwd=SCRIPTS)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("missing ready-bead workspace scope", result.stderr)
 
 
 if __name__ == "__main__":

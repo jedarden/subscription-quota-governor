@@ -7,6 +7,26 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+def describe_error(error, stderr=None):
+    """Name an exception's cause, including a captured subprocess stderr.
+
+    Logging only the class hid the 2026-10-23 Z.AI replica-count mismatch
+    (CalledProcessError) and the Codex missing-demand-block failure (ValueError)
+    for days (subgov-28a476df). CalledProcessError and TimeoutExpired carry the
+    child's stderr without showing it, so append it, whitespace-flattened and
+    tail-truncated, to keep the journal line bounded and single-line. A caller
+    holding a completed result's stderr can pass it directly.
+    """
+    text = str(error).strip() or type(error).__name__
+    if stderr is None:
+        stderr = getattr(error, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    if stderr and stderr.strip():
+        text += "; subprocess stderr: " + " ".join(stderr.split())[-1000:]
+    return text
+
+
 def read_json(path, default=None):
     try:
         with open(path, encoding="utf-8") as stream:

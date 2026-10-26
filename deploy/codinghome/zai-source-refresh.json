@@ -16,7 +16,9 @@
     "300",
     "--deadline-seconds",
     "45",
-    "--insecure-tls"
+    "--insecure-tls",
+    "--selector",
+    "app=zai-proxy,variant=production"
   ],
   "heartbeat_dir": "/home/coding/.needle/state/heartbeats",
   "gate_health_dir": "/home/coding/.needle/state/gate-health",

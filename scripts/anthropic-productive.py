@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 import sys
 
+from subgov_adapter_common import describe_error
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -46,5 +48,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print("Anthropic productive adapter failed: " + type(error).__name__, file=sys.stderr)
+        print("Anthropic productive adapter failed: "
+              + type(error).__name__ + ": " + describe_error(error), file=sys.stderr)
         sys.exit(1)

@@ -108,6 +108,41 @@ Reset-credit redemption remains human-only under
 drains at the threshold and waits for a real new quota generation. No credit
 consumption call or automatic redemption is introduced.
 
+## Source alerting
+
+The source publishers page when they fail. Three layers, added after the
+2026-10-23..26 outage in which `subgov-zai-source` and `subgov-codex-source`
+failed every cycle for days with no page (subgov-28a476df):
+
+1. **Failure paging.** Each source unit (`subgov-zai-source`,
+   `subgov-codex-source`, `subgov-anthropic-source`) carries
+   `OnFailure=repo-traffic-alert@%n.service`, so a failed cycle pages through
+   this box's shared Telegram alert template with the unit's result and
+   journal excerpt. The template lives in `~/.config/systemd/user/`
+   (jedarden.com checkout); hosts without it must substitute an equivalent
+   OnFailure pager.
+2. **Staleness watchdog.** `subgov-source-watch.service`/`.timer` run
+   `scripts/subgov_source_watch.py` every five minutes. A source is a
+   violation when its unit is failed, its settings or snapshot are missing or
+   unusable, or its snapshot was last written more than 900 seconds ago (three
+   300s publish cycles). Any violation exits 1 and the unit's own
+   `OnFailure=` pages with the violation lines. Units the user manager has
+   never loaded are skipped, so hosts deploying a subset stay quiet. This
+   catches the silent shapes: a dead timer, a hung publisher inside
+   `TimeoutStartSec`, a snapshot that stopped being written.
+3. **Named causes.** The publishers log `ExceptionClass: message` plus a
+   failed subprocess's captured stderr to the journal (before 2026-10-26 they
+   printed the bare class, which hid both incident causes). The watchdog
+   violation lines point at `journalctl --user -u <unit>` for that detail.
+
+Deploy the watchdog script with the adapters (`scripts/install-adapter-scripts.sh`
+installs it into `~/.local/lib/subgov-source-watch/`), install
+`subgov-source-watch.service` and `.timer` alongside the source units, then
+`systemctl --user daemon-reload && systemctl --user enable --now
+subgov-source-watch.timer`. Verify with a hand run:
+`~/.local/lib/subgov-source-watch/subgov_source_watch.py --max-age-seconds 900 --source ...`
+(exits 0 when all watched sources are fresh and their units healthy).
+
 ## Rollback
 
 Stop/disable the source timer and stop the publisher. Restore the backed-up

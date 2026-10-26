@@ -11,6 +11,18 @@ versioned config-schema contract; see
 
 ### Added
 
+- Source-publisher alerting (subgov-28a476df): the deployed source units gain
+  `OnFailure=repo-traffic-alert@%n.service` so a failed cycle pages;
+  `scripts/subgov_source_watch.py` (deployed via
+  `subgov-source-watch.service`/`.timer`, `deploy/codinghome/`) exits 1 when a
+  source unit is failed or its snapshot is older than three 300s cycles,
+  naming the stale source, and its own `OnFailure=` pages with those lines;
+  and the zai/codex/anthropic publishers log the exception message plus a
+  failed subprocess's stderr (bare class names hid both 2026-10-23 incident
+  causes). The shipped `deploy/codinghome/zai-source-refresh.json` pins the
+  collector selector to `app=zai-proxy,variant=production` so a test-variant
+  pod can no longer break the replica census.
+
 - Plan §26.2 roster takeover: an account's fleet may declare a `takeover`
   list of roster workers (worker_id, agent, optional systemd unit) plus a
   `takeover_helper` command. Listed workers leave the §23 unowned floor, so

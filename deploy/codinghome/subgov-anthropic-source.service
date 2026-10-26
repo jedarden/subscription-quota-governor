@@ -2,6 +2,11 @@
 Description=Anthropic read-only quota and ready-bead demand publisher
 After=network-online.target
 Wants=network-online.target
+# A failed cycle pages through the host's shared Telegram alert template
+# (repo-traffic-alert@, which reads the failed unit's result and journal
+# excerpt back out of the user manager). Without this hook the
+# 2026-10-23..26 failures ran for days with no page (subgov-28a476df).
+OnFailure=repo-traffic-alert@%n.service
 
 [Service]
 Type=oneshot

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-from subgov_adapter_common import atomic_json, atomic_text, live_children, locked, read_json
+from subgov_adapter_common import atomic_json, atomic_text, describe_error, live_children, locked, read_json
 from subgov_host_capacity import admission
 from subgov_ready_beads import allowed, native_internal_artifact, policy_ok, seed_order, observe as ready_demand
 
@@ -26,7 +26,10 @@ IDLE = {"SELECTING", "IDLE", "WAITING", "BACKOFF", "SLEEPING", "EXHAUSTED", "ADM
 def run(argv, cwd=None, timeout=5):
     result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
-        raise RuntimeError("read-only command failed" if argv[0] == "bead" else "adapter command failed")
+        label = "read-only command failed" if argv[0] == "bead" else "adapter command failed"
+        # The journal is where a failed command's own stderr belongs; the
+        # published snapshot stays free of CLI output (subgov-28a476df).
+        raise RuntimeError(describe_error(RuntimeError(label), result.stderr))
     return result.stdout
 
 
@@ -264,6 +267,8 @@ def refresh(settings):
         except Exception as exc:
             # Unknown demand must hold existing workers, never manufacture zero
             # or grant capacity. Do not forward CLI output or credentials.
+            print(f"subgov-codex-source: demand unavailable "
+                  f"({type(exc).__name__}: {describe_error(exc)})", file=sys.stderr)
             quota["fresh"] = False
             measured = {"observed_at": current_time().isoformat(), "unknown": type(exc).__name__}
         atomic_json(settings["demand_state"], measured)
@@ -520,5 +525,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print("Codex productive adapter failed: " + type(exc).__name__, file=sys.stderr)
+        print("Codex productive adapter failed: "
+              + type(exc).__name__ + ": " + describe_error(exc), file=sys.stderr)
         sys.exit(1)

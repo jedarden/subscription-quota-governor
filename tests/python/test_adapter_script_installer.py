@@ -32,6 +32,9 @@ MANIFEST = {
         "subgov_host_capacity.py",
         "zai-source-refresh.py",
     ],
+    "subgov-source-watch": [
+        "subgov_source_watch.py",
+    ],
 }
 
 
