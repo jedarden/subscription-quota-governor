@@ -34,6 +34,7 @@ MANIFEST = {
     ],
     "subgov-source-watch": [
         "subgov_source_watch.py",
+        "subgov_adapter_common.py",
     ],
 }
 

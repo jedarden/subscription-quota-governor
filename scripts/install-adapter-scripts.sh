@@ -82,7 +82,7 @@ declare -A adapter_files=(
     [subgov-codex]='codex-productive.py subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-source-refresh.py'
     [subgov-zai]='subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-collector.py zai-fleet.py zai-source-refresh.py zai-takeover.py'
     [subgov-anthropic]='anthropic-productive.py codex-productive.py subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-source-refresh.py'
-    [subgov-source-watch]='subgov_source_watch.py'
+    [subgov-source-watch]='subgov_source_watch.py subgov_adapter_common.py'
 )
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/subgov-adapter-scripts.XXXXXX")
