@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -86,12 +87,43 @@ class ReadyBeadsTests(unittest.TestCase):
             repo = self.workspace(root, 'normal', 'strands:\n  pluck:\n    exclude_labels:\n    - test-only\n')
             settings = self.settings(foreign, legacy, agent, gate, repo)
             settings['demand']['workspace_agents'] = {str(agent): ['claude-print']}
-            with patch.object(demand, 'gate_degraded', side_effect=lambda s, p: p == str(gate)), \
+            with patch.object(demand, 'gate_degraded', side_effect=lambda s, p: 'workspace_gate_degraded' if p == str(gate) else None), \
                     patch.object(demand, 'ready_issues', return_value=[
                         {'id': 'excluded', 'status': 'open', 'labels': ['test-only']}]) as query:
                 result = demand.observe(settings)
             self.assertEqual(result['eligible_backlog_capacity'], 0)
             query.assert_called_once_with(str(repo))
+
+    def test_unreadable_gate_records_block_only_their_workspaces(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            empty = self.workspace(root, 'empty')
+            truncated = self.workspace(root, 'truncated')
+            healthy = self.workspace(root, 'healthy')
+            absent = self.workspace(root, 'absent')
+            degraded = self.workspace(root, 'degraded')
+            gate_dir = root / 'gate-health'
+            gate_dir.mkdir()
+            for route, value in ((empty, ''), (truncated, '{"degraded":')):
+                key = hashlib.sha256(str(route.resolve()).encode()).hexdigest()[:12]
+                (gate_dir / f'{key}.json').write_text(value)
+            key = hashlib.sha256(str(healthy.resolve()).encode()).hexdigest()[:12]
+            (gate_dir / f'{key}.json').write_text('{"degraded": false}')
+            key = hashlib.sha256(str(degraded.resolve()).encode()).hexdigest()[:12]
+            (gate_dir / f'{key}.json').write_text('{"degraded": true}')
+            settings = self.settings(empty, truncated, healthy, absent, degraded)
+            settings['gate_health_dir'] = str(gate_dir)
+            with patch.object(demand, 'ready_issues', side_effect=lambda route: [
+                    {'id': Path(route).name + '-ready', 'status': 'open', 'labels': []}]) as query:
+                measured = demand.observe(settings)
+            self.assertEqual(measured['ready_bead_count'], 2)
+            self.assertEqual(measured['eligible_backlog_capacity'], 2)
+            self.assertEqual({job['id'] for job in measured['ready']}, {'healthy-ready', 'absent-ready'})
+            self.assertEqual({(row['workspace'], row['reason']) for row in measured['blocked']},
+                             {(str(empty), 'gate_state_unreadable'),
+                              (str(truncated), 'gate_state_unreadable'),
+                              (str(degraded), 'workspace_gate_degraded')})
+            self.assertEqual({call.args[0] for call in query.call_args_list}, {str(healthy), str(absent)})
 
     def test_query_failure_malformed_or_truncated_output_is_unknown(self):
         with tempfile.TemporaryDirectory() as temp:

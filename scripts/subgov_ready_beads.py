@@ -110,10 +110,15 @@ def policy_ok(route, host):
 
 def gate_degraded(settings, route):
     if not settings.get('gate_health_dir'):
-        return False
+        return None
     key = hashlib.sha256(str(Path(route).resolve()).encode()).hexdigest()[:12]
-    value = read_json(Path(settings['gate_health_dir']) / (key + '.json'), {})
-    return value.get('degraded', False) is not False
+    try:
+        value = read_json(Path(settings['gate_health_dir']) / (key + '.json'), {})
+    except (json.JSONDecodeError, UnicodeError, OSError):
+        return 'gate_state_unreadable'
+    if not isinstance(value, dict):
+        return 'gate_state_unreadable'
+    return 'workspace_gate_degraded' if value.get('degraded', False) is not False else None
 
 
 def discover(root):
@@ -251,8 +256,8 @@ def observe(settings, busy=(), unowned_floor=0):
     for route in routes(settings):
         if not policy_ok(route, settings['host']):
             blocked.append({'workspace': route, 'reason': 'backend_or_queue_owner'})
-        elif gate_degraded(settings, route):
-            blocked.append({'workspace': route, 'reason': 'workspace_gate_degraded'})
+        elif gate_reason := gate_degraded(settings, route):
+            blocked.append({'workspace': route, 'reason': gate_reason})
         else:
             selected.append(route)
     ready, seeds, summaries, capacity = [], [], [], unowned_floor
