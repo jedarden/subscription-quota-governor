@@ -13,12 +13,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use subscription_governor::config::{ActuatorConfig, Config, ResourceSourceConfig, SourceConfig};
+use subscription_governor::config::{
+    AccountConfig, ActuatorConfig, Config, FederationConfig, ResourceSourceConfig, SourceConfig,
+};
 use subscription_governor::controller::{
     apply_backpressure, evaluate_pool, CreditDeadlineAdvisory, Decision,
 };
+use subscription_governor::federation::{
+    self, FederationHost, PeerFreshness, PeerMoment, PeerQuotaSample, PeerRecord, PeerTable,
+};
 use subscription_governor::fleet;
-use subscription_governor::model::ResourceSnapshot;
+use subscription_governor::model::{QuotaSnapshot, ResourceSnapshot};
 use subscription_governor::ownership::{self, OwnershipCycle};
 use subscription_governor::placement::{self, HostPlacement};
 use subscription_governor::source;
@@ -814,6 +819,11 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
         );
     }
     let shutdown = install_shutdown_flag().map_err(GovernorError::State)?;
+    let mut federation_runtime = config
+        .federation
+        .as_ref()
+        .filter(|f| !f.peers.is_empty())
+        .map(FederationRuntime::new);
     let interval = Duration::from_secs(config.poll_interval_seconds);
     let mut anchor = Instant::now();
     let mut scheduled_at: Option<Instant> = None;
@@ -821,7 +831,13 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
     loop {
         let cycle_started_at = Instant::now();
         let (late, skipped_cycles) = schedule_drift(scheduled_at, cycle_started_at, interval);
-        let outcome = run_cycle(&config, &mut state, observe_only, &shutdown);
+        let outcome = run_cycle(
+            &config,
+            &mut state,
+            observe_only,
+            &shutdown,
+            federation_runtime.as_mut(),
+        );
         println!(
             "{}",
             serde_json::to_string(&json!({
@@ -1395,6 +1411,175 @@ fn federated(config: &Config) -> bool {
         .is_some_and(|f| !f.peers.is_empty())
 }
 
+/// Accepted records survive a failed pull so §28.7 can count the last
+/// published workers until expiry. PeerTable owns the monotonic freshness
+/// clock; the parallel record map supplies identity and ceiling metadata.
+struct FederationRuntime {
+    table: PeerTable,
+    records: BTreeMap<String, PeerRecord>,
+}
+
+impl FederationRuntime {
+    fn new(config: &FederationConfig) -> Self {
+        Self {
+            table: PeerTable::new(config, Instant::now()),
+            records: BTreeMap::new(),
+        }
+    }
+
+    fn ingest_cycle(&mut self, config: &FederationConfig, ownership: &OwnershipCycle) {
+        for record in &ownership.records {
+            if let Some(peer) = config
+                .peers
+                .iter()
+                .find(|peer| peer.host_id == record.host_id)
+            {
+                match self
+                    .table
+                    .ingest(peer, Ok(record.clone()), &PeerMoment::now())
+                {
+                    Ok(()) => {
+                        self.records.insert(record.host_id.clone(), record.clone());
+                    }
+                    Err(error) => eprintln!(
+                        "{}",
+                        json!({"event":"peer_rejected","time":Utc::now(),"peer_host_id":peer.host_id,"error":error.to_string()})
+                    ),
+                }
+            }
+        }
+        for event in self.table.drain_events() {
+            println!("{event}");
+        }
+    }
+
+    fn expired_hosts(&mut self, config: &FederationConfig) -> BTreeSet<String> {
+        let moment = PeerMoment::now();
+        config
+            .peers
+            .iter()
+            .filter(|peer| {
+                self.table.freshness(&peer.host_id, &moment) == Some(PeerFreshness::Expired)
+            })
+            .map(|peer| peer.host_id.clone())
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)] // §28.6 needs the current local observation plus the configured peer view.
+    fn shared_decision(
+        &mut self,
+        federation: &FederationConfig,
+        local_record: &PeerRecord,
+        name: &str,
+        account: &AccountConfig,
+        snapshot: &QuotaSnapshot,
+        prior: &subscription_governor::state::AccountState,
+        local_workers: u32,
+        now: DateTime<Utc>,
+    ) -> Result<(federation::SharedAccountDecision, bool)> {
+        let local_account = local_record
+            .accounts
+            .get(name)
+            .with_context(|| format!("local peer record has no account {name}"))?;
+        let local_demand = local_account
+            .pools
+            .values()
+            .map(|pool| pool.ready_demand.worker_bound())
+            .fold(0u32, u32::saturating_add);
+        let local_limit = account
+            .fleet
+            .hosts
+            .as_ref()
+            .and_then(|hosts| hosts.get(&federation.host_id))
+            .and_then(|host| host.max_workers)
+            .unwrap_or(account.fleet.max_workers);
+        let mut hosts = vec![FederationHost {
+            host_id: federation.host_id.clone(),
+            workers: local_workers,
+            ceiling: local_record
+                .host_ceiling
+                .as_ref()
+                .map_or(local_limit, |ceiling| ceiling.workers)
+                .min(local_limit),
+            ready_demand: local_demand,
+        }];
+        let mut samples = Vec::<PeerQuotaSample>::new();
+        if snapshot.fresh
+            && now
+                .signed_duration_since(snapshot.observed_at)
+                .num_seconds()
+                <= account.utilization.stale_after_seconds as i64
+        {
+            if let Some(window) = snapshot.windows.first() {
+                samples.push(PeerQuotaSample {
+                    window: window.id.clone(),
+                    used_fraction: window.used_fraction,
+                    resets_at: window.resets_at,
+                    observed_at: snapshot.observed_at,
+                });
+            }
+        }
+        let moment = PeerMoment::now();
+        for peer in &federation.peers {
+            let Some(record) = self.records.get(&peer.host_id) else {
+                continue;
+            };
+            let Some(peer_account) = record.accounts.get(name) else {
+                continue;
+            };
+            if !federation::classify_account(local_account, peer_account).shares_account_total() {
+                if federation::classify_account(local_account, peer_account).is_error() {
+                    println!(
+                        "{}",
+                        federation::fingerprint_mismatch_event(
+                            local_account,
+                            peer_account,
+                            &peer.host_id,
+                            now,
+                        )
+                    );
+                }
+                continue;
+            }
+            let view = self
+                .table
+                .peer_account_snapshot(&peer.host_id, name, &moment)
+                .expect("configured peer has a snapshot");
+            hosts.push(FederationHost {
+                host_id: peer.host_id.clone(),
+                workers: view.workers,
+                ceiling: record
+                    .host_ceiling
+                    .as_ref()
+                    .map_or(account.fleet.max_workers, |ceiling| ceiling.workers)
+                    .min(
+                        account
+                            .fleet
+                            .hosts
+                            .as_ref()
+                            .and_then(|hosts| hosts.get(&peer.host_id))
+                            .and_then(|host| host.max_workers)
+                            .unwrap_or(account.fleet.max_workers),
+                    ),
+                ready_demand: view.ready_demand,
+            });
+            if let Some(sample) = view.quota_sample.filter(|sample| {
+                now.signed_duration_since(sample.observed_at).num_seconds()
+                    <= account.utilization.stale_after_seconds as i64
+            }) {
+                samples.push(sample);
+            }
+        }
+        let stale_peer = self.table.any_peer_stale(&moment);
+        for event in self.table.drain_events() {
+            println!("{event}");
+        }
+        let decision =
+            federation::shared_account_total(name, account, prior, &hosts, &samples, now)?;
+        Ok((decision, stale_peer))
+    }
+}
+
 fn ownership_for_cycle(config: &Config) -> OwnershipCycle {
     if !federated(config) {
         return OwnershipCycle::default();
@@ -1424,6 +1609,7 @@ fn ownership_for_cycle(config: &Config) -> OwnershipCycle {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Re-pull gate needs the account target and expiry classification.
 fn gate_federated_launch(
     config: &Config,
     account: &str,
@@ -1431,6 +1617,7 @@ fn gate_federated_launch(
     desired: u32,
     controller_total: u32,
     actuator: &ActuatorConfig,
+    expired_hosts: &BTreeSet<String>,
     now: DateTime<Utc>,
 ) -> Result<u32> {
     if desired <= current {
@@ -1470,8 +1657,21 @@ fn gate_federated_launch(
         now,
         || {
             let cycle = ownership::refresh_ownership(config, Utc::now())?;
-            if !cycle.fresh {
-                anyhow::bail!("a configured peer did not answer the launch re-pull");
+            let received_at = Utc::now();
+            if cycle.records.iter().any(|record| {
+                (record.observed_at - received_at).num_seconds()
+                    > federation::PEER_CLOCK_SKEW_TOLERANCE_SECONDS
+            }) {
+                anyhow::bail!("a peer re-pull record exceeded clock skew tolerance");
+            }
+            if federation.peers.iter().any(|peer| {
+                !expired_hosts.contains(&peer.host_id)
+                    && !cycle
+                        .records
+                        .iter()
+                        .any(|record| record.host_id == peer.host_id)
+            }) {
+                anyhow::bail!("a non-expired peer did not answer the launch re-pull");
             }
             if fleet::launch_capacity(actuator, &cycle.excluded)? < proposed {
                 anyhow::bail!("workspace ownership changed before launch");
@@ -1493,9 +1693,18 @@ fn run_cycle(
     state: &mut State,
     observe_only: bool,
     shutdown: &AtomicBool,
+    mut federation_runtime: Option<&mut FederationRuntime>,
 ) -> CycleOutcome {
     let mut outcome = CycleOutcome::default();
     let ownership = ownership_for_cycle(config);
+    if let (Some(runtime), Some(federation)) = (
+        federation_runtime.as_deref_mut(),
+        config.federation.as_ref(),
+    ) {
+        runtime.ingest_cycle(federation, &ownership);
+    }
+    let local_record =
+        federated(config).then(|| federation::build_local_record(config, Utc::now()));
     for (name, account_config) in &config.accounts {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -1577,6 +1786,51 @@ fn run_cycle(
                 now,
             )
             .map_err(AccountFailure::Observation)?;
+            let mut shared_total = None;
+            let mut local_share = None;
+            let mut stale_peer = false;
+            let mut expired_hosts = BTreeSet::new();
+            let mut peer_capacity_unknown = false;
+            if let Some(runtime) = federation_runtime.as_deref_mut() {
+                let federation = config.federation.as_ref().expect("federated config");
+                let local_record = local_record
+                    .as_ref()
+                    .expect("federated cycle has local record")
+                    .as_ref()
+                    .map_err(|error| AccountFailure::Observation(anyhow!("{error:#}")))?;
+                let (shared, stale) = runtime
+                    .shared_decision(
+                        federation,
+                        local_record,
+                        name,
+                        account_config,
+                        &snapshot,
+                        &prior,
+                        host_current
+                            .as_ref()
+                            .and_then(|hosts| hosts.get(&federation.host_id).copied())
+                            .unwrap_or(workers),
+                        now,
+                    )
+                    .map_err(AccountFailure::Observation)?;
+                shared_total = Some(shared.total);
+                local_share = Some(shared.shares.get(&federation.host_id).copied().unwrap_or(0));
+                stale_peer = stale;
+                expired_hosts = runtime.expired_hosts(federation);
+                peer_capacity_unknown = federation.peers.iter().any(|peer| {
+                    !expired_hosts.contains(&peer.host_id)
+                        && runtime.records.get(&peer.host_id).is_some_and(|record| {
+                            record.host_ceiling.is_none()
+                                && account_config
+                                    .fleet
+                                    .hosts
+                                    .as_ref()
+                                    .and_then(|hosts| hosts.get(&peer.host_id))
+                                    .and_then(|host| host.max_workers)
+                                    .is_none()
+                        })
+                });
+            }
             if account_config.utilization.zai_saturation.is_some() {
                 let next = subscription_governor::saturation::apply_zai_saturation(
                     &mut decision,
@@ -1602,19 +1856,50 @@ fn run_cycle(
                 );
                 state.accounts.entry(name.clone()).or_default().backpressure = next_backpressure;
             }
+            // The current §28.6 pure helper carries one quota window and no
+            // banked-credit or pressure inputs. Keep live workers untouched
+            // for policies it cannot faithfully evaluate yet.
+            let federation_safety_hold = federated(config)
+                && (account_config.banked_resets.enabled
+                    || account_config.utilization.zai_saturation.is_some()
+                    || account_config.utilization.backpressure.is_some()
+                    || snapshot.windows.len() != 1
+                    || unowned > 0
+                    || peer_capacity_unknown);
+            if let Some(share) = local_share {
+                // Local pressure brakes may further reduce this host's share.
+                // Otherwise the shared §28.6 split is the actuation target.
+                let local_brake = decision
+                    .backpressure
+                    .as_ref()
+                    .is_some_and(|b| b.brake_changed)
+                    || decision.saturation.is_some();
+                decision.desired_workers = if local_brake {
+                    share.min(decision.desired_workers)
+                } else {
+                    share
+                };
+                if stale_peer {
+                    decision.desired_workers = decision.desired_workers.min(workers);
+                }
+                if federation_safety_hold {
+                    decision.desired_workers = workers;
+                }
+            }
             if federated(config)
                 && !observe_only
                 && host_current.is_none()
                 && decision.desired_workers > workers
             {
-                decision.desired_workers = if ownership.fresh && pending == 0 {
+                decision.desired_workers = if !stale_peer && pending == 0 {
                     gate_federated_launch(
                         config,
                         name,
                         workers,
                         decision.desired_workers,
-                        decision.desired_workers,
+                        shared_total.unwrap_or(decision.desired_workers),
                         &account_config.fleet.actuator,
+                        &expired_hosts,
                         now,
                     )
                     .map_err(AccountFailure::Actuation)?
@@ -1651,6 +1936,30 @@ fn run_cycle(
                     now,
                 )
                 .map_err(AccountFailure::Observation)?;
+                if let Some(share) = local_share {
+                    let local_host = &config
+                        .federation
+                        .as_ref()
+                        .expect("federated config")
+                        .host_id;
+                    for placement in &mut placements {
+                        placement.target = if &placement.host_id == local_host {
+                            // The local §22.7 placement already applies the
+                            // measured resource reserve. Federation may
+                            // further cap it, never bypass it.
+                            let target = share.min(decision.desired_workers).min(placement.target);
+                            if federation_safety_hold {
+                                placement.current
+                            } else if stale_peer {
+                                target.min(placement.current)
+                            } else {
+                                target
+                            }
+                        } else {
+                            placement.current
+                        };
+                    }
+                }
                 if federated(config) && !observe_only {
                     let local_host = &config
                         .federation
@@ -1659,16 +1968,17 @@ fn run_cycle(
                         .host_id;
                     if let Some(local) = placements.iter_mut().find(|p| &p.host_id == local_host) {
                         if local.target > local.current {
-                            local.target = if ownership.fresh && pending == 0 {
+                            local.target = if !stale_peer && pending == 0 {
                                 gate_federated_launch(
                                     config,
                                     name,
                                     local.current,
                                     local.target,
-                                    decision.desired_workers,
+                                    shared_total.unwrap_or(decision.desired_workers),
                                     &account_config.fleet.hosts.as_ref().expect("host fleet")
                                         [local_host]
                                         .actuator,
+                                    &expired_hosts,
                                     now,
                                 )
                                 .map_err(AccountFailure::Actuation)?
@@ -1684,8 +1994,8 @@ fn run_cycle(
                 host_placements = Some(placements);
             }
 
-            metrics.actuation_attempted = !observe_only;
-            let actuated = if observe_only {
+            metrics.actuation_attempted = !observe_only && !federation_safety_hold;
+            let actuated = if observe_only || federation_safety_hold {
                 false
             } else if let Some(placements) = &host_placements {
                 let outcomes = if federated(config) {
@@ -1755,6 +2065,17 @@ fn run_cycle(
                 "actuated": actuated,
                 "decision": decision,
             });
+            if let Some(total) = shared_total {
+                event["federation"] = json!({
+                    "shared_total": total,
+                    "local_share": local_share,
+                    "stale_peer": stale_peer,
+                    "expired_hosts": expired_hosts,
+                });
+            }
+            if federation_safety_hold {
+                event["federation_safety_hold"] = json!(true);
+            }
             if let Some(actual) = observed_after_actuation {
                 event["actual_workers"] = json!(actual);
             }
@@ -2023,11 +2344,264 @@ mod shutdown_tests {
     }
 
     #[test]
+    fn runtime_shared_decision_counts_matching_peers_and_caps_the_local_host() {
+        let now = Utc::now();
+        let mut config = config_with_unreachable_sources();
+        config.accounts.remove("b");
+        let account = config.accounts.get_mut("a").unwrap();
+        account.fleet.max_workers = 6;
+        account.fleet.hosts = Some(BTreeMap::from([(
+            "local".to_owned(),
+            serde_json::from_value(json!({
+                "max_workers": 2,
+                "observer": {"type": "static", "workers": 1}
+            }))
+            .unwrap(),
+        )]));
+        let federation: FederationConfig = serde_json::from_value(json!({
+            "host_id": "local",
+            "peers": [{"host_id": "remote"}]
+        }))
+        .unwrap();
+        let make_record = |host: &str, workers: u32, fingerprint: String, demand: u32| {
+            serde_json::from_value::<PeerRecord>(json!({
+                "schema_version": 1,
+                "instance_id": "0123456789abcdef0123456789abcdef",
+                "host_id": host,
+                "record_seq": 1,
+                "observed_at": now,
+                "accounts": {"a": {
+                    "account_id": "a",
+                    "account_fingerprint": fingerprint,
+                    "pools": {"a": {
+                        "governed_workers": workers,
+                        "pending_launches": 0,
+                        "desired": workers,
+                        "ready_demand": {"ready_beads": demand}
+                    }}
+                }}
+            }))
+            .unwrap()
+        };
+        let fingerprint = federation::account_fingerprint("a");
+        let local = make_record("local", 1, fingerprint.clone(), 6);
+        let peer = make_record("remote", 2, fingerprint.clone(), 6);
+        let snapshot: QuotaSnapshot = serde_json::from_value(json!({
+            "observed_at": now,
+            "fresh": true,
+            "windows": [{
+                "id": "five_hour",
+                "used_fraction": 0.1,
+                "resets_at": now + chrono::Duration::hours(4)
+            }]
+        }))
+        .unwrap();
+        let mut runtime = FederationRuntime::new(&federation);
+        runtime.ingest_cycle(
+            &federation,
+            &OwnershipCycle {
+                fresh: true,
+                excluded: BTreeSet::new(),
+                events: Vec::new(),
+                records: vec![peer],
+            },
+        );
+        let (decision, stale) = runtime
+            .shared_decision(
+                &federation,
+                &local,
+                "a",
+                account,
+                &snapshot,
+                &Default::default(),
+                1,
+                now,
+            )
+            .unwrap();
+        assert!(!stale);
+        assert_eq!(decision.denominator, 3);
+        assert!(decision.shares["local"] <= 2);
+        assert!(decision.shares.values().sum::<u32>() <= decision.total);
+
+        let mismatched = make_record(
+            "remote",
+            2,
+            federation::account_fingerprint("other-account"),
+            6,
+        );
+        runtime.ingest_cycle(
+            &federation,
+            &OwnershipCycle {
+                fresh: true,
+                excluded: BTreeSet::new(),
+                events: Vec::new(),
+                records: vec![mismatched],
+            },
+        );
+        let (decision, _) = runtime
+            .shared_decision(
+                &federation,
+                &local,
+                "a",
+                account,
+                &snapshot,
+                &Default::default(),
+                1,
+                now,
+            )
+            .unwrap();
+        assert_eq!(decision.denominator, 1);
+
+        let peer = make_record("remote", 2, fingerprint, 6);
+        let mut stale_runtime = FederationRuntime::new(&federation);
+        stale_runtime
+            .table
+            .ingest(
+                &federation.peers[0],
+                Ok(peer.clone()),
+                &PeerMoment {
+                    monotonic: Instant::now() - Duration::from_secs(130),
+                    wall: now,
+                },
+            )
+            .unwrap();
+        stale_runtime.records.insert("remote".to_owned(), peer);
+        let (decision, stale) = stale_runtime
+            .shared_decision(
+                &federation,
+                &local,
+                "a",
+                account,
+                &snapshot,
+                &Default::default(),
+                1,
+                now,
+            )
+            .unwrap();
+        assert!(stale);
+        assert_eq!(decision.denominator, 3, "stale peer workers stay counted");
+
+        let peer = make_record("remote", 2, federation::account_fingerprint("a"), 6);
+        let mut expired_runtime = FederationRuntime::new(&federation);
+        expired_runtime
+            .table
+            .ingest(
+                &federation.peers[0],
+                Ok(peer.clone()),
+                &PeerMoment {
+                    monotonic: Instant::now() - Duration::from_secs(1_900),
+                    wall: now,
+                },
+            )
+            .unwrap();
+        expired_runtime.records.insert("remote".to_owned(), peer);
+        let (decision, stale) = expired_runtime
+            .shared_decision(
+                &federation,
+                &local,
+                "a",
+                account,
+                &snapshot,
+                &Default::default(),
+                1,
+                now,
+            )
+            .unwrap();
+        assert!(!stale);
+        assert_eq!(decision.denominator, 1, "expired peer workers leave total");
+        assert_eq!(
+            expired_runtime.expired_hosts(&federation),
+            BTreeSet::from(["remote".to_owned()])
+        );
+    }
+
+    #[test]
+    fn run_cycle_holds_banked_federated_pool_without_calling_its_actuator() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let source_path = dir.path().join("quota.json");
+        fs::write(
+            &source_path,
+            serde_json::to_vec(&json!({
+                "observed_at": now,
+                "fresh": true,
+                "windows": [{
+                    "id": "five_hour",
+                    "used_fraction": 0.1,
+                    "resets_at": now + chrono::Duration::hours(4)
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let peer_path = dir.path().join("peer.json");
+        fs::write(
+            &peer_path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "instance_id": "0123456789abcdef0123456789abcdef",
+                "host_id": "remote",
+                "record_seq": 1,
+                "observed_at": now,
+                "accounts": {"a": {
+                    "account_id": "a",
+                    "account_fingerprint": federation::account_fingerprint("a"),
+                    "pools": {"remote": {
+                        "governed_workers": 2,
+                        "pending_launches": 0,
+                        "desired": 2,
+                        "ready_demand": {"ready_beads": 2}
+                    }}
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let marker_path = dir.path().join("actuated");
+        let mut config = config_with_unreachable_sources();
+        config.accounts.remove("b");
+        config.state_path = Some(dir.path().join("state.json"));
+        let account = config.accounts.get_mut("a").unwrap();
+        account.source = SourceConfig::NormalizedFile { path: source_path };
+        account.fleet.actuator = ActuatorConfig::Command {
+            argv: vec!["touch".to_owned(), marker_path.display().to_string()],
+            reconcile_unchanged: true,
+        };
+        account.banked_resets.enabled = true;
+        config.federation = Some(
+            serde_json::from_value(json!({
+                "host_id": "local",
+                "peers": [{
+                    "host_id": "remote",
+                    "argv": ["cat", peer_path.display().to_string()]
+                }]
+            }))
+            .unwrap(),
+        );
+        let mut runtime = FederationRuntime::new(config.federation.as_ref().unwrap());
+        let mut state = State::default();
+        let outcome = run_cycle(
+            &config,
+            &mut state,
+            false,
+            &AtomicBool::new(false),
+            Some(&mut runtime),
+        );
+        assert_eq!(outcome.observation_failures, 0);
+        assert_eq!(outcome.actuation_failures, 0);
+        assert!(
+            !marker_path.exists(),
+            "unsupported policy must skip actuation"
+        );
+        assert_eq!(state.accounts["a"].last_target, Some(1));
+    }
+
+    #[test]
     fn run_cycle_abandons_every_account_when_shutdown_is_already_requested() {
         let config = config_with_unreachable_sources();
         let mut state = State::default();
         let shutdown = AtomicBool::new(true);
-        let outcome = run_cycle(&config, &mut state, true, &shutdown);
+        let outcome = run_cycle(&config, &mut state, true, &shutdown, None);
         assert_eq!(
             outcome.observation_failures, 0,
             "no account should have been attempted"
@@ -2040,7 +2614,7 @@ mod shutdown_tests {
         let config = config_with_unreachable_sources();
         let mut state = State::default();
         let shutdown = AtomicBool::new(false);
-        let outcome = run_cycle(&config, &mut state, true, &shutdown);
+        let outcome = run_cycle(&config, &mut state, true, &shutdown, None);
         assert_eq!(outcome.observation_failures, 2);
         assert_eq!(outcome.actuation_failures, 0);
     }
@@ -2151,7 +2725,7 @@ mod exit_code_tests {
         };
         let mut state = State::default();
         let shutdown = AtomicBool::new(false);
-        let outcome = run_cycle(&config, &mut state, false, &shutdown);
+        let outcome = run_cycle(&config, &mut state, false, &shutdown, None);
         assert_eq!(outcome.actuation_failures, 1);
         assert_eq!(outcome.observation_failures, 0);
     }
@@ -2190,7 +2764,7 @@ mod exit_code_tests {
         let prior = subscription_governor::state::AccountState::default();
         state.accounts.insert("a".to_string(), prior.clone());
         let shutdown = AtomicBool::new(false);
-        let outcome = run_cycle(&config, &mut state, false, &shutdown);
+        let outcome = run_cycle(&config, &mut state, false, &shutdown, None);
         assert_eq!(outcome.actuation_failures, 1);
         assert_eq!(state.accounts.get("a"), Some(&prior));
     }
@@ -2247,7 +2821,7 @@ mod exit_code_tests {
         let mut state = State::default();
         state.accounts.insert("a".to_string(), prior.clone());
         let shutdown = AtomicBool::new(false);
-        let outcome = run_cycle(&config, &mut state, false, &shutdown);
+        let outcome = run_cycle(&config, &mut state, false, &shutdown, None);
 
         assert_eq!(outcome.actuation_failures, 1);
         assert_eq!(
