@@ -868,7 +868,7 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
         if owner != &federation.host_id
             && !federation.peers.iter().any(|peer| &peer.host_id == owner)
         {
-            bail!("federation.repo_owners for {origin} names unconfigured host {owner}");
+            bail!("federation.repo_owners names unconfigured host {owner}");
         }
     }
     for account in federation.account_identities.keys() {
@@ -907,6 +907,8 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
         }
     }
     if !federation.peers.is_empty() {
+        let mut local_prefixes = BTreeSet::new();
+        let prefix_map = crate::federation::local_worker_prefixes(config);
         for (name, account) in &config.accounts {
             let (observer, actuator) = match &account.fleet.hosts {
                 Some(hosts) => match hosts.get(&federation.host_id) {
@@ -935,6 +937,11 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
                 }
             ) {
                 bail!("account {name}: federated needle_run requires an identifier_prefix");
+            }
+            if let Some(prefix) = prefix_map.get(name) {
+                if !local_prefixes.insert(prefix.clone()) {
+                    bail!("account {name}: worker prefix {prefix} is already claimed by another local account");
+                }
             }
         }
     }

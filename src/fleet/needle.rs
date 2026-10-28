@@ -264,6 +264,15 @@ fn read_seed_demand(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(state.ready.into_iter().map(|job| job.workspace).collect())
 }
 
+pub(super) fn seedable_count(path: &Path, excluded: &BTreeSet<PathBuf>) -> Result<u32> {
+    let ready = read_seed_demand(path)?;
+    Ok(ready
+        .iter()
+        .filter(|path| !excluded.contains(*path))
+        .count()
+        .min(u32::MAX as usize) as u32)
+}
+
 /// Counts fresh NEEDLE heartbeats per workspace across every adapter, because
 /// §26.5 occupancy is workers at a workspace, not this pool's claims. Like
 /// the heartbeat observer, a malformed or unreadable heartbeat fails closed;

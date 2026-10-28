@@ -1118,7 +1118,7 @@ impl DemandDigest {
                         .is_some_and(|p| !excluded.contains(Path::new(p)))
                 })
                 .map(|w| w.ready_beads.unwrap_or(0))
-                .sum(),
+                .fold(0u32, u32::saturating_add),
             eligible_backlog_capacity: Some(
                 self.workspaces
                     .iter()
@@ -1128,7 +1128,7 @@ impl DemandDigest {
                             .is_some_and(|p| !excluded.contains(Path::new(p)))
                     })
                     .map(|w| w.eligible_slots.unwrap_or(0))
-                    .sum(),
+                    .fold(0u32, u32::saturating_add),
             ),
         }
     }

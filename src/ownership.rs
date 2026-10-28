@@ -21,6 +21,7 @@
 use crate::config::Config;
 use crate::federation::PeerRecord;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -340,7 +341,22 @@ pub fn permitted_launch(
 /// `subgov peer-state` publishes it verbatim per pool, so a peer's
 /// simultaneous-launch gate sees this instance's intent before its workers
 /// exist.
-fn read_pending_map(path: &Path) -> BTreeMap<String, u32> {
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PendingEntry {
+    Legacy(u32),
+    Reserved { count: u32, baseline: u32 },
+}
+
+impl PendingEntry {
+    fn count(self) -> u32 {
+        match self {
+            Self::Legacy(count) | Self::Reserved { count, .. } => count,
+        }
+    }
+}
+
+fn read_pending_map(path: &Path) -> BTreeMap<String, PendingEntry> {
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -354,19 +370,42 @@ fn read_pending_map(path: &Path) -> BTreeMap<String, u32> {
 /// never past it) and irrelevant for this instance, which re-publishes
 /// before it launches.
 pub fn read_pending_launches(path: &Path, pool: &str) -> u32 {
-    read_pending_map(path).get(pool).copied().unwrap_or(0)
+    read_pending_map(path)
+        .get(pool)
+        .copied()
+        .map_or(0, PendingEntry::count)
 }
 
 /// Publishes this instance's in-flight launches for one pool (§28.8). The
 /// write is atomic and mode 600; other pools' entries are preserved.
 pub fn publish_pending_launches(path: &Path, pool: &str, count: u32) -> Result<()> {
+    publish_pending_entry(
+        path,
+        pool,
+        (count > 0).then_some(PendingEntry::Legacy(count)),
+    )
+}
+
+fn publish_pending_entry(path: &Path, pool: &str, entry: Option<PendingEntry>) -> Result<()> {
     let mut pending = read_pending_map(path);
-    if count == 0 {
-        pending.remove(pool);
+    if let Some(entry) = entry {
+        pending.insert(pool.to_owned(), entry);
     } else {
-        pending.insert(pool.to_owned(), count);
+        pending.remove(pool);
     }
     write_private_json(path, &pending)
+}
+
+/// A reservation remains published until the next observation has seen all
+/// of its workers. The caller clears it only after publishing that observed
+/// count to the peer-state status file.
+pub fn pending_observed(path: &Path, pool: &str, observed_workers: u32) -> bool {
+    matches!(read_pending_map(path).get(pool), Some(PendingEntry::Reserved { count, baseline })
+        if observed_workers >= baseline.saturating_add(*count))
+}
+
+pub fn clear_pending_launches_pool(path: &Path, pool: &str) -> Result<()> {
+    publish_pending_entry(path, pool, None)
 }
 
 /// Clears every published in-flight launch (§28.8): the workers are now
@@ -422,20 +461,32 @@ pub fn gate_launch(
     repull: impl FnOnce() -> Result<Vec<PeerRecord>>,
 ) -> Result<LaunchDecision> {
     let want = want.min(local_step_limit);
+    let previous = read_pending_map(pending_path).get(pool).copied();
+    let baseline = match previous {
+        Some(PendingEntry::Reserved { baseline, .. }) => baseline,
+        _ => own_workers,
+    };
     // §28.8: publish first, then re-pull once. The published count is the
     // launch this cycle is attempting, so a concurrent gate on a peer sees
     // the full intent.
-    publish_pending_launches(pending_path, pool, own_current_pending.saturating_add(want))
-        .with_context(|| {
-            format!(
-                "failed to publish pending launches {}",
-                pending_path.display()
-            )
-        })?;
+    publish_pending_entry(
+        pending_path,
+        pool,
+        Some(PendingEntry::Reserved {
+            count: own_current_pending.saturating_add(want),
+            baseline,
+        }),
+    )
+    .with_context(|| {
+        format!(
+            "failed to publish pending launches {}",
+            pending_path.display()
+        )
+    })?;
     let records = match repull() {
         Ok(records) => records,
         Err(error) => {
-            publish_pending_launches(pending_path, pool, own_current_pending)?;
+            publish_pending_entry(pending_path, pool, previous)?;
             return Err(error.context("peer re-pull failed; launch abandoned"));
         }
     };
@@ -452,7 +503,7 @@ pub fn gate_launch(
                         .governed_workers
                         .saturating_add(state.pending_launches)
                 })
-                .sum()
+                .fold(0u32, u32::saturating_add)
         })
         .fold(0u32, u32::saturating_add);
     let permitted = permitted_launch(
@@ -464,7 +515,7 @@ pub fn gate_launch(
         bound,
     );
     if permitted == 0 {
-        publish_pending_launches(pending_path, pool, own_current_pending).with_context(|| {
+        publish_pending_entry(pending_path, pool, previous).with_context(|| {
             format!(
                 "failed to withdraw pending launches {}",
                 pending_path.display()
@@ -488,10 +539,13 @@ pub fn gate_launch(
     }
     // Publish only what survived the gate: a peer gating next sees the
     // reduced intent, not the abandoned remainder.
-    publish_pending_launches(
+    publish_pending_entry(
         pending_path,
         pool,
-        own_current_pending.saturating_add(permitted),
+        Some(PendingEntry::Reserved {
+            count: own_current_pending.saturating_add(permitted),
+            baseline,
+        }),
     )
     .with_context(|| {
         format!(

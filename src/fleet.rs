@@ -124,6 +124,19 @@ pub fn actuator_for(config: &ActuatorConfig) -> Box<dyn Actuator> {
     }
 }
 
+/// Maximum seedable launches under the current workspace ownership view.
+/// Non-NEEDLE actuators have no workspace seed limit.
+pub fn launch_capacity(actuator: &ActuatorConfig, excluded: &BTreeSet<PathBuf>) -> Result<u32> {
+    match actuator {
+        ActuatorConfig::NeedleRun {
+            seed_demand_state: Some(path),
+            ..
+        } => needle::seedable_count(path, excluded),
+        ActuatorConfig::NeedleRun { repo, .. } if excluded.contains(repo) => Ok(0),
+        _ => Ok(u32::MAX),
+    }
+}
+
 /// Checks that NEEDLE has the configured adapter and can execute its probe.
 /// The same check is used by `subgov doctor` and immediately before a
 /// `needle_run` actuator inspects or changes workers.

@@ -12,10 +12,10 @@ use subscription_governor::federation::{
     account_fingerprint, PeerAccount, PeerPool, PeerReadyDemand, PeerRecord,
     PEER_RECORD_SCHEMA_VERSION,
 };
-use subscription_governor::fleet::observer_for;
+use subscription_governor::fleet::{launch_capacity, observer_for};
 use subscription_governor::ownership::{
-    effective_prefix, gate_launch, overshoot_bound, read_pending_launches,
-    refuse_prefix_collisions, resolve_workspace_overlap,
+    clear_pending_launches_pool, effective_prefix, gate_launch, overshoot_bound, pending_observed,
+    read_pending_launches, refuse_prefix_collisions, resolve_workspace_overlap,
 };
 
 fn peer(host: &str, prefix: &str, workers: u32, pending: u32) -> PeerRecord {
@@ -76,6 +76,7 @@ fn derived_prefix_counts_only_workers_on_the_instances_host() {
     // deliberately contains a legacy worker too: it must not count as a
     // gmktec-governed worker.
     heartbeat(home.path(), "zai", "sg-zai-1");
+    heartbeat(home.path(), "zai", "sg-zai-gmktec-4");
     heartbeat(home.path(), "zai", "manual-1");
     heartbeat(remote.path(), "zai", "sg-zai-gmktec-1");
     heartbeat(remote.path(), "zai", "sg-zai-99");
@@ -125,6 +126,15 @@ fn secondary_config_rewrites_observer_and_actuator_to_one_host_prefix() {
         subscription_governor::federation::local_worker_prefixes(&config)["acct"],
         *observed
     );
+}
+
+#[test]
+fn config_rejects_step_sum_above_account_worker_reserve() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("governor.yaml");
+    fs::write(&path, "version: 1\naccounts:\n  acct:\n    source: { type: normalized_file, path: /tmp/source.json }\n    utilization: { reserve_fraction: 0.1 }\n    fleet:\n      max_workers: 3\n      max_scale_up_per_cycle: 2\n      observer: { type: static, workers: 0 }\n      actuator: { type: none }\nfederation:\n  host_id: codinghome\n  peers: [{ host_id: gmktec }]\n").unwrap();
+    let error = Config::load(&path).unwrap_err();
+    assert!(error.to_string().contains("max_step_up"), "{error}");
 }
 
 #[test]
@@ -228,6 +238,45 @@ fn overlap_excludes_the_losing_hosts_workspace_from_seed_candidates() {
 }
 
 #[test]
+fn excluded_workspace_consumes_no_launch_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let contested = dir.path().join("contested");
+    let allowed = dir.path().join("allowed");
+    let demand = dir.path().join("demand.json");
+    fs::write(
+        &demand,
+        json!({"ready": [
+            {"workspace": contested}, {"workspace": allowed}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let actuator = ActuatorConfig::NeedleRun {
+        repo: contested.clone(),
+        adapter: "codex".into(),
+        identifier_prefix: Some("sg-codex-".into()),
+        seed_demand_state: Some(demand),
+        seed_heartbeats: Some(dir.path().join("heartbeats")),
+    };
+    assert_eq!(
+        launch_capacity(
+            &actuator,
+            &std::collections::BTreeSet::from([contested.clone()])
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        launch_capacity(
+            &actuator,
+            &std::collections::BTreeSet::from([contested, allowed])
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn simultaneous_launch_repulled_pending_prevents_a_second_launch() {
     let home = tempfile::tempdir().unwrap();
     let remote = tempfile::tempdir().unwrap();
@@ -276,4 +325,29 @@ fn simultaneous_launch_repulled_pending_prevents_a_second_launch() {
     assert_eq!(remote_decision.permitted, 0);
     assert_eq!(read_pending_launches(&remote_pending, &remote_prefix), 0);
     assert!(home_decision.permitted + remote_decision.permitted <= bound);
+    assert!(!pending_observed(&home_pending, &home_prefix, 2));
+    assert!(pending_observed(&home_pending, &home_prefix, 3));
+    clear_pending_launches_pool(&home_pending, &home_prefix).unwrap();
+    assert_eq!(read_pending_launches(&home_pending, &home_prefix), 0);
+}
+
+#[test]
+fn failed_launch_repull_withdraws_its_published_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pending.json");
+    let result = gate_launch(
+        1,
+        1,
+        0,
+        0,
+        &account_fingerprint("provider:shared-account"),
+        "sg-zai-",
+        &path,
+        2,
+        2,
+        Utc::now(),
+        || anyhow::bail!("peer unavailable"),
+    );
+    assert!(result.unwrap_err().to_string().contains("re-pull failed"));
+    assert_eq!(read_pending_launches(&path, "sg-zai-"), 0);
 }

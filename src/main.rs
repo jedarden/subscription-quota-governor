@@ -404,10 +404,15 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
                 json!({"event": "status_write_error", "time": Utc::now(), "error": format!("{error:#}")})
             );
         }
-        if status_result.is_ok() && outcome.actuation_failures == 0 {
+        if status_result.is_ok() {
             if let Some(federation) = &config.federation {
-                ownership::clear_pending_launches(&federation.pending_launches_path(&config))
+                for pool in &outcome.observed_pending {
+                    ownership::clear_pending_launches_pool(
+                        &federation.pending_launches_path(&config),
+                        pool,
+                    )
                     .map_err(GovernorError::State)?;
+                }
             }
         }
         if once {
@@ -687,6 +692,7 @@ struct CycleOutcome {
     observation_failures: usize,
     actuation_failures: usize,
     statuses: BTreeMap<String, AccountReadiness>,
+    observed_pending: std::collections::BTreeSet<String>,
 }
 
 /// Why one account's cycle failed, carrying enough to both count it under
@@ -984,12 +990,22 @@ fn gate_federated_launch(
     current: u32,
     desired: u32,
     controller_total: u32,
+    actuator: &ActuatorConfig,
     now: DateTime<Utc>,
 ) -> Result<u32> {
     if desired <= current {
         return Ok(desired);
     }
     let federation = config.federation.as_ref().context("federation missing")?;
+    let initial_excluded =
+        ownership::read_workspace_exclusions(&federation.workspace_exclusions_path(config));
+    let seed_capacity = fleet::launch_capacity(actuator, &initial_excluded)?;
+    let desired = desired.min(current.saturating_add(seed_capacity));
+    if desired <= current {
+        return Ok(current);
+    }
+    let step_limit = ownership::local_step_limit(config, account);
+    let proposed = (desired - current).min(step_limit);
     let prefix = subscription_governor::federation::local_worker_prefixes(config)
         .remove(account)
         .unwrap_or_else(|| account.to_owned());
@@ -1003,7 +1019,7 @@ fn gate_federated_launch(
     let fingerprint = subscription_governor::federation::account_fingerprint(identity);
     let gated = ownership::gate_launch(
         desired - current,
-        ownership::local_step_limit(config, account),
+        step_limit,
         current,
         pending,
         &fingerprint,
@@ -1016,6 +1032,9 @@ fn gate_federated_launch(
             let cycle = ownership::refresh_ownership(config, Utc::now())?;
             if !cycle.fresh {
                 anyhow::bail!("a configured peer did not answer the launch re-pull");
+            }
+            if fleet::launch_capacity(actuator, &cycle.excluded)? < proposed {
+                anyhow::bail!("workspace ownership changed before launch");
             }
             for event in cycle.events {
                 println!("{event}");
@@ -1069,6 +1088,25 @@ fn run_cycle(
                     .map_err(AccountFailure::Observation)?
             };
             metrics.current_workers = Some(workers);
+            let (pending, pending_observed_pool) = if federated(config) {
+                let federation = config.federation.as_ref().expect("federated config");
+                let pool = subscription_governor::federation::local_worker_prefixes(config)
+                    .remove(name)
+                    .unwrap_or_else(|| name.clone());
+                let local_workers = host_current
+                    .as_ref()
+                    .and_then(|hosts| hosts.get(&federation.host_id).copied())
+                    .unwrap_or(workers);
+                let path = federation.pending_launches_path(config);
+                let observed_pool = ownership::pending_observed(&path, &pool, local_workers)
+                    .then_some(pool.clone());
+                (
+                    ownership::read_pending_launches(&path, &pool),
+                    observed_pool,
+                )
+            } else {
+                (0, None)
+            };
             let prior = state.accounts.get(name).cloned().unwrap_or_default();
             // Plan §23.4: unowned (roster) workers spend the same quota, so the
             // controller sizes the whole pool. Its fleet range is shifted by the
@@ -1129,13 +1167,14 @@ fn run_cycle(
                 && host_current.is_none()
                 && decision.desired_workers > workers
             {
-                decision.desired_workers = if ownership.fresh {
+                decision.desired_workers = if ownership.fresh && pending == 0 {
                     gate_federated_launch(
                         config,
                         name,
                         workers,
                         decision.desired_workers,
                         decision.desired_workers,
+                        &account_config.fleet.actuator,
                         now,
                     )
                     .map_err(AccountFailure::Actuation)?
@@ -1180,13 +1219,16 @@ fn run_cycle(
                         .host_id;
                     if let Some(local) = placements.iter_mut().find(|p| &p.host_id == local_host) {
                         if local.target > local.current {
-                            local.target = if ownership.fresh {
+                            local.target = if ownership.fresh && pending == 0 {
                                 gate_federated_launch(
                                     config,
                                     name,
                                     local.current,
                                     local.target,
                                     decision.desired_workers,
+                                    &account_config.fleet.hosts.as_ref().expect("host fleet")
+                                        [local_host]
+                                        .actuator,
                                     now,
                                 )
                                 .map_err(AccountFailure::Actuation)?
@@ -1342,6 +1384,9 @@ fn run_cycle(
                 for placement in placements {
                     state.record_host_placement(name, &placement.host_id, now, placement.target);
                 }
+            }
+            if let Some(pool) = pending_observed_pool {
+                outcome.observed_pending.insert(pool);
             }
             outcome.statuses.insert(name.clone(), readiness);
             Ok(())
