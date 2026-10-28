@@ -243,7 +243,14 @@ fn headroom_weights<'a>(
         .collect()
 }
 
-fn distribute<'a>(
+/// The §22.7 weighted split: floor each eligible host's weighted share, then
+/// hand the shortfall to the eligible host with the most unused headroom, one
+/// worker at a time, until `account_target` is met or every eligible host
+/// sits at its cap. Also the engine of §28.6's cross-host split
+/// (`federation::shared_account_total`), which supplies worker-count
+/// `headroom_of` weights capped by ready demand and per-host share caps as
+/// `ceiling_of`.
+pub(crate) fn distribute<'a>(
     account_target: u32,
     eligible: &[&'a str],
     headroom_of: &BTreeMap<&'a str, f64>,

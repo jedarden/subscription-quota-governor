@@ -11,6 +11,28 @@ versioned config-schema contract; see
 
 ### Added
 
+- Plan §28.6 shared account total and cross-host placement (WP29): every
+  federation instance derives one account total from peer records without
+  exchanging decisions (`federation::shared_account_total`). The §28.6
+  sample rule (`freshest_used_fraction`) takes the freshest held quota
+  sample — this instance's own plus every fresh-or-stale peer's — and
+  switches to the largest fraction when any sample disagrees by more than
+  0.05 (the conservative reading); with no sample anywhere the §9.1 stale
+  rule holds the combined current. The burn denominator is
+  `governed_workers` summed across all hosts (`FederationHost`), fed
+  through the pure §9 controller, and the total is split across hosts by
+  the §22.7 placement engine (`split_account_total`, reusing
+  `placement::distribute`): weights are each host's worker headroom from
+  the peer records, each share is capped by the smaller of the host's
+  reserve ceiling and the work its ready demand can absorb, a host with
+  zero ready demand receives none of the new placement while keeping its
+  running workers until the total shrinks, no share ever exceeds its
+  reserve, and the split never exceeds the controller total. Per-host
+  step limits stay with each instance's own actuation of its share.
+  `PeerTable::peer_account_snapshot` feeds the derivation from the
+  receiver's clock: fresh and stale peers contribute exactly what they
+  last published, expired peers contribute zeros and no sample (§28.7).
+
 - Plan §28.3/§28.7 federation peer pull, staleness and freeze-on-stale
   (WP28): `federation:` gains `peers: [{host_id, argv}]` (argv defaulting
   to the sanctioned `ssh -o ConnectTimeout=5 <host> subgov peer-state

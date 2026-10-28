@@ -20,7 +20,8 @@
 //! (§28.7). WP29 builds on that table: every instance derives the same
 //! account total from the freshest held quota sample and the cross-host
 //! worker sum, then splits it across hosts with the §22.7 placement
-//! function over peer-record headroom (`shared_account_total` below).
+//! function over peer-record headroom (`shared_account_total` and
+//! `split_account_total` below).
 //!
 //! No credentials, prompts or raw provider bodies ever enter a record
 //! (§14): every field below is a count, a timestamp, a derived fingerprint,
@@ -33,6 +34,7 @@ use rand::Rng;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -141,6 +143,16 @@ pub struct PeerReadyDemand {
     /// Worker slots the eligible backlog could fill, when observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_backlog_capacity: Option<u32>,
+}
+
+impl PeerReadyDemand {
+    /// The worker count this demand can absorb (§26.4): the observed
+    /// backlog slot capacity when one was measured, the ready-bead count
+    /// otherwise. This is the bound §28.6 caps a host's share with -- spare
+    /// quota never launches a worker into work that does not exist.
+    pub fn worker_bound(&self) -> u32 {
+        self.eligible_backlog_capacity.unwrap_or(self.ready_beads)
+    }
 }
 
 /// The WP24 measured ceiling (§26.6): how many workers this host can carry,
@@ -703,6 +715,57 @@ impl PeerTable {
     pub fn drain_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.events)
     }
+
+    /// A configured peer's §28.6 view of one account, measured on the
+    /// receiver's clock: fresh and stale peers contribute exactly what they
+    /// last published (§28.7), expired peers contribute zeros and no
+    /// sample, and a host that is not a configured peer is `None`. The
+    /// caller folds this into a [`FederationHost`] -- alongside the peer's
+    /// ceiling (`record.host_ceiling`, else the account ceiling) -- to
+    /// derive the shared total.
+    pub fn peer_account_snapshot(
+        &mut self,
+        host_id: &str,
+        account_id: &str,
+        now: &PeerMoment,
+    ) -> Option<PeerAccountSnapshot> {
+        if self.freshness(host_id, now)? == PeerFreshness::Expired {
+            return Some(PeerAccountSnapshot::default());
+        }
+        let entry = self.entries.get(host_id)?;
+        let account = entry
+            .record
+            .as_ref()
+            .and_then(|record| record.accounts.get(account_id));
+        Some(PeerAccountSnapshot {
+            workers: account
+                .map(|account| {
+                    account
+                        .pools
+                        .values()
+                        .map(|pool| pool.governed_workers)
+                        .sum::<u32>()
+                })
+                .unwrap_or(0),
+            ready_demand: account
+                .map(|account| {
+                    account
+                        .pools
+                        .values()
+                        .map(|pool| pool.ready_demand.worker_bound())
+                        .sum::<u32>()
+                })
+                .unwrap_or(0),
+            quota_sample: account.and_then(|account| {
+                freshest_sample(
+                    account
+                        .pools
+                        .values()
+                        .filter_map(|pool| pool.quota_sample.as_ref()),
+                )
+            }),
+        })
+    }
 }
 
 /// The §28.7 expiry event: the peer is counted as zero workers from here
@@ -715,6 +778,282 @@ fn peer_expired_event(host_id: &str, entry: &PeerEntry, time: DateTime<Utc>) -> 
         "peer_host_id": host_id,
         "last_record_seq": entry.record.as_ref().map(|record| record.record_seq),
         "action": "counted_as_zero_workers",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// §28.6 (WP29): one total derived everywhere, and the cross-host split
+// ---------------------------------------------------------------------------
+
+/// §28.6's sample-disagreement threshold: when any held sample's
+/// `used_fraction` sits more than this above the freshest sample's, the
+/// larger fraction is used instead.
+pub const SAMPLE_DISAGREEMENT_FRACTION: f64 = 0.05;
+
+/// A peer's §28.6 inputs for one account, measured on the receiver's clock
+/// (`PeerTable::peer_account_snapshot`): what the peer publishes while
+/// fresh or stale, and zeros once it has expired.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct PeerAccountSnapshot {
+    /// The peer's `governed_workers`, summed over the account's pools.
+    pub workers: u32,
+    /// The peer's ready demand, as the worker count it can absorb.
+    pub ready_demand: u32,
+    /// The peer's freshest held quota sample; `None` once expired (a peer
+    /// gone for `peer_expiry` no longer constrains the total) or when its
+    /// record holds no sample for the account.
+    pub quota_sample: Option<PeerQuotaSample>,
+}
+
+/// One host's §28.6 inputs for one account: what the account already runs
+/// there, the worker capacity the host can carry, and the ready demand
+/// that caps its share. The local host's entry comes from this instance's
+/// own observation; every other entry comes from that peer's record
+/// (§28.4), via [`PeerTable::peer_account_snapshot`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct FederationHost {
+    pub host_id: String,
+    /// Governed workers for the account observed on this host. Pending
+    /// launches are deliberately not folded in: the §28.6 burn denominator
+    /// is the sum of `governed_workers`, and in-flight launches are a WP30
+    /// overshoot concern with their own re-pull gate.
+    pub workers: u32,
+    /// The host's worker capacity: the WP24 measured ceiling when the
+    /// record published one (that ceiling already nets out the configured
+    /// `resource_reserve`, §26.6), else the account's `fleet.max_workers`
+    /// (the §22.7 ceiling default).
+    pub ceiling: u32,
+    /// Ready demand for this host's workspaces (§26.4), bounding the host's
+    /// share: `PeerReadyDemand::worker_bound` of the record's entry.
+    pub ready_demand: u32,
+}
+
+/// The §28.6 outcome every instance derives for one account: the shared
+/// controller total, the sample it came from, and the cross-host split.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct SharedAccountDecision {
+    /// The §9 controller total. Two instances that assemble identical
+    /// inputs choose the same number here without exchanging decisions
+    /// (§28.6: "one total, derived everywhere").
+    pub total: u32,
+    /// The `used_fraction` the total was derived from -- the freshest held
+    /// sample's, or the largest when a sample disagrees by more than
+    /// [`SAMPLE_DISAGREEMENT_FRACTION`]. `None` when no instance holds a
+    /// sample and the total is the stale hold at the combined current.
+    pub used_fraction: Option<f64>,
+    /// The §28.6 burn denominator: `governed_workers` summed across all
+    /// hosts.
+    pub denominator: u32,
+    /// Whether the controller's decision was a stale hold (§9.1).
+    pub stale: bool,
+    /// Per-host shares of `total` from the §22.7 split. Sums to at most
+    /// `total`; an instance actuates only its own host's entry, applying
+    /// that host's per-cycle step limits there.
+    pub shares: BTreeMap<String, u32>,
+}
+
+/// The freshest sample by `observed_at`; ties break on the larger fraction
+/// and then the window id, so every instance orders an identical sample
+/// set identically.
+fn freshest_sample<'a, I>(samples: I) -> Option<PeerQuotaSample>
+where
+    I: IntoIterator<Item = &'a PeerQuotaSample>,
+{
+    samples
+        .into_iter()
+        .max_by(|left, right| {
+            left.observed_at
+                .cmp(&right.observed_at)
+                .then_with(|| {
+                    left.used_fraction
+                        .partial_cmp(&right.used_fraction)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| right.window.cmp(&left.window))
+        })
+        .cloned()
+}
+
+/// §28.6's conservative fraction over one account's held samples (this
+/// instance's own plus every fresh-or-stale peer's): the freshest sample's
+/// `used_fraction`, replaced by the largest held fraction when any sample
+/// disagrees by more than [`SAMPLE_DISAGREEMENT_FRACTION`]. A higher
+/// `used_fraction` is the conservative reading -- less quota remains -- and
+/// every instance applying the same rule to the same samples lands on the
+/// same one. `None` when no instance holds a sample.
+pub fn freshest_used_fraction(samples: &[PeerQuotaSample]) -> Option<f64> {
+    let base = freshest_sample(samples)?.used_fraction;
+    let largest = samples
+        .iter()
+        .filter(|sample| sample.used_fraction.is_finite())
+        .fold(base, |largest, sample| largest.max(sample.used_fraction));
+    Some(if largest - base > SAMPLE_DISAGREEMENT_FRACTION {
+        largest
+    } else {
+        base
+    })
+}
+
+/// Splits one account's controller total across the federation's hosts
+/// (§28.6 over §22.7, reusing `placement::distribute`). Weights are each
+/// host's worker headroom (`ceiling - workers`, from the peer records),
+/// and each host's share is capped by the smaller of its reserve ceiling
+/// and the work its ready demand can absorb (`workers + ready_demand`,
+/// never past the ceiling): no host is asked to exceed its reserve or to
+/// run more workers than it has work for.
+///
+/// A host with zero ready demand receives none of the new placement.
+/// While the total is stable or growing it keeps the workers it already
+/// runs (the §22.8 frozen-host rule, applied to demand instead of
+/// staleness); when the total shrinks it is the first to step down, and
+/// hosts with ready demand carry what remains as absolute targets.
+///
+/// The split is a pure function of its arguments and never exceeds
+/// `total`: it may come in under it when no host has the headroom or the
+/// demand to place the rest. Per-cycle step limits are deliberately *not*
+/// applied here -- each instance applies its own host's limits when it
+/// actuates its own share. Host ids must be unique, as peer records are
+/// keyed by host.
+pub fn split_account_total(total: u32, hosts: &[FederationHost]) -> BTreeMap<String, u32> {
+    // Ascending host id, so distribute's remainder tie-break lands on the
+    // smallest key regardless of which side assembled the list first --
+    // §28.6's split must not depend on the caller's perspective.
+    let mut ids: Vec<&str> = hosts.iter().map(|host| host.host_id.as_str()).collect();
+    ids.sort_unstable();
+    let workers_of: BTreeMap<&str, u32> = hosts
+        .iter()
+        .map(|host| (host.host_id.as_str(), host.workers))
+        .collect();
+    let ready_of: BTreeMap<&str, u32> = hosts
+        .iter()
+        .map(|host| (host.host_id.as_str(), host.ready_demand))
+        .collect();
+    // The share cap: the reserve ceiling, never past the work the host can
+    // absorb on top of what it already runs.
+    let cap_of: BTreeMap<&str, u32> = hosts
+        .iter()
+        .map(|host| {
+            (
+                host.host_id.as_str(),
+                host.ceiling
+                    .min(host.workers.saturating_add(host.ready_demand)),
+            )
+        })
+        .collect();
+    // §28.6: headroom from the peer records, in workers.
+    let headroom_of: BTreeMap<&str, f64> = hosts
+        .iter()
+        .map(|host| {
+            (
+                host.host_id.as_str(),
+                f64::from(host.ceiling.saturating_sub(host.workers)),
+            )
+        })
+        .collect();
+    let current_total = workers_of
+        .values()
+        .fold(0u32, |total, workers| total.saturating_add(*workers));
+
+    let (base_of, budget, share_cap_of, eligible): (
+        BTreeMap<&str, u32>,
+        u32,
+        BTreeMap<&str, u32>,
+        Vec<&str>,
+    ) = if total >= current_total {
+        // Stable or growing: hold every host at what it already runs and
+        // distribute only the surplus to hosts with marginal room -- free
+        // ceiling AND demand to fill it.
+        let base_of = workers_of.clone();
+        let share_cap_of: BTreeMap<&str, u32> = cap_of
+            .iter()
+            .map(|(id, cap)| (*id, cap.saturating_sub(workers_of[id])))
+            .collect();
+        let eligible = ids
+            .iter()
+            .copied()
+            .filter(|id| share_cap_of[id] > 0)
+            .collect();
+        (base_of, total - current_total, share_cap_of, eligible)
+    } else {
+        // Shrinking: §22.7's raw-0 for hosts without demand -- no work to
+        // hold workers for -- while the demanding hosts split the total as
+        // absolute targets, capped as always.
+        let base_of = ids.iter().map(|id| (*id, 0)).collect();
+        let eligible = ids.iter().copied().filter(|id| ready_of[id] > 0).collect();
+        (base_of, total, cap_of, eligible)
+    };
+
+    let distributed =
+        crate::placement::distribute(budget, &eligible, &headroom_of, &share_cap_of, &ids);
+    ids.into_iter()
+        .map(|id| (id.to_owned(), base_of[id].saturating_add(distributed[id])))
+        .collect()
+}
+
+/// §28.6's one-total derivation for one account (WP29). `hosts` carries the
+/// local host's view plus every fresh-or-stale peer's, and `samples` the
+/// quota samples this instance holds for the account, its own and its
+/// peers' (an expired peer contributes nothing, §28.7, so its snapshot is
+/// already zeros). Every instance that assembles the same views and
+/// samples derives the same [`SharedAccountDecision`] without exchanging
+/// decisions: [`freshest_used_fraction`] picks one `used_fraction`, the
+/// §28.6 denominator sums `governed_workers` across hosts, the pure §9
+/// controller (`controller::evaluate`) turns both into the account total,
+/// and [`split_account_total`] places it. The caller actuates only its own
+/// host's share; placement never exceeds the controller total (§22.15(2)).
+pub fn shared_account_total(
+    account_name: &str,
+    config: &AccountConfig,
+    prior: &crate::state::AccountState,
+    hosts: &[FederationHost],
+    samples: &[PeerQuotaSample],
+    now: DateTime<Utc>,
+) -> Result<SharedAccountDecision> {
+    let denominator = hosts
+        .iter()
+        .fold(0u32, |total, host| total.saturating_add(host.workers));
+    let decision = match freshest_sample(samples) {
+        Some(freshest) => {
+            let snapshot = crate::model::QuotaSnapshot {
+                observed_at: freshest.observed_at,
+                fresh: true,
+                windows: vec![crate::model::QuotaWindow {
+                    id: freshest.window.clone(),
+                    used_fraction: freshest_used_fraction(samples)
+                        .expect("freshest_sample implies a fraction"),
+                    resets_at: freshest.resets_at,
+                    duration_minutes: None,
+                    reached: false,
+                }],
+                eligible_backlog_capacity: None,
+                reset_credits: None,
+                backpressure: None,
+                saturation: None,
+            };
+            crate::controller::evaluate(account_name, config, &snapshot, prior, denominator, now)?
+        }
+        // No instance holds a sample: §9.1's stale rule applied to the
+        // combined fleet holds the total at the combined current.
+        None => {
+            let snapshot = crate::model::QuotaSnapshot {
+                observed_at: now,
+                fresh: false,
+                windows: Vec::new(),
+                eligible_backlog_capacity: None,
+                reset_credits: None,
+                backpressure: None,
+                saturation: None,
+            };
+            crate::controller::evaluate(account_name, config, &snapshot, prior, denominator, now)?
+        }
+    };
+    let shares = split_account_total(decision.desired_workers, hosts);
+    Ok(SharedAccountDecision {
+        total: decision.desired_workers,
+        used_fraction: freshest_used_fraction(samples),
+        denominator,
+        stale: decision.stale,
+        shares,
     })
 }
 
