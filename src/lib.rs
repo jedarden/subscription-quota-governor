@@ -1,6 +1,7 @@
 pub mod config;
 pub mod controller;
 pub mod dashboard;
+pub mod federation;
 pub mod fleet;
 pub mod model;
 pub mod placement;

@@ -27,6 +27,9 @@ dirs = "=6.0.0"
 fs2 = "=0.4.3"
 rand = "=0.8.8"
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+# §28.4 account_fingerprint: truncated SHA-256 of the provider's non-secret
+# account identifier. Identity tag only -- never a secret carrier (§14).
+sha2 = "=0.10.9"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 serde_yaml = "=0.9.34"

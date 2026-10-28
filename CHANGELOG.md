@@ -11,6 +11,24 @@ versioned config-schema contract; see
 
 ### Added
 
+- Plan §28.4/§28.13 federation peer record (WP27): new `federation:` config
+  block (`host_id`, optional `instance_id_file`/`record_seq_file`,
+  `host_capacity_state`, per-account `account_identities`) and a read-only
+  `subgov peer-state --json` command that prints the instance's versioned
+  peer record: persisted random `instance_id` (mode 0600, created on first
+  use), `host_id`, monotonic `record_seq`, `observed_at`, and per account
+  and pool the account fingerprint (truncated SHA-256 of the provider's
+  non-secret identifier — the identifier itself never leaves the instance),
+  `governed_workers`, `pending_launches`, `desired`, the latest quota
+  sample, `ready_demand`, the WP24 measured ceiling and launch
+  reservations, the host `resource_reserve`, and the git origin URLs of
+  seedable workspaces with embedded userinfo stripped (§14). An unknown
+  `schema_version` major is rejected outright; unknown fields inside a
+  known major stay compatible. A same-id/different-fingerprint peer
+  account is classified as a different account with an
+  `account_fingerprint_mismatch` error event (§28.5); distinct account ids
+  remain ordinary independent accounts (§28.11).
+
 - Source-publisher alerting (subgov-28a476df): the deployed source units gain
   `OnFailure=repo-traffic-alert@%n.service` so a failed cycle pages;
   `scripts/subgov_source_watch.py` (deployed via

@@ -13,6 +13,11 @@ pub struct Config {
     #[serde(default)]
     pub state_path: Option<PathBuf>,
     pub accounts: BTreeMap<String, AccountConfig>,
+    /// Plan §28.13 (WP27): this instance's federation identity. Absent
+    /// entirely means federation of one and is accepted unchanged; WP31
+    /// adds `peers`, the staleness bounds and `repo_owners`.
+    #[serde(default)]
+    pub federation: Option<FederationConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -119,6 +124,50 @@ pub struct TakeoverTarget {
     /// straggler, which is retired by signalling its supervisor directly.
     #[serde(default)]
     pub unit: Option<String>,
+}
+
+/// Plan §28.13 (WP27): per-instance federation identity. Everything here is
+/// read-only input to the peer record; no peer transport or trust decision
+/// lives in this block yet.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationConfig {
+    /// This host's id within the federation (§28.2). Peer records carry it
+    /// verbatim, so it must be unique across the federation.
+    pub host_id: String,
+    /// Where the persisted random `instance_id` lives (§28.4). Defaults to
+    /// a sibling of the state file.
+    #[serde(default)]
+    pub instance_id_file: Option<PathBuf>,
+    /// Where the monotonic `record_seq` counter lives (§28.4). Defaults to
+    /// a sibling of the state file.
+    #[serde(default)]
+    pub record_seq_file: Option<PathBuf>,
+    /// The WP24 host-capacity adapter's state file, whose `last_evidence`
+    /// carries the measured ceiling and launch reservations this instance
+    /// publishes (§26.6, §28.4).
+    #[serde(default)]
+    pub host_capacity_state: Option<PathBuf>,
+    /// Per account: the provider's non-secret account identifier whose
+    /// truncated hash is that account's `account_fingerprint` (§28.4).
+    /// Accounts without an entry fingerprint their configured account
+    /// name, which matches today's label-based identity (§28.11).
+    #[serde(default)]
+    pub account_identities: BTreeMap<String, String>,
+}
+
+impl FederationConfig {
+    pub fn instance_id_path(&self, config: &Config) -> PathBuf {
+        self.instance_id_file
+            .clone()
+            .unwrap_or_else(|| config.state_path().with_file_name("federation-instance-id"))
+    }
+
+    pub fn record_seq_path(&self, config: &Config) -> PathBuf {
+        self.record_seq_file
+            .clone()
+            .unwrap_or_else(|| config.state_path().with_file_name("federation-record-seq"))
+    }
 }
 
 /// One placement target within an account's fleet (plan.md §22.3).
@@ -421,6 +470,18 @@ impl Config {
             account.source.expand_paths();
             account.fleet.expand_paths();
         }
+        if let Some(federation) = &mut config.federation {
+            for path in [
+                &mut federation.instance_id_file,
+                &mut federation.record_seq_file,
+                &mut federation.host_capacity_state,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *path = expand_tilde(path);
+            }
+        }
         config.validate()?;
         Ok(config)
     }
@@ -511,6 +572,9 @@ impl Config {
             }
             validate_banked_resets(account, name)?;
         }
+        if let Some(federation) = &self.federation {
+            validate_federation(federation, self)?;
+        }
         Ok(())
     }
 
@@ -520,6 +584,12 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("subscription-governor/state.json")
         })
+    }
+
+    /// The derived per-cycle readiness report, a sibling of the state file.
+    /// Both the `status` command and the federation peer record read it.
+    pub fn status_path(&self) -> PathBuf {
+        self.state_path().with_file_name("status.json")
     }
 }
 
@@ -666,6 +736,25 @@ fn validate_backpressure(policy: &BackpressureConfig, account: &str) -> Result<(
         policy.signal_loss_release_seconds,
         &format!("account {account}: utilization.backpressure.signal_loss_release_seconds"),
     )
+}
+
+/// Plan §28.13 (WP27): the identity fields the local peer record needs.
+/// WP31 extends this with peers, staleness bounds and repo_owners.
+fn validate_federation(federation: &FederationConfig, config: &Config) -> Result<()> {
+    if federation.host_id.trim().is_empty() || federation.host_id.chars().any(char::is_whitespace) {
+        bail!("federation.host_id must be non-empty and free of whitespace");
+    }
+    for account in federation.account_identities.keys() {
+        if !config.accounts.contains_key(account) {
+            bail!("federation.account_identities names account {account}, which is not configured");
+        }
+    }
+    for (account, identifier) in &federation.account_identities {
+        if identifier.trim().is_empty() {
+            bail!("federation.account_identities.{account} must be non-empty");
+        }
+    }
+    Ok(())
 }
 
 fn validate_source(source: &SourceConfig, account: &str) -> Result<()> {
@@ -1978,6 +2067,7 @@ accounts:
             poll_interval_seconds: default_poll_interval(),
             state_path: None,
             accounts,
+            federation: None,
         }
     }
 

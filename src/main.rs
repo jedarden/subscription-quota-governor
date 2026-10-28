@@ -72,6 +72,14 @@ enum Commands {
     },
     /// Check that every configured NEEDLE adapter is ready to actuate.
     Doctor,
+    /// Print this instance's read-only federation peer record (plan.md
+    /// §28.4/§28.13). Polls no source, observes no worker, actuates
+    /// nothing; the §28.3 pull transport runs this over SSH.
+    PeerState {
+        /// Print the machine-readable peer record (the only format).
+        #[arg(long, required = true)]
+        json: bool,
+    },
     /// Read a no-secret inventory and reject overlapping controller ownership.
     Preflight {
         /// JSON inventory assembled from the read-only host inspection procedure.
@@ -163,6 +171,8 @@ fn run_cli() -> Result<(), GovernorError> {
         Commands::Snapshot { account, host } => snapshot(&config, &account, host.as_deref()),
         Commands::Run { once, observe_only } => run(config, once, observe_only),
         Commands::Status => status(&config),
+        Commands::PeerState { json: true } => peer_state(&config),
+        Commands::PeerState { json: false } => unreachable!("clap requires --json"),
         Commands::Doctor => doctor(&config),
         Commands::Preflight { .. } => unreachable!("preflight handled before config loading"),
         Commands::Dashboard { .. } => unreachable!("dashboard handled before config loading"),
@@ -286,8 +296,20 @@ fn configured_host_resource_source<'a>(
 /// sidecar status file the run loop writes after every cycle. This never
 /// contacts a source, observer, or actuator, so it never needs credentials
 /// and never blocks on a live provider.
+/// Prints one read-only peer record (plan.md §28.4/§28.13). The only state
+/// this writes is the instance's own identity: the persisted random
+/// instance id and the monotonic record sequence the next record carries.
+/// Fleet observation, sources and actuators are never touched, so a peer
+/// pull can never perturb the host it reads (§28.3).
+fn peer_state(config: &Config) -> Result<(), GovernorError> {
+    let record = subscription_governor::federation::build_local_record(config, Utc::now())
+        .map_err(GovernorError::State)?;
+    println!("{}", record.to_json().map_err(GovernorError::State)?);
+    Ok(())
+}
+
 fn status(config: &Config) -> Result<(), GovernorError> {
-    let path = status_path(&config.state_path());
+    let path = config.status_path();
     let recorded: BTreeMap<String, AccountReadiness> = match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse status file {}", path.display()))
@@ -343,7 +365,7 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
     let interval = Duration::from_secs(config.poll_interval_seconds);
     let mut anchor = Instant::now();
     let mut scheduled_at: Option<Instant> = None;
-    let status_path = status_path(&state_path);
+    let status_path = config.status_path();
     loop {
         let cycle_started_at = Instant::now();
         let (late, skipped_cycles) = schedule_drift(scheduled_at, cycle_started_at, interval);
@@ -489,10 +511,6 @@ fn readiness_for_failure(failure: &AccountFailure) -> AccountReadiness {
         current_workers: None,
         desired_workers: None,
     }
-}
-
-fn status_path(state_path: &Path) -> PathBuf {
-    state_path.with_file_name("status.json")
 }
 
 /// Reads the existing status file (tolerating a missing or corrupt file by
@@ -1340,6 +1358,7 @@ mod shutdown_tests {
             poll_interval_seconds: 300,
             state_path: None,
             accounts,
+            federation: None,
         }
     }
 
@@ -1468,6 +1487,7 @@ mod exit_code_tests {
             poll_interval_seconds: 300,
             state_path: None,
             accounts,
+            federation: None,
         };
         let mut state = State::default();
         let shutdown = AtomicBool::new(false);
@@ -1504,6 +1524,7 @@ mod exit_code_tests {
             poll_interval_seconds: 300,
             state_path: None,
             accounts,
+            federation: None,
         };
         let mut state = State::default();
         let prior = subscription_governor::state::AccountState::default();
@@ -1546,6 +1567,7 @@ mod exit_code_tests {
             poll_interval_seconds: 300,
             state_path: None,
             accounts,
+            federation: None,
         };
 
         let prior = subscription_governor::state::AccountState {
@@ -1731,10 +1753,21 @@ mod status_tests {
 
     #[test]
     fn status_path_is_a_sibling_of_the_state_file() {
-        let path = status_path(Path::new("/var/lib/subscription-governor/state.json"));
+        let mut config = Config {
+            version: 1,
+            poll_interval_seconds: 300,
+            state_path: Some(PathBuf::from("/var/lib/subscription-governor/state.json")),
+            accounts: BTreeMap::new(),
+            federation: None,
+        };
         assert_eq!(
-            path,
+            config.status_path(),
             PathBuf::from("/var/lib/subscription-governor/status.json")
+        );
+        config.state_path = None;
+        assert_eq!(
+            config.status_path().file_name(),
+            Some(std::ffi::OsStr::new("status.json"))
         );
     }
 }

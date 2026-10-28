@@ -1,0 +1,1143 @@
+//! plan.md §28 (WP27): the versioned federation peer record, its schema
+//! gate, account identity, and the read-only projection of this instance's
+//! state that `subgov peer-state --json` prints.
+//!
+//! A peer record is what one subgov instance publishes about itself and
+//! what its peers pull (§28.3, WP28's transport). It is versioned
+//! independently of the persisted state (§28.4): an unknown major version
+//! is rejected on its own terms, while unknown fields inside a known major
+//! are ignored so minor additions stay compatible. Everything here is
+//! read-only with respect to the fleet: no source is polled, no observer is
+//! asked, no worker is touched. The only files `build_local_record` writes
+//! are this instance's own identity (§28.4: a persisted random
+//! `instance_id` and a monotonic `record_seq`).
+//!
+//! No credentials, prompts or raw provider bodies ever enter a record
+//! (§14): every field below is a count, a timestamp, a derived fingerprint,
+//! or a workspace origin URL that has had its userinfo stripped.
+
+use crate::config::{AccountConfig, Config, ResourceReserveConfig};
+use anyhow::{Context, Result};
+use chrono::{DateTime, TimeZone, Utc};
+use rand::Rng;
+use serde::Deserialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::str;
+
+/// The only peer-record major version this binary publishes, and the only
+/// one it accepts (§28.4: "versioned independently of state"). The state
+/// file's `schema_version` counts minor migrations of on-disk state and is
+/// a separate sequence entirely.
+pub const PEER_RECORD_SCHEMA_VERSION: u32 = 1;
+
+/// Length of the truncated account fingerprint in hex characters (64 bits).
+/// Enough to distinguish the handful of accounts a federation governs while
+/// keeping the provider identifier itself out of every record (§14).
+const FINGERPRINT_HEX_CHARS: usize = 16;
+
+/// The §28.4 peer record: one instance's publishable view of its host.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeerRecord {
+    pub schema_version: u32,
+    /// Stable random identity, persisted across restarts (§28.4). Never
+    /// derived from the hostname, so a cloned host does not inherit one.
+    pub instance_id: String,
+    pub host_id: String,
+    /// Monotonic counter bumped on every publication, so a receiver can
+    /// order records from one instance even when timestamps tie.
+    pub record_seq: u64,
+    pub observed_at: DateTime<Utc>,
+    /// Governed accounts keyed by account id. `BTreeMap` keeps the
+    /// serialization byte-stable, which §28.6's identical-everywhere
+    /// derivations compare.
+    #[serde(default)]
+    pub accounts: BTreeMap<String, PeerAccount>,
+    /// The WP24 measured host worker ceiling, when the host-capacity
+    /// adapter has published evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ceiling: Option<HostCeiling>,
+    /// WP24 launch reservations: workers an asynchronous launch has claimed
+    /// but whose processes have not been observed yet, keyed by pool.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub host_reservations: BTreeMap<String, HostReservation>,
+    /// The host's configured resource reserve (§22.3), when one is declared
+    /// for this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_reserve: Option<ResourceReserveDigest>,
+    /// Git origin URLs of the workspaces this instance will seed, keyed by
+    /// workspace path (§28.10: peers compare these to detect two hosts
+    /// working the same repository).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_origins: BTreeMap<String, String>,
+}
+
+/// One governed account as a peer sees it (§28.4/§28.5).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeerAccount {
+    pub account_id: String,
+    /// Truncated hash of the provider's non-secret account identifier
+    /// (§28.4). Published instead of the identifier so records stay free of
+    /// provider-specific identity material while still detecting two
+    /// labels that claim one provider account (§28.5).
+    pub account_fingerprint: String,
+    /// This instance's pools for the account, keyed by worker prefix (or
+    /// account id for a pool with no prefix). Today an account governs one
+    /// pool; the map keeps the §28.4 per-account-and-pool shape.
+    #[serde(default)]
+    pub pools: BTreeMap<String, PeerPool>,
+}
+
+/// One pool's worker and demand state on this host (§28.4).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeerPool {
+    /// Workers with this pool's prefix currently observed on this host.
+    pub governed_workers: u32,
+    /// Launches published but not yet observed (§28.8). Always zero until
+    /// WP30 persists in-flight launches; the field exists so the schema
+    /// does not change when they arrive.
+    pub pending_launches: u32,
+    /// This host's placement target from the last completed cycle.
+    pub desired: u32,
+    /// The freshest quota sample this instance holds for the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_sample: Option<PeerQuotaSample>,
+    /// Ready demand for this host's workspaces (§26.4).
+    pub ready_demand: PeerReadyDemand,
+}
+
+/// The one quota sample a record carries per pool (§28.4). Exactly the
+/// fields §28.6's shared-total derivation consumes -- never a raw provider
+/// response.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeerQuotaSample {
+    pub window: String,
+    pub used_fraction: f64,
+    pub resets_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// Ready demand as a count plus the backlog capacity it can carry (§26.4).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeerReadyDemand {
+    /// Ready, claimable beads across this host's workspaces for the pool.
+    #[serde(default)]
+    pub ready_beads: u32,
+    /// Worker slots the eligible backlog could fill, when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_backlog_capacity: Option<u32>,
+}
+
+/// The WP24 measured ceiling (§26.6): how many workers this host can carry,
+/// measured from memory pressure and load, not configured.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HostCeiling {
+    pub workers: u32,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// Workers reserved by an in-flight launch whose processes are not yet
+/// observable (WP24's reservation high-water).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HostReservation {
+    pub count: u32,
+    pub reserved_at: DateTime<Utc>,
+}
+
+/// The configured resource reserve a placement may not consume (§22.3).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ResourceReserveDigest {
+    pub cpu_reserve_fraction: f64,
+    pub mem_reserve_mb: u64,
+}
+
+impl From<&ResourceReserveConfig> for ResourceReserveDigest {
+    fn from(reserve: &ResourceReserveConfig) -> Self {
+        Self {
+            cpu_reserve_fraction: reserve.cpu_reserve_fraction,
+            mem_reserve_mb: reserve.mem_reserve_mb,
+        }
+    }
+}
+
+/// Why a peer record was rejected (§28.4).
+#[derive(Debug, thiserror::Error)]
+pub enum PeerRecordError {
+    /// An unknown major is rejected outright, never best-effort parsed: a
+    /// record this binary cannot fully interpret must not be partially
+    /// trusted with quota decisions.
+    #[error("unknown peer record schema_version {found} (this binary supports major {supported})")]
+    UnknownSchemaMajor { found: u32, supported: u32 },
+    #[error("peer record is not valid JSON: {0}")]
+    Malformed(#[from] serde_json::Error),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+impl PeerRecord {
+    /// Parses and validates one peer record, rejecting an unknown major
+    /// (§28.4) and any field that could not have come from a conforming
+    /// publisher.
+    pub fn parse(bytes: &[u8]) -> Result<Self, PeerRecordError> {
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            schema_version: u32,
+        }
+        // Read the version first so an unknown major is rejected on its own
+        // terms instead of as a pile of unrelated missing-field errors.
+        let probe: VersionProbe = serde_json::from_slice(bytes)?;
+        if probe.schema_version != PEER_RECORD_SCHEMA_VERSION {
+            return Err(PeerRecordError::UnknownSchemaMajor {
+                found: probe.schema_version,
+                supported: PEER_RECORD_SCHEMA_VERSION,
+            });
+        }
+        let record: Self = serde_json::from_slice(bytes)?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Serializes to the single-line JSON the §28.3 pull transport reads.
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self).context("failed to serialize peer record")
+    }
+
+    fn validate(&self) -> Result<(), PeerRecordError> {
+        validate_identifier("instance_id", &self.instance_id)?;
+        validate_identifier("host_id", &self.host_id)?;
+        for (account_id, account) in &self.accounts {
+            validate_identifier("account_id", account_id)?;
+            if account.account_id != *account_id {
+                return Err(PeerRecordError::Invalid(format!(
+                    "account {account_id}: body carries account_id {}",
+                    account.account_id
+                )));
+            }
+            if !is_fingerprint(&account.account_fingerprint) {
+                return Err(PeerRecordError::Invalid(format!(
+                    "account {account_id}: account_fingerprint must be \
+                     {FINGERPRINT_HEX_CHARS} lowercase hex characters"
+                )));
+            }
+            for (pool, state) in &account.pools {
+                validate_identifier("pool", pool)?;
+                if let Some(sample) = &state.quota_sample {
+                    if sample.window.trim().is_empty() {
+                        return Err(PeerRecordError::Invalid(format!(
+                            "account {account_id} pool {pool}: quota sample window must not be empty"
+                        )));
+                    }
+                    if !sample.used_fraction.is_finite()
+                        || !(0.0..=1.0).contains(&sample.used_fraction)
+                    {
+                        return Err(PeerRecordError::Invalid(format!(
+                            "account {account_id} pool {pool}: used_fraction must be in [0, 1]"
+                        )));
+                    }
+                }
+            }
+        }
+        for (path, origin) in &self.workspace_origins {
+            if path.trim().is_empty() || origin.trim().is_empty() {
+                return Err(PeerRecordError::Invalid(
+                    "workspace_origins must not carry empty paths or origins".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_identifier(field: &str, value: &str) -> Result<(), PeerRecordError> {
+    if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(PeerRecordError::Invalid(format!(
+            "{field} must be non-empty and free of whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn is_fingerprint(value: &str) -> bool {
+    value.len() == FINGERPRINT_HEX_CHARS
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The truncated hash of a provider's non-secret account identifier
+/// (§28.4). The identifier itself never leaves the instance that holds it
+/// (§14); peers compare fingerprints.
+pub fn account_fingerprint(identifier: &str) -> String {
+    let digest = Sha256::digest(identifier.as_bytes());
+    let hex: String = digest
+        .iter()
+        .take(FINGERPRINT_HEX_CHARS / 2)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    debug_assert_eq!(hex.len(), FINGERPRINT_HEX_CHARS);
+    hex
+}
+
+/// §28.5 account identity: same account only when both the account id and
+/// the fingerprint match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountIdentityVerdict {
+    /// Same account: both fields agree. Quota totals may merge.
+    Same,
+    /// Different account ids: independent accounts that never share a
+    /// total (§28.11). Ordinary, not an error.
+    Distinct,
+    /// Same account id with a different fingerprint (§28.5): an error
+    /// event, and the peer record is treated as a different account.
+    FingerprintMismatch,
+}
+
+impl AccountIdentityVerdict {
+    /// Whether the two accounts' quota totals may be derived together.
+    pub fn shares_account_total(&self) -> bool {
+        matches!(self, Self::Same)
+    }
+
+    /// Whether §28.5 requires an error event.
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::FingerprintMismatch)
+    }
+}
+
+/// Classifies a peer's account against the local one (§28.5).
+pub fn classify_account(local: &PeerAccount, peer: &PeerAccount) -> AccountIdentityVerdict {
+    if local.account_id != peer.account_id {
+        return AccountIdentityVerdict::Distinct;
+    }
+    if local.account_fingerprint != peer.account_fingerprint {
+        AccountIdentityVerdict::FingerprintMismatch
+    } else {
+        AccountIdentityVerdict::Same
+    }
+}
+
+/// The §28.5 error event for a fingerprint mismatch. Fingerprints are
+/// truncated hashes, so the event may carry them without leaking the
+/// provider identifier.
+pub fn fingerprint_mismatch_event(
+    local: &PeerAccount,
+    peer: &PeerAccount,
+    peer_host_id: &str,
+    time: DateTime<Utc>,
+) -> Value {
+    serde_json::json!({
+        "event": "account_fingerprint_mismatch",
+        "severity": "error",
+        "time": time,
+        "peer_host_id": peer_host_id,
+        "account_id": local.account_id,
+        "local_fingerprint": local.account_fingerprint,
+        "peer_fingerprint": peer.account_fingerprint,
+        "action": "treated_as_different_account",
+    })
+}
+
+/// Loads this instance's persisted random identity, creating it on first
+/// use (§28.4). The file is mode 600 and holds 32 hex characters.
+pub fn load_or_create_instance_id(path: &Path) -> Result<String> {
+    if let Ok(bytes) = fs::read(path) {
+        let id = String::from_utf8(bytes)
+            .with_context(|| format!("instance id {} is not UTF-8", path.display()))?;
+        let id = id.trim();
+        validate_identifier("instance_id", id).map_err(anyhow::Error::from)?;
+        return Ok(id.to_owned());
+    }
+    let id: String = {
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill(&mut bytes);
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    };
+    write_private_file(path, format!("{id}\n").as_bytes())
+        .with_context(|| format!("failed to persist instance id {}", path.display()))?;
+    Ok(id)
+}
+
+/// Reads and bumps the monotonic record counter (§28.4). The first record
+/// is sequence 1; the count only ever moves forward, including across
+/// restarts. An exclusive lock covers the read-modify-write so two
+/// concurrent `peer-state` runs cannot publish the same sequence.
+pub fn next_record_seq(path: &Path) -> Result<u64> {
+    let _lock = crate::state::StateLock::acquire(path)
+        .with_context(|| format!("failed to lock record sequence {}", path.display()))?;
+    let current = match fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .with_context(|| format!("record sequence {} is not UTF-8", path.display()))?
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("record sequence {} is not a counter", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read record sequence {}", path.display()))
+        }
+    };
+    let next = current
+        .checked_add(1)
+        .context("record sequence counter exhausted")?;
+    write_private_file(path, format!("{next}\n").as_bytes())
+        .with_context(|| format!("failed to persist record sequence {}", path.display()))?;
+    Ok(next)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    let temp = path.with_extension("tmp");
+    let mut file =
+        fs::File::create(&temp).with_context(|| format!("failed to write {}", temp.display()))?;
+    restrict_permissions(&file)?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", temp.display()))?;
+    drop(file);
+    fs::rename(&temp, path).with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_permissions(file: &std::fs::File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_file: &std::fs::File) -> Result<()> {
+    Ok(())
+}
+
+/// Assembles this instance's peer record (§28.4) from files the running
+/// governor already maintains. Nothing here contacts a provider, observes
+/// workers or actuates: a peer pull must never perturb the host it reads.
+pub fn build_local_record(config: &Config, now: DateTime<Utc>) -> Result<PeerRecord> {
+    let federation = config
+        .federation
+        .as_ref()
+        .context("peer-state requires a federation: block (federation.host_id)")?;
+    let instance_id = load_or_create_instance_id(&federation.instance_id_path(config))?;
+    let record_seq = next_record_seq(&federation.record_seq_path(config))?;
+
+    let status = read_status(config);
+    let state = crate::state::State::load(&config.state_path()).map(|(state, _)| state)?;
+    let capacity = federation
+        .host_capacity_state
+        .as_deref()
+        .map(read_host_capacity)
+        .transpose()?
+        .unwrap_or_default();
+
+    let mut accounts = BTreeMap::new();
+    let mut workspace_origins = BTreeMap::new();
+    for (name, account) in &config.accounts {
+        let provider_identifier = federation.account_identities.get(name);
+        let pools = pool_states(account, name, &status, &state, &mut workspace_origins);
+        accounts.insert(
+            name.clone(),
+            PeerAccount {
+                account_id: name.clone(),
+                account_fingerprint: account_fingerprint(
+                    provider_identifier.map(String::as_str).unwrap_or(name),
+                ),
+                pools,
+            },
+        );
+    }
+
+    Ok(PeerRecord {
+        schema_version: PEER_RECORD_SCHEMA_VERSION,
+        instance_id,
+        host_id: federation.host_id.clone(),
+        record_seq,
+        observed_at: now,
+        accounts,
+        host_ceiling: capacity.last_evidence.and_then(|evidence| {
+            Some(HostCeiling {
+                workers: evidence.ceiling?,
+                observed_at: epoch(evidence.observed_at, now)?,
+            })
+        }),
+        host_reservations: capacity
+            .reservations
+            .into_iter()
+            .filter_map(|(pool, reservation)| {
+                Some((
+                    pool,
+                    HostReservation {
+                        count: reservation.count,
+                        reserved_at: epoch(reservation.at, now)?,
+                    },
+                ))
+            })
+            .collect(),
+        resource_reserve: host_resource_reserve(config, &federation.host_id)
+            .map(ResourceReserveDigest::from),
+        workspace_origins,
+    })
+}
+
+/// Per-account, per-pool state plus the origin URLs of the workspaces the
+/// pool's actuator would seed (§28.4/§28.10).
+fn pool_states(
+    account: &AccountConfig,
+    name: &str,
+    status: &BTreeMap<String, StatusDigest>,
+    state: &crate::state::State,
+    origins: &mut BTreeMap<String, String>,
+) -> BTreeMap<String, PeerPool> {
+    let readiness = status.get(name);
+    let quota_sample = freshest_window(state, name);
+    let mut pools = BTreeMap::new();
+    let demand_path = seed_demand_state(account);
+    let demand = demand_path.as_deref().map(read_demand).unwrap_or_default();
+    for (path, url) in seed_origins(&demand) {
+        origins.insert(path, url);
+    }
+    pools.insert(
+        pool_key(account, name),
+        PeerPool {
+            governed_workers: readiness
+                .and_then(|readiness| readiness.current_workers)
+                .unwrap_or(0),
+            pending_launches: 0,
+            desired: readiness
+                .and_then(|readiness| readiness.desired_workers)
+                .unwrap_or(0),
+            quota_sample,
+            ready_demand: PeerReadyDemand {
+                ready_beads: demand.ready_bead_count.unwrap_or(0),
+                eligible_backlog_capacity: demand.eligible_backlog_capacity,
+            },
+        },
+    );
+    pools
+}
+
+/// A pool is identified by its worker prefix when one is configured
+/// (§28.9) and by the account id otherwise.
+fn pool_key(account: &AccountConfig, name: &str) -> String {
+    identifier_prefix(account).unwrap_or_else(|| name.to_owned())
+}
+
+fn identifier_prefix(account: &AccountConfig) -> Option<String> {
+    let actuator = match &account.fleet.hosts {
+        Some(hosts) => hosts.values().find_map(|host| match &host.actuator {
+            crate::config::ActuatorConfig::NeedleRun {
+                identifier_prefix, ..
+            } => identifier_prefix.clone(),
+            _ => None,
+        }),
+        None => match &account.fleet.actuator {
+            crate::config::ActuatorConfig::NeedleRun {
+                identifier_prefix, ..
+            } => identifier_prefix.clone(),
+            _ => None,
+        },
+    };
+    actuator.or_else(|| {
+        account
+            .fleet
+            .observer
+            .as_ref()
+            .and_then(|observer| match observer {
+                crate::config::WorkerObserverConfig::NeedleStatus {
+                    identifier_prefix, ..
+                } => identifier_prefix.clone(),
+                _ => None,
+            })
+    })
+}
+
+/// The demand-state file of the actuator on this instance's own host
+/// (§26.5); `None` when the account has no needle_run actuator.
+fn seed_demand_state(account: &AccountConfig) -> Option<PathBuf> {
+    match &account.fleet.hosts {
+        Some(hosts) => hosts.values().find_map(|host| match &host.actuator {
+            crate::config::ActuatorConfig::NeedleRun {
+                seed_demand_state, ..
+            } => seed_demand_state.clone(),
+            _ => None,
+        }),
+        None => match &account.fleet.actuator {
+            crate::config::ActuatorConfig::NeedleRun {
+                seed_demand_state, ..
+            } => seed_demand_state.clone(),
+            _ => None,
+        },
+    }
+}
+
+/// The account's freshest window sample, keyed by window id (§28.4: "the
+/// latest quota sample"). Ties break on window id so the choice is stable.
+fn freshest_window(state: &crate::state::State, account: &str) -> Option<PeerQuotaSample> {
+    state
+        .accounts
+        .get(account)?
+        .windows
+        .iter()
+        .max_by(|(left_id, left), (right_id, right)| {
+            left.observed_at
+                .cmp(&right.observed_at)
+                .then_with(|| right_id.cmp(left_id))
+        })
+        .map(|(id, sample)| PeerQuotaSample {
+            window: id.clone(),
+            used_fraction: sample.used_fraction,
+            resets_at: sample.resets_at,
+            observed_at: sample.observed_at,
+        })
+}
+
+/// The configured resource reserve of this instance's own host, when the
+/// account placement declares one (§22.3). The first account that names
+/// the host wins; hosts sharing a federation must declare the same reserve.
+fn host_resource_reserve<'a>(
+    config: &'a Config,
+    host_id: &'a str,
+) -> Option<&'a ResourceReserveConfig> {
+    config.accounts.values().find_map(|account| {
+        account
+            .fleet
+            .hosts
+            .as_ref()?
+            .get(host_id)?
+            .resource_reserve
+            .as_ref()
+    })
+}
+
+/// Per-account readiness from the last completed cycle. The status file is
+/// a derived, best-effort surface (see `merge_status_report`), so a missing
+/// or corrupt file simply leaves every account unobserved.
+fn read_status(config: &Config) -> BTreeMap<String, StatusDigest> {
+    fs::read(config.status_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StatusDigest {
+    #[serde(default)]
+    current_workers: Option<u32>,
+    #[serde(default)]
+    desired_workers: Option<u32>,
+}
+
+/// The WP23 demand-state file (scripts/subgov_ready_beads.py). Lenient by
+/// the same rule as the status file: unreadable demand is zero demand in a
+/// record, never a failed pull.
+fn read_demand(path: &Path) -> DemandDigest {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct DemandDigest {
+    #[serde(default)]
+    ready_bead_count: Option<u32>,
+    #[serde(default)]
+    eligible_backlog_capacity: Option<u32>,
+    #[serde(default)]
+    workspaces: Vec<DemandWorkspace>,
+    #[serde(default)]
+    ready: Vec<DemandWorkspace>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct DemandWorkspace {
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+/// Git origin URLs for the workspaces this instance will seed (§28.4),
+/// sanitized of any embedded userinfo. A workspace whose origin cannot be
+/// read is omitted: §28.10's overlap check must not treat an unknown
+/// origin as either matching or free.
+fn seed_origins(demand: &DemandDigest) -> BTreeMap<String, String> {
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for workspace in demand.workspaces.iter().chain(demand.ready.iter()) {
+        if let Some(path) = workspace.workspace.as_deref() {
+            if !path.trim().is_empty() {
+                paths.insert(path.to_owned());
+            }
+        }
+    }
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            Some((
+                path.clone(),
+                sanitize_origin(&git_origin(Path::new(&path))?).into_owned(),
+            ))
+        })
+        .collect()
+}
+
+fn git_origin(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = str::from_utf8(&output.stdout).ok()?.trim();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_owned())
+    }
+}
+
+/// Strips userinfo (`user:token@`) from a URL or scp-style remote so a
+/// credential embedded in a git remote never reaches a peer record (§14).
+fn sanitize_origin(url: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        // scp-like `git@host:path` remotes carry userinfo with no scheme.
+        None => (None, url),
+    };
+    let authority_end = rest.find('/').unwrap_or(match scheme {
+        // `host:path` form: the whole remainder is the authority.
+        None => rest.len(),
+        Some(_) => rest.find(':').unwrap_or(rest.len()),
+    });
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.split_once('@') {
+        Some((_userinfo, host)) => match scheme {
+            Some(scheme) => Cow::Owned(format!("{scheme}://{host}{tail}")),
+            None => Cow::Owned(format!("{host}{tail}")),
+        },
+        None => Cow::Borrowed(url),
+    }
+}
+
+/// The WP24 host-capacity adapter's state file: `last_evidence` carries the
+/// measured ceiling this record publishes (§26.6). Unreadable or
+/// error-marked evidence publishes no ceiling -- a peer must never see a
+/// ceiling that was not measured.
+fn read_host_capacity(path: &Path) -> Result<HostCapacityDigest> {
+    let bytes = fs::read(path).with_context(|| {
+        format!(
+            "failed to read federation.host_capacity_state {}",
+            path.display()
+        )
+    })?;
+    let digest: HostCapacityDigest = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse federation.host_capacity_state {}",
+            path.display()
+        )
+    })?;
+    Ok(digest)
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HostCapacityDigest {
+    #[serde(default)]
+    last_evidence: Option<HostEvidence>,
+    #[serde(default)]
+    reservations: BTreeMap<String, Reservation>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HostEvidence {
+    /// `null` when the adapter could not measure (unknown evidence holds
+    /// the fleet rather than inventing an admission).
+    #[serde(default)]
+    ceiling: Option<u32>,
+    #[serde(default)]
+    observed_at: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct Reservation {
+    #[serde(default)]
+    count: u32,
+    #[serde(default)]
+    at: Option<f64>,
+}
+
+/// Converts the adapter's `time.time()` float to a timestamp, falling back
+/// to the record's own `observed_at` when the adapter wrote no usable one.
+fn epoch(seconds: Option<f64>, fallback: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let seconds = seconds?;
+    let secs = seconds.trunc() as i64;
+    let nanos = ((seconds - seconds.trunc()) * 1_000_000_000.0) as u32;
+    Utc.timestamp_opt(secs, nanos).single().or(Some(fallback))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{FederationConfig, FleetConfig, SourceConfig};
+    use chrono::Duration;
+
+    fn sample_record() -> PeerRecord {
+        PeerRecord {
+            schema_version: PEER_RECORD_SCHEMA_VERSION,
+            instance_id: "0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_owned(),
+            host_id: "codinghome".to_owned(),
+            record_seq: 7,
+            observed_at: Utc::now(),
+            accounts: BTreeMap::from([(
+                "claude-zai".to_owned(),
+                PeerAccount {
+                    account_id: "claude-zai".to_owned(),
+                    account_fingerprint: account_fingerprint("zai:user-42"),
+                    pools: BTreeMap::from([(
+                        "sg-zai-".to_owned(),
+                        PeerPool {
+                            governed_workers: 4,
+                            pending_launches: 0,
+                            desired: 5,
+                            quota_sample: Some(PeerQuotaSample {
+                                window: "five_hour".to_owned(),
+                                used_fraction: 0.42,
+                                resets_at: Utc::now() + Duration::hours(3),
+                                observed_at: Utc::now(),
+                            }),
+                            ready_demand: PeerReadyDemand {
+                                ready_beads: 6,
+                                eligible_backlog_capacity: Some(5),
+                            },
+                        },
+                    )]),
+                },
+            )]),
+            host_ceiling: Some(HostCeiling {
+                workers: 12,
+                observed_at: Utc::now(),
+            }),
+            host_reservations: BTreeMap::from([(
+                "sg-zai-".to_owned(),
+                HostReservation {
+                    count: 1,
+                    reserved_at: Utc::now(),
+                },
+            )]),
+            resource_reserve: Some(ResourceReserveDigest {
+                cpu_reserve_fraction: 0.1,
+                mem_reserve_mb: 8192,
+            }),
+            workspace_origins: BTreeMap::from([(
+                "/home/coding/SEAM".to_owned(),
+                "https://git.ardenone.com/jedarden/SEAM.git".to_owned(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_a_stable_truncated_hash() {
+        // Standard SHA-256("zai:user-42") truncated to 16 hex characters.
+        assert_eq!(
+            account_fingerprint("zai:user-42").len(),
+            FINGERPRINT_HEX_CHARS
+        );
+        assert_eq!(
+            account_fingerprint("zai:user-42"),
+            account_fingerprint("zai:user-42")
+        );
+        assert_ne!(
+            account_fingerprint("zai:user-42"),
+            account_fingerprint("zai:user-43")
+        );
+        assert!(is_fingerprint(&account_fingerprint("anything")));
+    }
+
+    #[test]
+    fn parse_round_trips_a_full_record() {
+        let record = sample_record();
+        let parsed = PeerRecord::parse(record.to_json().unwrap().as_bytes()).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn unknown_major_is_rejected_but_unknown_minor_fields_pass() {
+        let mut future = serde_json::to_value(sample_record()).unwrap();
+        future["schema_version"] = serde_json::json!(2);
+        let error = PeerRecord::parse(future.to_string().as_bytes()).unwrap_err();
+        assert!(matches!(
+            error,
+            PeerRecordError::UnknownSchemaMajor {
+                found: 2,
+                supported: 1
+            }
+        ));
+
+        let mut extended = serde_json::to_value(sample_record()).unwrap();
+        extended["accounts"]["claude-zai"]["future_field"] = serde_json::json!(true);
+        assert!(PeerRecord::parse(extended.to_string().as_bytes()).is_ok());
+
+        let mut unversioned = serde_json::to_value(sample_record()).unwrap();
+        unversioned
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+        assert!(PeerRecord::parse(unversioned.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn invalid_records_are_rejected_with_field_context() {
+        let mut bad = serde_json::to_value(sample_record()).unwrap();
+        bad["accounts"]["claude-zai"]["account_fingerprint"] = serde_json::json!("not-hex");
+        assert!(PeerRecord::parse(bad.to_string().as_bytes()).is_err());
+
+        let mut empty_host = serde_json::to_value(sample_record()).unwrap();
+        empty_host["host_id"] = serde_json::json!("");
+        assert!(PeerRecord::parse(empty_host.to_string().as_bytes()).is_err());
+
+        let mut out_of_range = serde_json::to_value(sample_record()).unwrap();
+        out_of_range["accounts"]["claude-zai"]["pools"]["sg-zai-"]["quota_sample"]
+            ["used_fraction"] = serde_json::json!(1.5);
+        assert!(PeerRecord::parse(out_of_range.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn identity_classification_isolates_a_fingerprint_mismatch() {
+        let local = PeerAccount {
+            account_id: "claude-zai".to_owned(),
+            account_fingerprint: account_fingerprint("zai:user-42"),
+            pools: BTreeMap::new(),
+        };
+        let same = PeerAccount {
+            account_fingerprint: account_fingerprint("zai:user-42"),
+            ..local.clone()
+        };
+        let drifted = PeerAccount {
+            account_fingerprint: account_fingerprint("zai:user-99"),
+            ..local.clone()
+        };
+        let other = PeerAccount {
+            account_id: "codex".to_owned(),
+            account_fingerprint: account_fingerprint("codex:org-1"),
+            ..local.clone()
+        };
+
+        assert_eq!(
+            classify_account(&local, &same),
+            AccountIdentityVerdict::Same
+        );
+        let mismatch = classify_account(&local, &drifted);
+        assert_eq!(mismatch, AccountIdentityVerdict::FingerprintMismatch);
+        assert!(!mismatch.shares_account_total());
+        assert!(mismatch.is_error());
+        assert_eq!(
+            classify_account(&local, &other),
+            AccountIdentityVerdict::Distinct
+        );
+        assert!(!classify_account(&local, &other).is_error());
+
+        let event = fingerprint_mismatch_event(&local, &drifted, "gmktec", Utc::now());
+        assert_eq!(event["event"], "account_fingerprint_mismatch");
+        assert_eq!(event["severity"], "error");
+        assert_eq!(event["action"], "treated_as_different_account");
+        // The raw provider identifier must never appear in the event (§14).
+        assert!(!event.to_string().contains("zai:user"));
+    }
+
+    #[test]
+    fn origin_sanitization_strips_userinfo() {
+        use sanitize_origin as clean;
+        assert_eq!(
+            clean("https://user:tok3n@git.ardenone.com/jedarden/SEAM.git"),
+            "https://git.ardenone.com/jedarden/SEAM.git"
+        );
+        assert_eq!(
+            clean("https://token@github.com/jedarden/x.git"),
+            "https://github.com/jedarden/x.git"
+        );
+        assert_eq!(clean("git@host:repo/path.git"), "host:repo/path.git");
+        assert_eq!(
+            clean("https://git.ardenone.com/jedarden/SEAM.git"),
+            "https://git.ardenone.com/jedarden/SEAM.git"
+        );
+    }
+
+    fn test_config(dir: &Path) -> Config {
+        Config {
+            version: 1,
+            poll_interval_seconds: 300,
+            state_path: Some(dir.join("state").join("governor.json")),
+            accounts: BTreeMap::from([(
+                "acct".to_owned(),
+                AccountConfig {
+                    source: SourceConfig::NormalizedFile {
+                        path: dir.join("quota.json"),
+                    },
+                    fleet: FleetConfig {
+                        min_workers: 0,
+                        max_workers: 4,
+                        bootstrap_workers: 1,
+                        max_scale_up_per_cycle: 1,
+                        max_scale_down_per_cycle: 1,
+                        observer: Some(crate::config::WorkerObserverConfig::Static { workers: 0 }),
+                        actuator: crate::config::ActuatorConfig::None,
+                        observer_reconciliation: Default::default(),
+                        hosts: None,
+                        takeover: Vec::new(),
+                        takeover_helper: None,
+                    },
+                    utilization: crate::config::UtilizationConfig {
+                        target_utilization: Some(0.9),
+                        reserve_fraction: None,
+                        strategy: Default::default(),
+                        stale_after_seconds: 900,
+                        stale_behavior: Default::default(),
+                        minimum_sample_seconds: 60,
+                        backpressure: None,
+                        zai_saturation: None,
+                        windows: BTreeMap::new(),
+                    },
+                    banked_resets: Default::default(),
+                },
+            )]),
+            federation: Some(FederationConfig {
+                host_id: "codinghome".to_owned(),
+                instance_id_file: None,
+                record_seq_file: None,
+                host_capacity_state: None,
+                account_identities: BTreeMap::from([(
+                    "acct".to_owned(),
+                    "provider:acct-1".to_owned(),
+                )]),
+            }),
+        }
+    }
+
+    #[test]
+    fn instance_id_persists_and_record_seq_is_monotonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let federation = config.federation.as_ref().unwrap();
+        let id_path = federation.instance_id_path(&config);
+        let seq_path = federation.record_seq_path(&config);
+
+        let first = load_or_create_instance_id(&id_path).unwrap();
+        assert_eq!(first, load_or_create_instance_id(&id_path).unwrap());
+        assert_eq!(first.len(), 32);
+        assert!(seq_path.starts_with(dir.path()));
+
+        assert_eq!(next_record_seq(&seq_path).unwrap(), 1);
+        assert_eq!(next_record_seq(&seq_path).unwrap(), 2);
+        assert_eq!(next_record_seq(&seq_path).unwrap(), 3);
+        use std::os::unix::fs::PermissionsExt;
+        let actual = fs::metadata(&id_path).unwrap().permissions().mode();
+        assert_eq!(actual & 0o777, 0o600, "identity file must be private");
+    }
+
+    #[test]
+    fn local_record_carries_status_quota_demand_and_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        let now = Utc::now();
+
+        // No files yet: an unobserved instance still publishes a valid record.
+        let record = build_local_record(&config, now).unwrap();
+        assert_eq!(record.schema_version, PEER_RECORD_SCHEMA_VERSION);
+        assert_eq!(record.host_id, "codinghome");
+        let pool = &record.accounts["acct"].pools[&"acct".to_owned()];
+        assert_eq!(pool.governed_workers, 0);
+        assert_eq!(pool.pending_launches, 0);
+        assert_eq!(pool.ready_demand.ready_beads, 0);
+        assert_eq!(
+            record.accounts["acct"].account_fingerprint,
+            account_fingerprint("provider:acct-1")
+        );
+        PeerRecord::parse(record.to_json().unwrap().as_bytes()).unwrap();
+
+        // A completed cycle's artifacts flow into the record.
+        let status = serde_json::json!({
+            "acct": {"state": "healthy_learning", "reason": "", "updated_at": now,
+                "current_workers": 2, "desired_workers": 3}
+        });
+        fs::create_dir_all(config.state_path().parent().unwrap()).unwrap();
+        fs::write(config.status_path(), status.to_string()).unwrap();
+        let mut state = crate::state::State::default();
+        state
+            .accounts
+            .entry("acct".to_owned())
+            .or_default()
+            .windows
+            .insert(
+                "five_hour".to_owned(),
+                crate::state::WindowSample {
+                    observed_at: now,
+                    used_fraction: 0.31,
+                    resets_at: now + Duration::hours(4),
+                    workers: 2,
+                },
+            );
+        fs::write(
+            config.state_path(),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let record = build_local_record(&config, now).unwrap();
+        let pool = &record.accounts["acct"].pools[&"acct".to_owned()];
+        assert_eq!(pool.governed_workers, 2);
+        assert_eq!(pool.desired, 3);
+        let sample = pool.quota_sample.as_ref().unwrap();
+        assert_eq!(sample.window, "five_hour");
+        assert_eq!(sample.used_fraction, 0.31);
+
+        // A measured ceiling and reservations flow from the WP24 state file.
+        let capacity_path = dir.path().join("host-capacity.json");
+        fs::write(
+            &capacity_path,
+            serde_json::json!({
+                "version": 1,
+                "last_evidence": {
+                    "event": "host_worker_ceiling", "ceiling": 12,
+                    "observed_at": now.timestamp() as f64,
+                },
+                "reservations": {"acct": {"count": 1, "at": now.timestamp() as f64}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        config.federation.as_mut().unwrap().host_capacity_state = Some(capacity_path);
+        let record = build_local_record(&config, now).unwrap();
+        assert_eq!(record.host_ceiling.as_ref().unwrap().workers, 12);
+        assert_eq!(record.host_reservations["acct"].count, 1);
+
+        // A failed measurement publishes no ceiling, never a zero.
+        fs::write(
+            dir.path().join("host-capacity.json"),
+            serde_json::json!({"version": 1,
+                "last_evidence": {"ceiling": None::<u32>, "observed_at": now.timestamp() as f64}})
+            .to_string(),
+        )
+        .unwrap();
+        let record = build_local_record(&config, now).unwrap();
+        assert!(record.host_ceiling.is_none());
+    }
+
+    #[test]
+    fn record_requires_a_federation_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.federation = None;
+        assert!(build_local_record(&config, Utc::now())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("federation"));
+    }
+}
