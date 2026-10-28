@@ -5,7 +5,7 @@ use crate::config::{
 use crate::placement::HostPlacement;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -59,6 +59,10 @@ pub trait Observer {
 /// implementation could pass such data through even if it wanted to.
 pub trait Actuator {
     fn actuate(&self, desired: u32) -> Result<()>;
+
+    fn actuate_with_exclusions(&self, desired: u32, _excluded: &BTreeSet<PathBuf>) -> Result<()> {
+        self.actuate(desired)
+    }
 }
 
 /// The observable outcome of one actuation decision (plan.md §11.2).
@@ -192,6 +196,27 @@ pub fn actuate_host_targets(
     config: &AccountConfig,
     placements: &[HostPlacement],
 ) -> Result<BTreeMap<String, ActuationOutcome>> {
+    actuate_host_targets_selected(config, placements, None, &BTreeSet::new())
+}
+
+/// Federated actuation touches only this instance's host while retaining
+/// outcome entries for every placement so existing accounting can use the
+/// peer hosts' observed counts without treating them as locally actuated.
+pub fn actuate_host_targets_local(
+    config: &AccountConfig,
+    placements: &[HostPlacement],
+    local_host: &str,
+    excluded: &BTreeSet<PathBuf>,
+) -> Result<BTreeMap<String, ActuationOutcome>> {
+    actuate_host_targets_selected(config, placements, Some(local_host), excluded)
+}
+
+fn actuate_host_targets_selected(
+    config: &AccountConfig,
+    placements: &[HostPlacement],
+    selected_host: Option<&str>,
+    excluded: &BTreeSet<PathBuf>,
+) -> Result<BTreeMap<String, ActuationOutcome>> {
     let hosts = configured_hosts(config)?;
     let mut by_host = BTreeMap::new();
     for placement in placements {
@@ -215,9 +240,26 @@ pub fn actuate_host_targets(
         .iter()
         .map(|(host_id, host)| {
             let placement = by_host[host_id.as_str()];
-            let mut outcome = actuate_config(&host.actuator, placement.current, placement.target)
-                .with_context(|| format!("host {host_id} actuator failed"))?;
-            if reconcile_unchanged(&host.actuator) {
+            let mut outcome = if selected_host.is_some_and(|selected| selected != host_id) {
+                ActuationOutcome {
+                    actuated: false,
+                    observed_workers: None,
+                }
+            } else if selected_host.is_none() {
+                actuate_config(&host.actuator, placement.current, placement.target)
+                    .with_context(|| format!("host {host_id} actuator failed"))?
+            } else {
+                actuate_config_with_exclusions(
+                    &host.actuator,
+                    placement.current,
+                    placement.target,
+                    excluded,
+                )
+                .with_context(|| format!("host {host_id} actuator failed"))?
+            };
+            if selected_host.is_none_or(|selected| selected == host_id)
+                && reconcile_unchanged(&host.actuator)
+            {
                 outcome.observed_workers = Some(
                     // Host-scoped fleets never carry a takeover list
                     // (validate_takeover rejects the combination).
@@ -286,7 +328,17 @@ fn reconcile_observed_range(observed: u32, config: &FleetConfig) -> Result<u32> 
 /// must not treat this cycle's observation as authoritative -- retaining
 /// whatever state it already holds is what lets the next cycle reconcile.
 pub fn actuate(config: &FleetConfig, observed: u32, desired: u32) -> Result<ActuationOutcome> {
-    let mut outcome = actuate_config(&config.actuator, observed, desired)?;
+    actuate_with_exclusions(config, observed, desired, &BTreeSet::new())
+}
+
+pub fn actuate_with_exclusions(
+    config: &FleetConfig,
+    observed: u32,
+    desired: u32,
+    excluded: &BTreeSet<PathBuf>,
+) -> Result<ActuationOutcome> {
+    let mut outcome =
+        actuate_config_with_exclusions(&config.actuator, observed, desired, excluded)?;
     retire_takeover(config)?;
     if reconcile_unchanged(&config.actuator) {
         outcome.observed_workers = Some(current_workers(config)?);
@@ -322,6 +374,15 @@ fn actuate_config(
     observed: u32,
     desired: u32,
 ) -> Result<ActuationOutcome> {
+    actuate_config_with_exclusions(actuator, observed, desired, &BTreeSet::new())
+}
+
+fn actuate_config_with_exclusions(
+    actuator: &ActuatorConfig,
+    observed: u32,
+    desired: u32,
+    excluded: &BTreeSet<PathBuf>,
+) -> Result<ActuationOutcome> {
     if desired == observed && !reconcile_unchanged(actuator) {
         return Ok(ActuationOutcome {
             actuated: false,
@@ -334,7 +395,7 @@ fn actuate_config(
             observed_workers: None,
         });
     }
-    actuator_for(actuator).actuate(desired)?;
+    actuator_for(actuator).actuate_with_exclusions(desired, excluded)?;
     Ok(ActuationOutcome {
         actuated: true,
         observed_workers: None,

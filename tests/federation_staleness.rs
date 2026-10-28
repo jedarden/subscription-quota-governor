@@ -56,6 +56,9 @@ fn federation(peers: Vec<PeerConfig>, stale_after: u64, expiry: u64) -> Federati
         peers,
         peer_stale_after_seconds: stale_after,
         peer_expiry_seconds: expiry,
+        primary: true,
+        repo_owners: BTreeMap::new(),
+        pending_launches_file: None,
     }
 }
 

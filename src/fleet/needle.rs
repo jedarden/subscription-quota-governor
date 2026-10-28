@@ -8,7 +8,7 @@ use super::{new_process_group_command, wait_with_timeout, Actuator, Observer, CH
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read;
@@ -154,7 +154,7 @@ fn count_needle_heartbeats(
             || (age_seconds == stale_after_seconds && age.subsec_nanos() == 0);
         if is_fresh {
             let owned = identifier_prefix
-                .map(|prefix| heartbeat.worker_id.starts_with(prefix))
+                .map(|prefix| crate::ownership::matches_worker_prefix(prefix, &heartbeat.worker_id))
                 .unwrap_or(true);
             let slot = if owned {
                 &mut counts.owned
@@ -182,6 +182,10 @@ pub(super) struct NeedleRunActuator {
 
 impl Actuator for NeedleRunActuator {
     fn actuate(&self, desired: u32) -> Result<()> {
+        self.actuate_with_exclusions(desired, &BTreeSet::new())
+    }
+
+    fn actuate_with_exclusions(&self, desired: u32, excluded: &BTreeSet<PathBuf>) -> Result<()> {
         let seeds = match (&self.seed_demand_state, &self.seed_heartbeats) {
             (Some(demand_state), Some(heartbeats)) => Some(SeedSources {
                 demand_state,
@@ -197,6 +201,7 @@ impl Actuator for NeedleRunActuator {
             self.identifier_prefix.as_deref(),
             seeds.as_ref(),
             desired,
+            excluded,
         )
     }
 }
@@ -353,6 +358,7 @@ struct TmuxSession {
     attached: bool,
 }
 
+#[allow(clippy::too_many_arguments)] // The adapter's explicit programs, seed policy and exclusion set are independently testable.
 fn reconcile_needle_workers(
     needle_program: &str,
     tmux_program: &str,
@@ -361,16 +367,20 @@ fn reconcile_needle_workers(
     identifier_prefix: Option<&str>,
     seeds: Option<&SeedSources>,
     desired: u32,
+    excluded: &BTreeSet<PathBuf>,
 ) -> Result<()> {
     check_needle_adapter_with_program(needle_program, adapter)?;
     let sessions = list_sessions(tmux_program)?;
-    let prefix = match identifier_prefix {
-        Some(identifier_prefix) => format!("{}{identifier_prefix}", session_prefix(adapter)),
-        None => session_prefix(adapter),
-    };
+    let adapter_prefix = session_prefix(adapter);
     let mut matching: Vec<_> = sessions
         .iter()
-        .filter(|session| session.name.starts_with(&prefix))
+        .filter(|session| match identifier_prefix {
+            Some(prefix) => session
+                .name
+                .strip_prefix(&adapter_prefix)
+                .is_some_and(|id| crate::ownership::matches_worker_prefix(prefix, id)),
+            None => session.name.starts_with(&adapter_prefix),
+        })
         .cloned()
         .collect();
     matching.sort_by(|left, right| left.name.cmp(&right.name));
@@ -379,6 +389,9 @@ fn reconcile_needle_workers(
         std::cmp::Ordering::Equal => Ok(()),
         std::cmp::Ordering::Greater => {
             let delta = desired - matching.len() as u32;
+            if seeds.is_none() && excluded.contains(repo) {
+                return Ok(());
+            }
             // Plan §26.5: with seeds configured, every scale-up worker is
             // launched with the ready workspace that has the fewest running
             // workers, read from the WP23 demand state and the NEEDLE
@@ -391,7 +404,10 @@ fn reconcile_needle_workers(
             }
             let launches: Vec<PathBuf> = match seeds {
                 Some(sources) => {
-                    let ready = read_seed_demand(sources.demand_state)?;
+                    let ready: Vec<_> = read_seed_demand(sources.demand_state)?
+                        .into_iter()
+                        .filter(|path| !excluded.contains(path))
+                        .collect();
                     let occupancy = seed_occupancy(sources.heartbeats, Utc::now())?;
                     seed_order(&ready, &occupancy)
                         .into_iter()
@@ -914,6 +930,7 @@ mod tests {
             None,
             None,
             2,
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -943,6 +960,7 @@ mod tests {
             None,
             None,
             1,
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -973,6 +991,7 @@ mod tests {
             Some("sg-codex-"),
             None,
             0,
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -1042,6 +1061,7 @@ mod tests {
             None,
             None,
             2,
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string();
@@ -1112,6 +1132,7 @@ mod tests {
             Some("sg-codex-"),
             None,
             3,
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -1144,6 +1165,48 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn excluded_workspace_is_never_used_as_a_launch_seed() {
+        let dir = TempDir::new().unwrap();
+        let contested = dir.path().join("contested");
+        let allowed = dir.path().join("allowed");
+        fs::create_dir_all(&contested).unwrap();
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(dir.path().join("heartbeats")).unwrap();
+        let demand_path = dir.path().join("demand.json");
+        write_demand(&demand_path, &[&contested, &allowed]);
+        let tmux = fake_program(
+            &dir,
+            "tmux",
+            "#!/bin/sh\necho 'no server running on test socket' >&2\nexit 1\n",
+        );
+        let log = dir.path().join("needle.log");
+        let needle = fake_program(&dir, "needle", &ready_test_agent_script(&log));
+        let seeds = SeedSources {
+            demand_state: &demand_path,
+            heartbeats: &dir.path().join("heartbeats"),
+        };
+        reconcile_needle_workers(
+            needle.to_str().unwrap(),
+            tmux.to_str().unwrap(),
+            &contested,
+            "codex",
+            Some("sg-codex-"),
+            Some(&seeds),
+            2,
+            &BTreeSet::from([contested.clone()]),
+        )
+        .unwrap();
+        let logged = fs::read_to_string(&log).unwrap();
+        assert_eq!(logged.matches("run -w").count(), 1, "{logged}");
+        assert!(logged.contains(&allowed.display().to_string()), "{logged}");
+        assert!(
+            !logged.contains(&contested.display().to_string()),
+            "{logged}"
+        );
     }
 
     #[test]
@@ -1219,6 +1282,7 @@ mod tests {
             Some("sg-codex-"),
             Some(&seeds),
             2,
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -1261,6 +1325,7 @@ mod tests {
             None,
             Some(&seeds),
             3,
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -1294,6 +1359,7 @@ mod tests {
             Some("sg-codex-"),
             Some(&seeds),
             2,
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -1324,6 +1390,7 @@ mod tests {
             None,
             Some(&seeds),
             2,
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string();
@@ -1368,6 +1435,7 @@ mod tests {
             None,
             Some(&seeds),
             2,
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string();

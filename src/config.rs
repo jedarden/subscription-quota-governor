@@ -168,6 +168,21 @@ pub struct FederationConfig {
     /// Defaults to 30 minutes.
     #[serde(default = "default_peer_expiry_seconds")]
     pub peer_expiry_seconds: u64,
+    /// The primary instance keeps the legacy worker prefixes. Other hosts
+    /// derive a host-specific prefix from each configured pool prefix.
+    #[serde(default = "default_primary_host")]
+    pub primary: bool,
+    /// Explicit owner of a repository origin when two hosts list it.
+    #[serde(default)]
+    pub repo_owners: BTreeMap<String, String>,
+    /// Published in-flight launches, read by `peer-state` before workers
+    /// become observable. Defaults to a sibling of the state file.
+    #[serde(default)]
+    pub pending_launches_file: Option<PathBuf>,
+}
+
+fn default_primary_host() -> bool {
+    true
 }
 
 /// One configured federation peer (§28.13: `peers: [{host_id, argv}]`).
@@ -184,6 +199,18 @@ pub struct PeerConfig {
 }
 
 impl FederationConfig {
+    pub fn workspace_exclusions_path(&self, config: &Config) -> PathBuf {
+        config
+            .state_path()
+            .with_file_name("federation-workspace-exclusions.json")
+    }
+    pub fn pending_launches_path(&self, config: &Config) -> PathBuf {
+        self.pending_launches_file.clone().unwrap_or_else(|| {
+            config
+                .state_path()
+                .with_file_name("federation-pending-launches.json")
+        })
+    }
     pub fn instance_id_path(&self, config: &Config) -> PathBuf {
         self.instance_id_file
             .clone()
@@ -512,6 +539,7 @@ impl Config {
                 &mut federation.instance_id_file,
                 &mut federation.record_seq_file,
                 &mut federation.host_capacity_state,
+                &mut federation.pending_launches_file,
             ]
             .into_iter()
             .flatten()
@@ -520,7 +548,31 @@ impl Config {
             }
         }
         config.validate()?;
+        config.apply_federation_prefixes();
         Ok(config)
+    }
+
+    fn apply_federation_prefixes(&mut self) {
+        let Some(federation) = &self.federation else {
+            return;
+        };
+        if federation.primary || federation.peers.is_empty() {
+            return;
+        }
+        let host_id = federation.host_id.clone();
+        for account in self.accounts.values_mut() {
+            if let Some(hosts) = &mut account.fleet.hosts {
+                if let Some(host) = hosts.get_mut(&host_id) {
+                    rewrite_observer_prefix(&mut host.observer, &host_id);
+                    rewrite_actuator_prefix(&mut host.actuator, &host_id);
+                }
+            } else {
+                if let Some(observer) = &mut account.fleet.observer {
+                    rewrite_observer_prefix(observer, &host_id);
+                }
+                rewrite_actuator_prefix(&mut account.fleet.actuator, &host_id);
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -698,6 +750,26 @@ fn expand_actuator_path(actuator: &mut ActuatorConfig) {
     }
 }
 
+fn rewrite_observer_prefix(observer: &mut WorkerObserverConfig, host_id: &str) {
+    if let WorkerObserverConfig::NeedleStatus {
+        identifier_prefix: Some(prefix),
+        ..
+    } = observer
+    {
+        *prefix = crate::ownership::effective_prefix(prefix, host_id, false);
+    }
+}
+
+fn rewrite_actuator_prefix(actuator: &mut ActuatorConfig, host_id: &str) {
+    if let ActuatorConfig::NeedleRun {
+        identifier_prefix: Some(prefix),
+        ..
+    } = actuator
+    {
+        *prefix = crate::ownership::effective_prefix(prefix, host_id, false);
+    }
+}
+
 impl UtilizationConfig {
     pub fn policy_for(&self, id: &str) -> Option<ResolvedPolicy> {
         let override_policy = self.windows.get(id);
@@ -782,6 +854,23 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
     if federation.host_id.trim().is_empty() || federation.host_id.chars().any(char::is_whitespace) {
         bail!("federation.host_id must be non-empty and free of whitespace");
     }
+    if !federation
+        .host_id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        bail!("federation.host_id must contain only a-z, 0-9 and '-' for worker identity");
+    }
+    for (origin, owner) in &federation.repo_owners {
+        if origin.trim().is_empty() || owner.trim().is_empty() {
+            bail!("federation.repo_owners requires non-empty origin URLs and host ids");
+        }
+        if owner != &federation.host_id
+            && !federation.peers.iter().any(|peer| &peer.host_id == owner)
+        {
+            bail!("federation.repo_owners for {origin} names unconfigured host {owner}");
+        }
+    }
     for account in federation.account_identities.keys() {
         if !config.accounts.contains_key(account) {
             bail!("federation.account_identities names account {account}, which is not configured");
@@ -817,6 +906,38 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
             )?;
         }
     }
+    if !federation.peers.is_empty() {
+        for (name, account) in &config.accounts {
+            let (observer, actuator) = match &account.fleet.hosts {
+                Some(hosts) => match hosts.get(&federation.host_id) {
+                    Some(host) => (Some(&host.observer), &host.actuator),
+                    None => bail!(
+                        "account {name}: federation host {} is missing from fleet.hosts",
+                        federation.host_id
+                    ),
+                },
+                None => (account.fleet.observer.as_ref(), &account.fleet.actuator),
+            };
+            if matches!(
+                observer,
+                Some(WorkerObserverConfig::NeedleStatus {
+                    identifier_prefix: None,
+                    ..
+                })
+            ) {
+                bail!("account {name}: federated needle_status requires an identifier_prefix");
+            }
+            if matches!(
+                actuator,
+                ActuatorConfig::NeedleRun {
+                    identifier_prefix: None,
+                    ..
+                }
+            ) {
+                bail!("account {name}: federated needle_run requires an identifier_prefix");
+            }
+        }
+    }
     if federation.peer_stale_after_seconds == 0 {
         bail!("federation.peer_stale_after_seconds must be at least 1 second (plan.md §28.7)");
     }
@@ -825,6 +946,53 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
             "federation.peer_expiry_seconds ({}) must exceed peer_stale_after_seconds ({}): expiry is the recovery path out of a stale freeze (plan.md §28.7)",
             federation.peer_expiry_seconds, federation.peer_stale_after_seconds
         );
+    }
+    if let Some((account, summed, reserve)) = crate::ownership::overshoot_violation(config) {
+        bail!("account {account}: federation summed max_step_up {summed} exceeds worker reserve {reserve} (plan.md §28.8)");
+    }
+    if !federation.primary && !federation.peers.is_empty() {
+        for (account, cfg) in &config.accounts {
+            let check = |prefix: &Option<String>| -> Result<()> {
+                if let Some(prefix) = prefix {
+                    let derived =
+                        crate::ownership::effective_prefix(prefix, &federation.host_id, false);
+                    validate_identifier_prefix(
+                        Some(&derived),
+                        &format!("account {account} derived worker prefix"),
+                    )?;
+                }
+                Ok(())
+            };
+            if let Some(hosts) = &cfg.fleet.hosts {
+                if let Some(host) = hosts.get(&federation.host_id) {
+                    if let WorkerObserverConfig::NeedleStatus {
+                        identifier_prefix, ..
+                    } = &host.observer
+                    {
+                        check(identifier_prefix)?;
+                    }
+                    if let ActuatorConfig::NeedleRun {
+                        identifier_prefix, ..
+                    } = &host.actuator
+                    {
+                        check(identifier_prefix)?;
+                    }
+                }
+            } else {
+                if let Some(WorkerObserverConfig::NeedleStatus {
+                    identifier_prefix, ..
+                }) = &cfg.fleet.observer
+                {
+                    check(identifier_prefix)?;
+                }
+                if let ActuatorConfig::NeedleRun {
+                    identifier_prefix, ..
+                } = &cfg.fleet.actuator
+                {
+                    check(identifier_prefix)?;
+                }
+            }
+        }
     }
     Ok(())
 }

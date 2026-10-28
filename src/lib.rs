@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod federation;
 pub mod fleet;
 pub mod model;
+pub mod ownership;
 pub mod placement;
 pub mod preflight;
 pub mod saturation;

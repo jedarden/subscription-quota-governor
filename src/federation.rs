@@ -17,8 +17,10 @@
 //! On the receiving side, `PeerTable` ages each peer's last accepted
 //! record on this host's monotonic clock from receipt -- never from the
 //! peer's timestamp -- and freezes scale-up while any peer is stale
-//! (§28.7). WP29 wires that table into the shared total and cross-host
-//! placement.
+//! (§28.7). WP29 builds on that table: every instance derives the same
+//! account total from the freshest held quota sample and the cross-host
+//! worker sum, then splits it across hosts with the §22.7 placement
+//! function over peer-record headroom (`shared_account_total` below).
 //!
 //! No credentials, prompts or raw provider bodies ever enter a record
 //! (§14): every field below is a count, a timestamp, a derived fingerprint,
@@ -813,9 +815,20 @@ pub fn build_local_record(config: &Config, now: DateTime<Utc>) -> Result<PeerRec
 
     let mut accounts = BTreeMap::new();
     let mut workspace_origins = BTreeMap::new();
+    let excluded =
+        crate::ownership::read_workspace_exclusions(&federation.workspace_exclusions_path(config));
     for (name, account) in &config.accounts {
         let provider_identifier = federation.account_identities.get(name);
-        let pools = pool_states(account, name, &status, &state, &mut workspace_origins);
+        let pools = pool_states(
+            account,
+            name,
+            &federation.host_id,
+            &status,
+            &state,
+            &mut workspace_origins,
+            federation.pending_launches_path(config).as_path(),
+            &excluded,
+        );
         accounts.insert(
             name.clone(),
             PeerAccount {
@@ -862,36 +875,38 @@ pub fn build_local_record(config: &Config, now: DateTime<Utc>) -> Result<PeerRec
 
 /// Per-account, per-pool state plus the origin URLs of the workspaces the
 /// pool's actuator would seed (§28.4/§28.10).
+#[allow(clippy::too_many_arguments)] // Read-only projection needs the account, host and on-disk views together.
 fn pool_states(
     account: &AccountConfig,
     name: &str,
+    local_host: &str,
     status: &BTreeMap<String, StatusDigest>,
     state: &crate::state::State,
     origins: &mut BTreeMap<String, String>,
+    pending_path: &Path,
+    excluded: &BTreeSet<PathBuf>,
 ) -> BTreeMap<String, PeerPool> {
     let readiness = status.get(name);
     let quota_sample = freshest_window(state, name);
     let mut pools = BTreeMap::new();
-    let demand_path = seed_demand_state(account);
+    let demand_path = seed_demand_state(account, local_host);
     let demand = demand_path.as_deref().map(read_demand).unwrap_or_default();
-    for (path, url) in seed_origins(&demand) {
+    for (path, url) in local_seed_origins(account, local_host, &demand) {
         origins.insert(path, url);
     }
+    let key = pool_key(account, name, local_host);
     pools.insert(
-        pool_key(account, name),
+        key.clone(),
         PeerPool {
             governed_workers: readiness
                 .and_then(|readiness| readiness.current_workers)
                 .unwrap_or(0),
-            pending_launches: 0,
+            pending_launches: crate::ownership::read_pending_launches(pending_path, &key),
             desired: readiness
                 .and_then(|readiness| readiness.desired_workers)
                 .unwrap_or(0),
             quota_sample,
-            ready_demand: PeerReadyDemand {
-                ready_beads: demand.ready_bead_count.unwrap_or(0),
-                eligible_backlog_capacity: demand.eligible_backlog_capacity,
-            },
+            ready_demand: demand.ready_demand(excluded),
         },
     );
     pools
@@ -899,13 +914,13 @@ fn pool_states(
 
 /// A pool is identified by its worker prefix when one is configured
 /// (§28.9) and by the account id otherwise.
-fn pool_key(account: &AccountConfig, name: &str) -> String {
-    identifier_prefix(account).unwrap_or_else(|| name.to_owned())
+fn pool_key(account: &AccountConfig, name: &str, local_host: &str) -> String {
+    identifier_prefix(account, local_host).unwrap_or_else(|| name.to_owned())
 }
 
-fn identifier_prefix(account: &AccountConfig) -> Option<String> {
+fn identifier_prefix(account: &AccountConfig, local_host: &str) -> Option<String> {
     let actuator = match &account.fleet.hosts {
-        Some(hosts) => hosts.values().find_map(|host| match &host.actuator {
+        Some(hosts) => hosts.get(local_host).and_then(|host| match &host.actuator {
             crate::config::ActuatorConfig::NeedleRun {
                 identifier_prefix, ..
             } => identifier_prefix.clone(),
@@ -919,24 +934,39 @@ fn identifier_prefix(account: &AccountConfig) -> Option<String> {
         },
     };
     actuator.or_else(|| {
-        account
-            .fleet
-            .observer
-            .as_ref()
-            .and_then(|observer| match observer {
-                crate::config::WorkerObserverConfig::NeedleStatus {
-                    identifier_prefix, ..
-                } => identifier_prefix.clone(),
-                _ => None,
-            })
+        match &account.fleet.hosts {
+            Some(hosts) => hosts.get(local_host).map(|host| &host.observer),
+            None => account.fleet.observer.as_ref(),
+        }
+        .and_then(|observer| match observer {
+            crate::config::WorkerObserverConfig::NeedleStatus {
+                identifier_prefix, ..
+            } => identifier_prefix.clone(),
+            _ => None,
+        })
     })
+}
+
+/// Worker prefixes this instance claims. Startup compares these with the
+/// pools in every freshly pulled peer record before any actuation.
+pub fn local_worker_prefixes(config: &Config) -> BTreeMap<String, String> {
+    let Some(federation) = &config.federation else {
+        return BTreeMap::new();
+    };
+    config
+        .accounts
+        .iter()
+        .filter_map(|(name, account)| {
+            identifier_prefix(account, &federation.host_id).map(|prefix| (name.clone(), prefix))
+        })
+        .collect()
 }
 
 /// The demand-state file of the actuator on this instance's own host
 /// (§26.5); `None` when the account has no needle_run actuator.
-fn seed_demand_state(account: &AccountConfig) -> Option<PathBuf> {
+fn seed_demand_state(account: &AccountConfig, local_host: &str) -> Option<PathBuf> {
     match &account.fleet.hosts {
-        Some(hosts) => hosts.values().find_map(|host| match &host.actuator {
+        Some(hosts) => hosts.get(local_host).and_then(|host| match &host.actuator {
             crate::config::ActuatorConfig::NeedleRun {
                 seed_demand_state, ..
             } => seed_demand_state.clone(),
@@ -949,6 +979,46 @@ fn seed_demand_state(account: &AccountConfig) -> Option<PathBuf> {
             _ => None,
         },
     }
+}
+
+/// Origins of this instance's own seedable workspace candidates. A pull
+/// compares this view with peer records before updating overlap exclusions.
+pub fn local_workspace_origins(config: &Config) -> BTreeMap<String, String> {
+    let Some(federation) = &config.federation else {
+        return BTreeMap::new();
+    };
+    let mut origins = BTreeMap::new();
+    for account in config.accounts.values() {
+        let demand = seed_demand_state(account, &federation.host_id)
+            .as_deref()
+            .map(read_demand)
+            .unwrap_or_default();
+        origins.extend(local_seed_origins(account, &federation.host_id, &demand));
+    }
+    origins
+}
+
+fn local_seed_origins(
+    account: &AccountConfig,
+    local_host: &str,
+    demand: &DemandDigest,
+) -> BTreeMap<String, String> {
+    let mut origins = seed_origins(demand);
+    if seed_demand_state(account, local_host).is_none() {
+        let actuator = match &account.fleet.hosts {
+            Some(hosts) => hosts.get(local_host).map(|host| &host.actuator),
+            None => Some(&account.fleet.actuator),
+        };
+        if let Some(crate::config::ActuatorConfig::NeedleRun { repo, .. }) = actuator {
+            if let Some(url) = git_origin(repo) {
+                origins.insert(
+                    repo.display().to_string(),
+                    sanitize_origin(&url).into_owned(),
+                );
+            }
+        }
+    }
+    origins
 }
 
 /// The account's freshest window sample, keyed by window id (§28.4: "the
@@ -1030,10 +1100,48 @@ struct DemandDigest {
     ready: Vec<DemandWorkspace>,
 }
 
+impl DemandDigest {
+    fn ready_demand(&self, excluded: &BTreeSet<PathBuf>) -> PeerReadyDemand {
+        if excluded.is_empty() {
+            return PeerReadyDemand {
+                ready_beads: self.ready_bead_count.unwrap_or(0),
+                eligible_backlog_capacity: self.eligible_backlog_capacity,
+            };
+        }
+        PeerReadyDemand {
+            ready_beads: self
+                .workspaces
+                .iter()
+                .filter(|w| {
+                    w.workspace
+                        .as_ref()
+                        .is_some_and(|p| !excluded.contains(Path::new(p)))
+                })
+                .map(|w| w.ready_beads.unwrap_or(0))
+                .sum(),
+            eligible_backlog_capacity: Some(
+                self.workspaces
+                    .iter()
+                    .filter(|w| {
+                        w.workspace
+                            .as_ref()
+                            .is_some_and(|p| !excluded.contains(Path::new(p)))
+                    })
+                    .map(|w| w.eligible_slots.unwrap_or(0))
+                    .sum(),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct DemandWorkspace {
     #[serde(default)]
     workspace: Option<String>,
+    #[serde(default)]
+    ready_beads: Option<u32>,
+    #[serde(default)]
+    eligible_slots: Option<u32>,
 }
 
 /// Git origin URLs for the workspaces this instance will seed (§28.4),
@@ -1162,6 +1270,30 @@ mod tests {
     use super::*;
     use crate::config::{FederationConfig, FleetConfig, SourceConfig};
     use chrono::Duration;
+
+    #[test]
+    fn excluded_workspace_contributes_no_ready_demand() {
+        let demand = DemandDigest {
+            ready_bead_count: Some(5),
+            eligible_backlog_capacity: Some(3),
+            workspaces: vec![
+                DemandWorkspace {
+                    workspace: Some("/work/contested".into()),
+                    ready_beads: Some(4),
+                    eligible_slots: Some(2),
+                },
+                DemandWorkspace {
+                    workspace: Some("/work/allowed".into()),
+                    ready_beads: Some(1),
+                    eligible_slots: Some(1),
+                },
+            ],
+            ready: Vec::new(),
+        };
+        let allowed = demand.ready_demand(&BTreeSet::from([PathBuf::from("/work/contested")]));
+        assert_eq!(allowed.ready_beads, 1);
+        assert_eq!(allowed.eligible_backlog_capacity, Some(1));
+    }
 
     fn sample_record() -> PeerRecord {
         PeerRecord {
@@ -1394,6 +1526,9 @@ mod tests {
                 peers: Vec::new(),
                 peer_stale_after_seconds: 120,
                 peer_expiry_seconds: 1_800,
+                primary: true,
+                repo_owners: BTreeMap::new(),
+                pending_launches_file: None,
             }),
         }
     }

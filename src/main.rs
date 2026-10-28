@@ -19,6 +19,7 @@ use subscription_governor::controller::{
 };
 use subscription_governor::fleet;
 use subscription_governor::model::ResourceSnapshot;
+use subscription_governor::ownership::{self, OwnershipCycle};
 use subscription_governor::placement::{self, HostPlacement};
 use subscription_governor::source;
 use subscription_governor::state::{State, StateLock};
@@ -348,6 +349,17 @@ fn status(config: &Config) -> Result<(), GovernorError> {
 fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorError> {
     let state_path = config.state_path();
     let _lock = StateLock::acquire(&state_path).map_err(GovernorError::State)?;
+    if config
+        .federation
+        .as_ref()
+        .is_some_and(|f| !f.peers.is_empty())
+    {
+        let initial =
+            ownership::refresh_ownership(&config, Utc::now()).map_err(GovernorError::State)?;
+        for event in initial.events {
+            println!("{event}");
+        }
+    }
     let (mut state, quarantined) = State::load(&state_path).map_err(GovernorError::State)?;
     if let Some(quarantined) = quarantined {
         eprintln!(
@@ -385,11 +397,18 @@ fn run(config: Config, once: bool, observe_only: bool) -> Result<(), GovernorErr
             .expect("cycle_metrics always serializes")
         );
         state.save(&state_path).map_err(GovernorError::State)?;
-        if let Err(error) = merge_status_report(&status_path, &outcome.statuses) {
+        let status_result = merge_status_report(&status_path, &outcome.statuses);
+        if let Err(error) = &status_result {
             eprintln!(
                 "{}",
                 json!({"event": "status_write_error", "time": Utc::now(), "error": format!("{error:#}")})
             );
+        }
+        if status_result.is_ok() && outcome.actuation_failures == 0 {
+            if let Some(federation) = &config.federation {
+                ownership::clear_pending_launches(&federation.pending_launches_path(&config))
+                    .map_err(GovernorError::State)?;
+            }
         }
         if once {
             if outcome.actuation_failures > 0 {
@@ -923,6 +942,93 @@ fn banked_reset_advisory_event(
     })
 }
 
+fn federated(config: &Config) -> bool {
+    config
+        .federation
+        .as_ref()
+        .is_some_and(|f| !f.peers.is_empty())
+}
+
+fn ownership_for_cycle(config: &Config) -> OwnershipCycle {
+    if !federated(config) {
+        return OwnershipCycle::default();
+    }
+    match ownership::refresh_ownership(config, Utc::now()) {
+        Ok(cycle) => {
+            for event in &cycle.events {
+                println!("{event}");
+            }
+            cycle
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                json!({"event":"ownership_error","time":Utc::now(),"error":format!("{error:#}")})
+            );
+            let federation = config.federation.as_ref().expect("federated config");
+            OwnershipCycle {
+                fresh: false,
+                excluded: ownership::read_workspace_exclusions(
+                    &federation.workspace_exclusions_path(config),
+                ),
+                events: Vec::new(),
+                records: Vec::new(),
+            }
+        }
+    }
+}
+
+fn gate_federated_launch(
+    config: &Config,
+    account: &str,
+    current: u32,
+    desired: u32,
+    controller_total: u32,
+    now: DateTime<Utc>,
+) -> Result<u32> {
+    if desired <= current {
+        return Ok(desired);
+    }
+    let federation = config.federation.as_ref().context("federation missing")?;
+    let prefix = subscription_governor::federation::local_worker_prefixes(config)
+        .remove(account)
+        .unwrap_or_else(|| account.to_owned());
+    let path = federation.pending_launches_path(config);
+    let pending = ownership::read_pending_launches(&path, &prefix);
+    let identity = federation
+        .account_identities
+        .get(account)
+        .map(String::as_str)
+        .unwrap_or(account);
+    let fingerprint = subscription_governor::federation::account_fingerprint(identity);
+    let gated = ownership::gate_launch(
+        desired - current,
+        ownership::local_step_limit(config, account),
+        current,
+        pending,
+        &fingerprint,
+        &prefix,
+        &path,
+        controller_total,
+        ownership::step_up_bound(config, account),
+        now,
+        || {
+            let cycle = ownership::refresh_ownership(config, Utc::now())?;
+            if !cycle.fresh {
+                anyhow::bail!("a configured peer did not answer the launch re-pull");
+            }
+            for event in cycle.events {
+                println!("{event}");
+            }
+            Ok(cycle.records)
+        },
+    )?;
+    for event in gated.events {
+        println!("{event}");
+    }
+    Ok(current.saturating_add(gated.permitted))
+}
+
 fn run_cycle(
     config: &Config,
     state: &mut State,
@@ -930,6 +1036,7 @@ fn run_cycle(
     shutdown: &AtomicBool,
 ) -> CycleOutcome {
     let mut outcome = CycleOutcome::default();
+    let ownership = ownership_for_cycle(config);
     for (name, account_config) in &config.accounts {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -1017,6 +1124,25 @@ fn run_cycle(
                 );
                 state.accounts.entry(name.clone()).or_default().backpressure = next_backpressure;
             }
+            if federated(config)
+                && !observe_only
+                && host_current.is_none()
+                && decision.desired_workers > workers
+            {
+                decision.desired_workers = if ownership.fresh {
+                    gate_federated_launch(
+                        config,
+                        name,
+                        workers,
+                        decision.desired_workers,
+                        decision.desired_workers,
+                        now,
+                    )
+                    .map_err(AccountFailure::Actuation)?
+                } else {
+                    workers
+                };
+            }
             let readiness = readiness_for_decision(&decision);
             metrics.apply_decision(&decision, readiness.reason.clone(), now);
             if let Some(banked) = &decision.banked_resets {
@@ -1037,7 +1163,7 @@ fn run_cycle(
 
             if let Some(current) = &host_current {
                 let resources = collect_host_resources(name, account_config);
-                let placements = placement::place(
+                let mut placements = placement::place(
                     name,
                     decision.desired_workers,
                     account_config,
@@ -1046,6 +1172,30 @@ fn run_cycle(
                     now,
                 )
                 .map_err(AccountFailure::Observation)?;
+                if federated(config) && !observe_only {
+                    let local_host = &config
+                        .federation
+                        .as_ref()
+                        .expect("federated config")
+                        .host_id;
+                    if let Some(local) = placements.iter_mut().find(|p| &p.host_id == local_host) {
+                        if local.target > local.current {
+                            local.target = if ownership.fresh {
+                                gate_federated_launch(
+                                    config,
+                                    name,
+                                    local.current,
+                                    local.target,
+                                    decision.desired_workers,
+                                    now,
+                                )
+                                .map_err(AccountFailure::Actuation)?
+                            } else {
+                                local.current
+                            };
+                        }
+                    }
+                }
                 let records = host_decision_records(&placements, &resources);
                 metrics.apply_host_placements(&records);
                 host_records = Some(records);
@@ -1056,8 +1206,21 @@ fn run_cycle(
             let actuated = if observe_only {
                 false
             } else if let Some(placements) = &host_placements {
-                let outcomes = fleet::actuate_host_targets(account_config, placements)
-                    .map_err(AccountFailure::Actuation)?;
+                let outcomes = if federated(config) {
+                    let federation = config.federation.as_ref().expect("federated config");
+                    let excluded = ownership::read_workspace_exclusions(
+                        &federation.workspace_exclusions_path(config),
+                    );
+                    fleet::actuate_host_targets_local(
+                        account_config,
+                        placements,
+                        &federation.host_id,
+                        &excluded,
+                    )
+                } else {
+                    fleet::actuate_host_targets(account_config, placements)
+                }
+                .map_err(AccountFailure::Actuation)?;
                 metrics.actuation_succeeded = Some(true);
                 let any_actuated = outcomes.values().any(|outcome| outcome.actuated);
                 if outcomes
@@ -1085,9 +1248,21 @@ fn run_cycle(
                 host_actuation = Some(outcomes);
                 any_actuated
             } else {
-                let actuation =
-                    fleet::actuate(&account_config.fleet, workers, decision.desired_workers)
-                        .map_err(AccountFailure::Actuation)?;
+                let excluded = config
+                    .federation
+                    .as_ref()
+                    .filter(|f| !f.peers.is_empty())
+                    .map(|f| {
+                        ownership::read_workspace_exclusions(&f.workspace_exclusions_path(config))
+                    })
+                    .unwrap_or_else(|| ownership.excluded.clone());
+                let actuation = fleet::actuate_with_exclusions(
+                    &account_config.fleet,
+                    workers,
+                    decision.desired_workers,
+                    &excluded,
+                )
+                .map_err(AccountFailure::Actuation)?;
                 metrics.actuation_succeeded = Some(true);
                 observed_after_actuation = actuation.observed_workers;
                 actuation.actuated

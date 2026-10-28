@@ -131,6 +131,9 @@ impl FakePeer {
                 peers: Vec::new(),
                 peer_stale_after_seconds: 120,
                 peer_expiry_seconds: 1_800,
+                primary: true,
+                repo_owners: BTreeMap::new(),
+                pending_launches_file: None,
             }),
         };
         Self { config, _dir: dir }
