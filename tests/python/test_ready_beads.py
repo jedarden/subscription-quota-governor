@@ -27,6 +27,20 @@ class ReadyBeadsTests(unittest.TestCase):
         return {'host': 'codinghome', 'agent': 'codex-test', 'max_workers': 12,
                 'demand': {'workspaces': [str(path) for path in paths]}}
 
+    def test_yaml_flow_list_policy_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.workspace(Path(tmp), policy='bead_cli:\n  backend: bead-rs\nstrands:\n  pluck:\n    exclude_labels: [deferred, human, blocked]\n')
+            fields = demand.policy_fields(path / '.needle.yaml', {('strands', 'pluck', 'exclude_labels')})
+            self.assertEqual(fields[('strands', 'pluck', 'exclude_labels')], ['deferred', 'human', 'blocked'])
+
+    def test_unreadable_policy_blocks_only_that_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self.workspace(Path(tmp), 'good')
+            bad = self.workspace(Path(tmp), 'bad', policy='bead_cli:\n  backend: bead-rs\nstrands:\n  pluck:\n    exclude_labels: [unterminated\n')
+            with patch.object(demand, 'ready_issues', return_value=[]):
+                result = demand.observe(self.settings(good, bad))
+            self.assertIn({'workspace': str(bad), 'reason': 'policy_unreadable'}, result['blocked'])
+
     def test_native_fixture_filters_holds_and_counts_unlabelled_ready_beads(self):
         with tempfile.TemporaryDirectory() as temp:
             route = self.workspace(Path(temp))

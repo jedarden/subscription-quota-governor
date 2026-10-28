@@ -22,7 +22,16 @@ BUILD_MARKERS = ('Cargo.toml', 'go.mod', 'CMakeLists.txt', 'pom.xml', 'build.gra
 def scalar(value):
     value = value.strip()
     if value.startswith(('"', '[')):
-        return json.loads(value)
+        try:
+            return json.loads(value)
+        except ValueError:
+            # YAML flow sequence of plain words, e.g. [deferred, human].
+            body = value.split('#', 1)[0].strip()
+            if body.startswith('[') and body.endswith(']'):
+                items = [item.strip() for item in body[1:-1].split(',') if item.strip()]
+                if all(re.fullmatch(r'[A-Za-z0-9_./~:@+=-]+', item) for item in items):
+                    return items
+            raise
     if value.startswith("'"):
         if not value.endswith("'"):
             raise ValueError('invalid quoted policy scalar')
@@ -254,7 +263,13 @@ def observe(settings, busy=(), unowned_floor=0):
     blocked = []
     selected = []
     for route in routes(settings):
-        if not policy_ok(route, settings['host']):
+        try:
+            owned = policy_ok(route, settings['host'])
+        except (ValueError, OSError):
+            # One unreadable workspace policy must never fail the whole fleet.
+            blocked.append({'workspace': route, 'reason': 'policy_unreadable'})
+            continue
+        if not owned:
             blocked.append({'workspace': route, 'reason': 'backend_or_queue_owner'})
         elif gate_reason := gate_degraded(settings, route):
             blocked.append({'workspace': route, 'reason': gate_reason})
