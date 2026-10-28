@@ -12,7 +12,9 @@ Build `subgov` from a committed revision on codinghome. Install the one binary
 as `/home/coding/.local/bin/subgov` on gmktec and compare its SHA-256 with the
 source artifact. A codinghome Nix build may need its referenced runtime store
 paths copied to gmktec with `nix copy --to ssh-ng://gmktec` before it executes;
-verify the binary on gmktec before enabling the unit.
+root those runtime paths with `nix-store --realise --add-root ... --indirect`
+under `~/.needle/subgov/` so garbage collection cannot remove them. Verify
+the binary on gmktec before enabling the unit.
 
 Install `codex.yaml` as `~/.config/subgov/codex.yaml` (mode 0600),
 `needle-config.yaml` as `~/.config/needle/config.yaml`, and the Codex adapter
@@ -39,8 +41,10 @@ account identity, fresh `subgov peers` on each host, distinct worker prefixes,
 and no origin overlap for the seed repository. Require a ready, admitted bead
 in that repository and a fresh positive demand file. A shared-origin repository
 requires an explicit owner and exclusion from every other host's NEEDLE route.
-Keep the combined step-up bound within the account worker reserve. Record the
-first successful governed claim and its host on the owning bead.
+Verify that the running binary applies the shared account total and that each
+peer record publishes a capacity bound appropriate to its host. Keep the
+combined step-up bound within the account worker reserve. Record the first
+successful governed claim and its host on the owning bead.
 
 Expand the workspace list and other account pools only after the first pool
 has stable placement. The seven-day acceptance window, one real quota reset,
