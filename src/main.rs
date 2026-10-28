@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -79,6 +79,12 @@ enum Commands {
     PeerState {
         /// Print the machine-readable peer record (the only format).
         #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Pull configured peers and report freshness, workers and ownership overlap.
+    Peers {
+        /// Print the report as one JSON object.
+        #[arg(long)]
         json: bool,
     },
     /// Read a no-secret inventory and reject overlapping controller ownership.
@@ -174,6 +180,7 @@ fn run_cli() -> Result<(), GovernorError> {
         Commands::Status => status(&config),
         Commands::PeerState { json: true } => peer_state(&config),
         Commands::PeerState { json: false } => unreachable!("clap requires --json"),
+        Commands::Peers { json } => peers(&config, json),
         Commands::Doctor => doctor(&config),
         Commands::Preflight { .. } => unreachable!("preflight handled before config loading"),
         Commands::Dashboard { .. } => unreachable!("dashboard handled before config loading"),
@@ -307,6 +314,439 @@ fn peer_state(config: &Config) -> Result<(), GovernorError> {
         .map_err(GovernorError::State)?;
     println!("{}", record.to_json().map_err(GovernorError::State)?);
     Ok(())
+}
+
+/// A live, one-shot peer probe. Its freshness is measured from this command's
+/// receipt, as in the controller's PeerTable. The peer's wall-clock timestamp
+/// is displayed only as a diagnostic; it never decides freshness (§28.7).
+#[derive(Debug, Serialize)]
+struct PeerReport {
+    host_id: String,
+    generated_at: DateTime<Utc>,
+    peer_stale_after_seconds: u64,
+    peer_expiry_seconds: u64,
+    peers: Vec<PeerStatus>,
+    workers_per_host: BTreeMap<String, BTreeMap<String, Option<u32>>>,
+    overlap_complete: bool,
+    workspace_overlaps: Vec<WorkspaceOverlap>,
+    prefix_overlaps: Vec<PrefixOverlap>,
+}
+
+#[derive(Debug, Serialize)]
+struct PeerStatus {
+    host_id: String,
+    staleness: &'static str,
+    /// Age of the peer's claimed publication time, for diagnosis only.
+    record_age_seconds: Option<i64>,
+    observed_at: Option<DateTime<Utc>>,
+    error: Option<&'static str>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LocalWorkerDigest {
+    #[serde(default)]
+    current_workers: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceOverlap {
+    origin: String,
+    paths_by_host: BTreeMap<String, Vec<String>>,
+    owner: String,
+    excluded_hosts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrefixOverlap {
+    prefix: String,
+    hosts: Vec<String>,
+}
+
+fn peers(config: &Config, as_json: bool) -> Result<(), GovernorError> {
+    use subscription_governor::federation::{
+        self, PeerFreshness, PeerMoment, PeerPullError, PeerRecord, PeerRejection, PeerTable,
+    };
+
+    let federation = config.federation.as_ref().ok_or_else(|| {
+        GovernorError::CliOrConfig(anyhow!(
+            "peers requires a federation: block (federation.host_id)"
+        ))
+    })?;
+    let local_origins = federation::local_workspace_origins(config);
+    let mut workers_per_host = BTreeMap::new();
+    let local_status: BTreeMap<String, LocalWorkerDigest> = fs::read(config.status_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    workers_per_host.insert(
+        federation.host_id.clone(),
+        config
+            .accounts
+            .keys()
+            .map(|account| {
+                (
+                    account.clone(),
+                    local_status
+                        .get(account)
+                        .and_then(|status| status.current_workers),
+                )
+            })
+            .collect(),
+    );
+
+    let mut table = PeerTable::new(federation, Instant::now());
+    let mut records: Vec<PeerRecord> = Vec::new();
+    let mut statuses = Vec::new();
+    for peer in &federation.peers {
+        let fetched = federation::pull_peer_record(peer);
+        let pulled_record = fetched.as_ref().ok().cloned();
+        let now = PeerMoment::now();
+        let accepted = table.ingest(peer, fetched, &now);
+        // Ingest owns its result, while the report needs the accepted record.
+        // A failed or rejected pull contributes no workers or overlap claims.
+        let status = match accepted {
+            Ok(()) => {
+                let record = pulled_record.expect("accepted pull has a record");
+                let mut account_workers: BTreeMap<String, Option<u32>> = config
+                    .accounts
+                    .keys()
+                    .map(|account| (account.clone(), Some(0)))
+                    .collect();
+                for (account, details) in &record.accounts {
+                    account_workers.insert(
+                        account.clone(),
+                        Some(details.pools.values().fold(0u32, |total, pool| {
+                            total.saturating_add(pool.governed_workers)
+                        })),
+                    );
+                }
+                workers_per_host.insert(peer.host_id.clone(), account_workers);
+                let freshness = table.freshness(&peer.host_id, &now);
+                let status = PeerStatus {
+                    host_id: peer.host_id.clone(),
+                    staleness: match freshness {
+                        Some(PeerFreshness::Fresh) => "fresh",
+                        Some(PeerFreshness::Stale) => "stale",
+                        Some(PeerFreshness::Expired) => "expired",
+                        None => "unknown",
+                    },
+                    record_age_seconds: Some((now.wall - record.observed_at).num_seconds()),
+                    observed_at: Some(record.observed_at),
+                    error: None,
+                };
+                records.push(record);
+                status
+            }
+            Err(error) => {
+                workers_per_host.insert(
+                    peer.host_id.clone(),
+                    config
+                        .accounts
+                        .keys()
+                        .map(|account| (account.clone(), None))
+                        .collect(),
+                );
+                let reason = match error {
+                    PeerRejection::FetchFailed {
+                        source: PeerPullError::Transport { .. },
+                    } => "transport_failed",
+                    PeerRejection::FetchFailed {
+                        source: PeerPullError::Record { .. },
+                    } => "invalid_record",
+                    PeerRejection::ClockSkew { .. } => "clock_skew",
+                    PeerRejection::HostMismatch { .. } => "host_mismatch",
+                    PeerRejection::Unconfigured { .. } => "unconfigured_peer",
+                };
+                PeerStatus {
+                    host_id: peer.host_id.clone(),
+                    staleness: "stale",
+                    record_age_seconds: None,
+                    observed_at: None,
+                    error: Some(reason),
+                }
+            }
+        };
+        statuses.push(status);
+    }
+
+    let (workspace_overlaps, prefix_overlaps) = peer_overlaps(
+        &federation.host_id,
+        &local_origins,
+        &federation::local_worker_prefixes(config),
+        &records,
+        &federation.repo_owners,
+    );
+    let report = PeerReport {
+        host_id: federation.host_id.clone(),
+        generated_at: Utc::now(),
+        peer_stale_after_seconds: federation.peer_stale_after_seconds,
+        peer_expiry_seconds: federation.peer_expiry_seconds,
+        peers: statuses,
+        workers_per_host,
+        overlap_complete: records.len() == federation.peers.len(),
+        workspace_overlaps,
+        prefix_overlaps,
+    };
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).map_err(|error| GovernorError::State(error.into()))?
+        );
+    } else {
+        print_peer_report(&report);
+    }
+    Ok(())
+}
+
+fn peer_overlaps(
+    local_host: &str,
+    local_origins: &BTreeMap<String, String>,
+    local_prefixes: &BTreeMap<String, String>,
+    records: &[subscription_governor::federation::PeerRecord],
+    repo_owners: &BTreeMap<String, String>,
+) -> (Vec<WorkspaceOverlap>, Vec<PrefixOverlap>) {
+    let mut origins: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    let mut prefixes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (path, origin) in local_origins {
+        origins
+            .entry(report_origin(origin))
+            .or_default()
+            .entry(local_host.to_owned())
+            .or_default()
+            .push(path.clone());
+    }
+    for prefix in local_prefixes.values() {
+        prefixes
+            .entry(prefix.clone())
+            .or_default()
+            .insert(local_host.to_owned());
+    }
+    for record in records {
+        for (path, origin) in &record.workspace_origins {
+            origins
+                .entry(report_origin(origin))
+                .or_default()
+                .entry(record.host_id.clone())
+                .or_default()
+                .push(path.clone());
+        }
+        for prefix in ownership::claimed_prefixes(record) {
+            prefixes
+                .entry(prefix)
+                .or_default()
+                .insert(record.host_id.clone());
+        }
+    }
+    let workspace_overlaps = origins
+        .into_iter()
+        .filter_map(|(origin, paths_by_host)| {
+            if paths_by_host.len() < 2 {
+                return None;
+            }
+            let owner = ownership::workspace_owner(
+                &origin,
+                repo_owners,
+                paths_by_host.keys().map(String::as_str),
+            );
+            let excluded_hosts = paths_by_host
+                .keys()
+                .filter(|host| **host != owner)
+                .cloned()
+                .collect();
+            Some(WorkspaceOverlap {
+                origin,
+                paths_by_host,
+                owner,
+                excluded_hosts,
+            })
+        })
+        .collect();
+    let prefix_overlaps = prefixes
+        .into_iter()
+        .filter_map(|(prefix, hosts)| {
+            (hosts.len() > 1).then_some(PrefixOverlap {
+                prefix,
+                hosts: hosts.into_iter().collect(),
+            })
+        })
+        .collect();
+    (workspace_overlaps, prefix_overlaps)
+}
+
+/// Peer records normally contain sanitized git origins. Normalize again at
+/// this output boundary because a remote record can still carry userinfo.
+/// Query and fragment components are omitted because they can carry tokens.
+fn report_origin(origin: &str) -> String {
+    let base = origin.split(['?', '#']).next().unwrap_or(origin);
+    let (scheme, rest) = match base.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), base),
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}{host}{path}")
+}
+
+fn print_peer_report(report: &PeerReport) {
+    println!("host: {}", report.host_id);
+    for peer in &report.peers {
+        match (peer.record_age_seconds, peer.error) {
+            (Some(age), _) => println!(
+                "peer {}: {} (record age {}s; receiver age starts at this pull)",
+                peer.host_id, peer.staleness, age
+            ),
+            (_, Some(error)) => println!("peer {}: {} ({error})", peer.host_id, peer.staleness),
+            _ => println!("peer {}: {}", peer.host_id, peer.staleness),
+        }
+    }
+    println!("workers per host:");
+    for (host, accounts) in &report.workers_per_host {
+        for (account, count) in accounts {
+            let count = count.map_or_else(|| "unknown".to_owned(), |count| count.to_string());
+            println!("  {host} {account}: {count}");
+        }
+    }
+    if !report.overlap_complete {
+        println!("overlap: incomplete (one or more peers did not return a usable record)");
+    }
+    for overlap in &report.workspace_overlaps {
+        let hosts: Vec<_> = overlap.paths_by_host.keys().map(String::as_str).collect();
+        println!(
+            "workspace overlap {}: hosts {}, owner {}",
+            overlap.origin,
+            hosts.join(", "),
+            overlap.owner
+        );
+    }
+    for overlap in &report.prefix_overlaps {
+        println!(
+            "worker prefix overlap {}: hosts {}",
+            overlap.prefix,
+            overlap.hosts.join(", ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_report_tests {
+    use super::*;
+    use subscription_governor::federation::{
+        PeerAccount, PeerPool, PeerReadyDemand, PeerRecord, PEER_RECORD_SCHEMA_VERSION,
+    };
+
+    fn record(host: &str, origin: &str, prefix: &str) -> PeerRecord {
+        PeerRecord {
+            schema_version: PEER_RECORD_SCHEMA_VERSION,
+            instance_id: format!("instance-{host}"),
+            host_id: host.to_owned(),
+            record_seq: 1,
+            observed_at: Utc::now(),
+            accounts: BTreeMap::from([(
+                "acct".to_owned(),
+                PeerAccount {
+                    account_id: "acct".to_owned(),
+                    account_fingerprint: subscription_governor::federation::account_fingerprint(
+                        "acct",
+                    ),
+                    pools: BTreeMap::from([(
+                        prefix.to_owned(),
+                        PeerPool {
+                            governed_workers: 2,
+                            pending_launches: 0,
+                            desired: 2,
+                            quota_sample: None,
+                            ready_demand: PeerReadyDemand::default(),
+                        },
+                    )]),
+                },
+            )]),
+            host_ceiling: None,
+            host_reservations: BTreeMap::new(),
+            resource_reserve: None,
+            workspace_origins: BTreeMap::from([(format!("/work/{host}"), origin.to_owned())]),
+        }
+    }
+
+    #[test]
+    fn reports_workspace_and_worker_prefix_overlap_with_explicit_owner() {
+        let local_origins = BTreeMap::from([(
+            "/work/local".to_owned(),
+            "https://example.test/repo.git".to_owned(),
+        )]);
+        let local_prefixes = BTreeMap::from([("acct".to_owned(), "sg-acct-".to_owned())]);
+        let records = vec![record(
+            "remote",
+            "https://example.test/repo.git",
+            "sg-acct-",
+        )];
+        let owners = BTreeMap::from([(
+            "https://example.test/repo.git".to_owned(),
+            "remote".to_owned(),
+        )]);
+
+        let (workspaces, prefixes) =
+            peer_overlaps("local", &local_origins, &local_prefixes, &records, &owners);
+
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].owner, "remote");
+        assert_eq!(workspaces[0].excluded_hosts, vec!["local"]);
+        assert_eq!(workspaces[0].paths_by_host["local"], vec!["/work/local"]);
+        assert_eq!(workspaces[0].paths_by_host["remote"], vec!["/work/remote"]);
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(prefixes[0].prefix, "sg-acct-");
+        assert_eq!(prefixes[0].hosts, vec!["local", "remote"]);
+    }
+
+    #[test]
+    fn reports_peer_to_peer_overlap_without_local_claim() {
+        let records = vec![
+            record("zeta", "https://example.test/shared.git", "sg-zeta-"),
+            record("alpha", "https://example.test/shared.git", "sg-alpha-"),
+        ];
+        let (workspaces, prefixes) = peer_overlaps(
+            "local",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &records,
+            &BTreeMap::new(),
+        );
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].owner, "alpha");
+        assert_eq!(workspaces[0].excluded_hosts, vec!["zeta"]);
+        assert!(prefixes.is_empty());
+    }
+
+    #[test]
+    fn redacts_peer_origin_userinfo_before_overlap_reporting() {
+        let local_origins = BTreeMap::from([(
+            "/work/local".to_owned(),
+            "https://example.test/repo.git".to_owned(),
+        )]);
+        let records = vec![record(
+            "remote",
+            "https://user:secret-token@example.test/repo.git?access_key=private",
+            "sg-remote-",
+        )];
+        let (workspaces, _) = peer_overlaps(
+            "local",
+            &local_origins,
+            &BTreeMap::new(),
+            &records,
+            &BTreeMap::new(),
+        );
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].origin, "https://example.test/repo.git");
+        let output = serde_json::to_string(&workspaces).unwrap();
+        assert!(!output.contains("secret-token"));
+        assert!(!output.contains("access_key"));
+        assert_eq!(
+            report_origin("git:secret-token@example.test:repo.git"),
+            "example.test:repo.git"
+        );
+    }
 }
 
 fn status(config: &Config) -> Result<(), GovernorError> {

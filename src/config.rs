@@ -851,16 +851,7 @@ fn validate_backpressure(policy: &BackpressureConfig, account: &str) -> Result<(
 /// (WP28) the peer list and §28.7 staleness bounds. WP31 extends this with
 /// repo_owners, `subgov peers`/`check`, and the state schema migration.
 fn validate_federation(federation: &FederationConfig, config: &Config) -> Result<()> {
-    if federation.host_id.trim().is_empty() || federation.host_id.chars().any(char::is_whitespace) {
-        bail!("federation.host_id must be non-empty and free of whitespace");
-    }
-    if !federation
-        .host_id
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        bail!("federation.host_id must contain only a-z, 0-9 and '-' for worker identity");
-    }
+    validate_host_id(&federation.host_id, "federation.host_id")?;
     for (origin, owner) in &federation.repo_owners {
         if origin.trim().is_empty() || owner.trim().is_empty() {
             bail!("federation.repo_owners requires non-empty origin URLs and host ids");
@@ -883,9 +874,7 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
     }
     let mut peer_hosts = BTreeSet::new();
     for peer in &federation.peers {
-        if peer.host_id.trim().is_empty() || peer.host_id.chars().any(char::is_whitespace) {
-            bail!("federation.peers[].host_id must be non-empty and free of whitespace");
-        }
+        validate_host_id(&peer.host_id, "federation.peers[].host_id")?;
         if peer.host_id == federation.host_id {
             bail!(
                 "federation.peers lists this instance's own host {}: a peer is another subgov on a different host (plan.md §28.2)",
@@ -939,8 +928,13 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
                 bail!("account {name}: federated needle_run requires an identifier_prefix");
             }
             if let Some(prefix) = prefix_map.get(name) {
-                if !local_prefixes.insert(prefix.clone()) {
-                    bail!("account {name}: worker prefix {prefix} is already claimed by another local account");
+                let effective = crate::ownership::effective_prefix(
+                    prefix,
+                    &federation.host_id,
+                    federation.primary,
+                );
+                if !local_prefixes.insert(effective.clone()) {
+                    bail!("account {name}: worker prefix {effective} is already claimed by another local account");
                 }
             }
         }
@@ -1000,6 +994,19 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_host_id(host_id: &str, context: &str) -> Result<()> {
+    if host_id.trim().is_empty() || host_id.chars().any(char::is_whitespace) {
+        bail!("{context} must be non-empty and free of whitespace");
+    }
+    if !host_id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        bail!("{context} must contain only a-z, 0-9 and '-' for worker identity");
     }
     Ok(())
 }

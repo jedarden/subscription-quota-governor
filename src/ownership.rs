@@ -604,13 +604,25 @@ pub fn overshoot_violation(config: &Config) -> Option<(String, u32, u32)> {
 pub fn step_up_bound(config: &Config, account_name: &str) -> u32 {
     let account = &config.accounts[account_name];
     let steps = match &account.fleet.hosts {
-        Some(hosts) => hosts
-            .values()
-            .map(|host| {
-                host.max_scale_up_per_cycle
-                    .unwrap_or(account.fleet.max_scale_up_per_cycle)
-            })
-            .collect(),
+        Some(hosts) => {
+            // A peer omitted from this local host map can still run the
+            // account. Count its account-level step limit so an incomplete
+            // map cannot understate the federation's overshoot bound.
+            let mut host_ids: BTreeSet<&str> = hosts.keys().map(String::as_str).collect();
+            if let Some(federation) = &config.federation {
+                host_ids.insert(&federation.host_id);
+                host_ids.extend(federation.peers.iter().map(|peer| peer.host_id.as_str()));
+            }
+            host_ids
+                .into_iter()
+                .map(|host_id| {
+                    hosts
+                        .get(host_id)
+                        .and_then(|host| host.max_scale_up_per_cycle)
+                        .unwrap_or(account.fleet.max_scale_up_per_cycle)
+                })
+                .collect()
+        }
         None => vec![
             account.fleet.max_scale_up_per_cycle;
             config.federation.as_ref().map_or(1, |f| f.peers.len() + 1)
@@ -915,6 +927,16 @@ mod tests {
         )
         .unwrap();
         Config::load(&config_path).unwrap();
+
+        // A peer can be absent from this instance's host map while still
+        // running the account. Its fallback step must count toward the bound.
+        fs::write(
+            &config_path,
+            base("      max_scale_up_per_cycle: 3\n      hosts:\n        codinghome:\n          max_scale_up_per_cycle: 2\n          observer: { type: static, workers: 1 }\n          actuator: { type: none }"),
+        )
+        .unwrap();
+        let error = Config::load(&config_path).unwrap_err();
+        assert!(error.to_string().contains("max_step_up"), "{error}");
     }
 
     #[test]

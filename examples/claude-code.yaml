@@ -2,6 +2,12 @@ version: 1
 poll_interval_seconds: 300
 state_path: ~/.local/state/subscription-governor/claude-code.json
 
+# Optional federation identity. An empty peer list preserves single-host
+# behavior; add peer pull commands only when deploying a second host.
+federation:
+  host_id: codinghome
+  peers: []
+
 accounts:
   claude-anthropic:
     source:

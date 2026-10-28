@@ -51,6 +51,37 @@ until it has two observations in the same reset generation; zero observed delta
 is not treated as free capacity. An empty fleet starts at the configurable
 `bootstrap_workers` value so the governor can learn an initial burn rate.
 
+## Federation configuration
+
+An optional `federation` block identifies this host and its peers. An omitted
+block or an empty `peers` list preserves single-host controller decisions. The
+shipped `all-three.yaml` and `claude-code.yaml` examples show the empty list.
+
+```yaml
+federation:
+  host_id: codinghome
+  instance_id_file: /path/to/federation-instance-id
+  peers:
+    - host_id: gmktec
+      argv: [ssh, gmktec, subgov, peer-state, --json]
+  peer_stale_after_seconds: 120
+  peer_expiry_seconds: 1800
+  repo_owners:
+    https://git.example.org/team/repo.git: codinghome
+```
+
+The instance id file defaults to a sibling of `state_path`. A peer with no
+`argv` uses a bounded SSH pull. Set `primary: false` on a secondary host to
+derive host-specific worker prefixes. `subgov check` validates the static peer,
+prefix and scale-up bounds without contacting a peer; `subgov peers` pulls the
+configured peers and reports their current workers, age, staleness and workspace
+overlap. A failed pull is reported as stale.
+
+State schema v8 reads older state files. Before its first save over an older
+file, it preserves the exact prior bytes as `<state_path>.pre-v8`. To return to
+a v7 binary, stop the v8 process, restore that snapshot to `state_path`, then
+start v7. The snapshot is created once and retained for later rollback.
+
 ## Configurable utilization
 
 Utilization is a fraction from `0.0` to `1.0`. Set either a consumption target or

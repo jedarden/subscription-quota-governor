@@ -2,6 +2,12 @@ version: 1
 poll_interval_seconds: 300
 state_path: ./examples/data/demo-state.json
 
+# This host is a federation of one until peers are added. The controller's
+# account decisions are the same as when this block is omitted.
+federation:
+  host_id: codinghome
+  peers: []
+
 # This validates and exercises account separation without external fleet
 # commands. Replace static observers and none actuators using the focused
 # examples before production use.

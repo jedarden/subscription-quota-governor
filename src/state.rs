@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// read. A file with no `schema_version` at all predates versioning and is
 /// read with the current version. Earlier versions are migrated by defaulting
 /// fields added to account and host state, then advancing the version on load.
-pub const STATE_SCHEMA_VERSION: u32 = 7;
+pub const STATE_SCHEMA_VERSION: u32 = 8;
 
 fn current_schema_version() -> u32 {
     STATE_SCHEMA_VERSION
@@ -434,6 +434,113 @@ fn quarantine_path(path: &Path) -> PathBuf {
     ))
 }
 
+/// The exact older file is retained on the first v8 save so a previous
+/// binary, which refuses a newer schema, can be restarted with this file.
+/// Later v8 saves leave the snapshot alone.
+fn pre_migration_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.json");
+    path.with_file_name(format!("{file_name}.pre-v{STATE_SCHEMA_VERSION}"))
+}
+
+fn preserve_pre_migration_state(path: &Path, parent: &Path) -> Result<()> {
+    #[derive(Deserialize)]
+    struct StoredSchemaVersion {
+        schema_version: Option<u32>,
+    }
+
+    let old_bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read state {}", path.display()))
+        }
+    };
+    // Inspect the raw version separately: deserializing an unversioned file
+    // defaults it straight to v8, hiding the fact that it needs a backup.
+    let header: StoredSchemaVersion = serde_json::from_slice(&old_bytes)
+        .with_context(|| format!("invalid existing state {}", path.display()))?;
+    let version = header.schema_version.unwrap_or(0);
+    if version > STATE_SCHEMA_VERSION {
+        bail!(
+            "state {} has schema version {}, newer than the {} this binary supports; refusing to overwrite it",
+            path.display(),
+            version,
+            STATE_SCHEMA_VERSION
+        );
+    }
+    if version == STATE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    // A syntactically valid but incompatible old file is not a rollback
+    // source. Refuse to replace it instead of saving a useless snapshot.
+    serde_json::from_slice::<State>(&old_bytes)
+        .with_context(|| format!("invalid existing state {}", path.display()))?;
+
+    let snapshot = pre_migration_path(path);
+    let existing_snapshot = match fs::symlink_metadata(&snapshot) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect rollback state {}", snapshot.display())
+            })
+        }
+    };
+    if let Some(metadata) = existing_snapshot {
+        if !metadata.file_type().is_file() {
+            bail!(
+                "rollback state {} is not a regular file",
+                snapshot.display()
+            );
+        }
+        let rollback_bytes = fs::read(&snapshot)
+            .with_context(|| format!("failed to read rollback state {}", snapshot.display()))?;
+        let rollback_header: StoredSchemaVersion = serde_json::from_slice(&rollback_bytes)
+            .with_context(|| format!("invalid rollback state {}", snapshot.display()))?;
+        if rollback_header.schema_version.unwrap_or(0) >= STATE_SCHEMA_VERSION {
+            bail!(
+                "rollback state {} is not an older schema; refusing to replace state {}",
+                snapshot.display(),
+                path.display()
+            );
+        }
+        serde_json::from_slice::<State>(&rollback_bytes)
+            .with_context(|| format!("invalid rollback state {}", snapshot.display()))?;
+        return Ok(());
+    }
+    let temporary = temporary_path(&snapshot);
+    let mut created_temporary = false;
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        created_temporary = true;
+        restrict_permissions(&file)?;
+        file.write_all(&old_bytes)?;
+        file.sync_all()?;
+        // Linking a fully synced same-directory temp file publishes the
+        // snapshot only if no earlier migration already published one.
+        match fs::hard_link(&temporary, &snapshot) {
+            Ok(()) => sync_directory(parent)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to install {}", snapshot.display()))
+            }
+        }
+        Ok(())
+    })();
+    if created_temporary {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 impl State {
     /// Loads state from `path`, or `Self::default()` for a missing file (a
     /// genuine first run). A file that exists but fails to parse is moved
@@ -485,6 +592,8 @@ impl State {
         // state. Version 5 adds persisted backpressure phase/recovery state.
         // Version 6 adds opt-in saturation baseline/probe state.
         // Version 7 adds the per-generation utilization high-water mark.
+        // Version 8 marks federation-capable state; its existing per-host
+        // map already holds the necessary local samples, so no field changes.
         // All additions default empty when loading an older file.
         if state.schema_version < STATE_SCHEMA_VERSION {
             state.schema_version = STATE_SCHEMA_VERSION;
@@ -518,6 +627,13 @@ impl State {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        if self.schema_version != STATE_SCHEMA_VERSION {
+            bail!(
+                "refusing to save state with schema version {}; this binary writes version {}",
+                self.schema_version,
+                STATE_SCHEMA_VERSION
+            );
+        }
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create state directory {}", parent.display()))?;
@@ -550,6 +666,7 @@ impl State {
             })?;
             file.write_all(&payload)?;
             file.sync_all()?;
+            preserve_pre_migration_state(path, parent)?;
             fs::rename(&temporary, path)
                 .with_context(|| format!("failed to install state {}", path.display()))?;
             // On Unix, the rename's directory-entry update is not itself
@@ -1042,6 +1159,106 @@ mod tests {
         let (loaded, quarantined) = State::load(&path).unwrap();
         assert!(quarantined.is_none());
         assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+        assert!(!pre_migration_path(&path).exists());
+    }
+
+    #[test]
+    fn version_seven_state_migrates_with_exact_one_time_rollback_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let old_state = State {
+            schema_version: 7,
+            ..state_with_target(3)
+        };
+        let old_bytes = serde_json::to_vec_pretty(&old_state).unwrap();
+        fs::write(&path, &old_bytes).unwrap();
+
+        let (mut migrated, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(migrated.schema_version, 8);
+        assert_eq!(migrated.accounts["acct"].last_target, Some(3));
+        migrated.save(&path).unwrap();
+
+        let snapshot = pre_migration_path(&path);
+        assert_eq!(fs::read(&snapshot).unwrap(), old_bytes);
+        let rollback_raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        assert_eq!(rollback_raw["schema_version"], 7);
+        let (rollback, quarantined) = State::load(&snapshot).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(rollback.accounts["acct"].last_target, Some(3));
+
+        let saved_raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved_raw["schema_version"], 8);
+        let (reloaded, quarantined) = State::load(&path).unwrap();
+        assert!(quarantined.is_none());
+        assert_eq!(reloaded.accounts["acct"].last_target, Some(3));
+
+        migrated.accounts.get_mut("acct").unwrap().last_target = Some(9);
+        migrated.save(&path).unwrap();
+        assert_eq!(fs::read(&snapshot).unwrap(), old_bytes);
+        assert_eq!(
+            State::load(&path).unwrap().0.accounts["acct"].last_target,
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn unversioned_state_gets_a_rollback_snapshot_on_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let old_bytes = br#"{"accounts":{"acct":{"last_target":4}}}"#;
+        fs::write(&path, old_bytes).unwrap();
+        State::load(&path).unwrap().0.save(&path).unwrap();
+        assert_eq!(fs::read(pre_migration_path(&path)).unwrap(), old_bytes);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rollback_snapshot_has_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        fs::write(&path, br#"{"schema_version":7,"accounts":{}}"#).unwrap();
+        State::load(&path).unwrap().0.save(&path).unwrap();
+        let mode = fs::metadata(pre_migration_path(&path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn failed_rollback_snapshot_creation_leaves_old_state_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let old_bytes = br#"{"schema_version":7,"accounts":{"acct":{"last_target":4}}}"#;
+        fs::write(&path, old_bytes).unwrap();
+        let snapshot_temporary = temporary_path(&pre_migration_path(&path));
+        fs::write(&snapshot_temporary, b"already in use").unwrap();
+
+        let error = State::load(&path).unwrap().0.save(&path).unwrap_err();
+        assert!(error.to_string().contains("failed to create"));
+        assert_eq!(fs::read(&path).unwrap(), old_bytes);
+        assert!(!pre_migration_path(&path).exists());
+        assert_eq!(fs::read(&snapshot_temporary).unwrap(), b"already in use");
+    }
+
+    #[test]
+    fn unusable_existing_rollback_snapshot_blocks_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor-state.json");
+        let old_bytes = br#"{"schema_version":7,"accounts":{"acct":{"last_target":4}}}"#;
+        fs::write(&path, old_bytes).unwrap();
+        let snapshot = pre_migration_path(&path);
+        fs::write(&snapshot, b"truncated").unwrap();
+
+        let error = State::load(&path).unwrap().0.save(&path).unwrap_err();
+        assert!(error.to_string().contains("invalid rollback state"));
+        assert_eq!(fs::read(&path).unwrap(), old_bytes);
+        assert_eq!(fs::read(&snapshot).unwrap(), b"truncated");
     }
 
     #[test]
