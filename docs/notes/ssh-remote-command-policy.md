@@ -113,6 +113,25 @@ Concretely, this is why the sanctioned pattern is:
   attempt on top of the remote script's own runtime, since both come out
   of the same budget.
 
+## The federation peer pull uses the same shape (§28.3)
+
+The multi-instance federation's peer pull (plan §28.3, WP28) is one more
+consumer of this exact primitive, not a new transport. A configured peer
+without an explicit `argv` defaults to the sanctioned shape with the
+bounded connect timeout built in:
+
+```text
+ssh -o ConnectTimeout=5 <peer host_id> subgov peer-state --json
+```
+
+Everything above applies verbatim: `subgov` execs `ssh` directly with no
+local shell, the remote leg (`subgov peer-state --json`) is fixed and
+non-interpolated, authentication is the host's existing key-based auth,
+and the shared command timeout bounds the whole round trip
+(`PEER_PULL_TIMEOUT` in `src/federation.rs`, the same §7.4 bound as every
+other command). The remote command is read-only, so a failed or truncated
+fetch degrades to a stale peer (§28.7) rather than to partial state.
+
 ## What doesn't change
 
 Everything else about a `command` source/observer/actuator applies

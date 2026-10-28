@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -154,6 +154,33 @@ pub struct FederationConfig {
     /// name, which matches today's label-based identity (§28.11).
     #[serde(default)]
     pub account_identities: BTreeMap<String, String>,
+    /// The peers this instance pulls (§28.2/§28.3, WP28). Empty -- the
+    /// default -- is a federation of one that behaves exactly as before.
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+    /// §28.7: a peer record whose age on this receiver's monotonic clock
+    /// exceeds this many seconds makes the peer stale, freezing scale-up.
+    /// Defaults to 120 s.
+    #[serde(default = "default_peer_stale_after_seconds")]
+    pub peer_stale_after_seconds: u64,
+    /// §28.7: once a peer's age passes this many seconds it is counted as
+    /// zero workers, `peer_expired` is emitted, and scale-up may resume.
+    /// Defaults to 30 minutes.
+    #[serde(default = "default_peer_expiry_seconds")]
+    pub peer_expiry_seconds: u64,
+}
+
+/// One configured federation peer (§28.13: `peers: [{host_id, argv}]`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    /// The peer's host id, as its own records must claim it (§28.2).
+    pub host_id: String,
+    /// The full §28.3 pull argv. Absent means the sanctioned default
+    /// `[ssh, -o, ConnectTimeout=<n>, <host_id>, subgov, peer-state, --json]`
+    /// (§22.10: bounded ConnectTimeout, key-based auth already on the host).
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
 }
 
 impl FederationConfig {
@@ -167,6 +194,16 @@ impl FederationConfig {
         self.record_seq_file
             .clone()
             .unwrap_or_else(|| config.state_path().with_file_name("federation-record-seq"))
+    }
+
+    /// §28.7 `peer_stale_after` as a `Duration`.
+    pub fn peer_stale_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.peer_stale_after_seconds)
+    }
+
+    /// §28.7 `peer_expiry` as a `Duration`.
+    pub fn peer_expiry(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.peer_expiry_seconds)
     }
 }
 
@@ -738,8 +775,9 @@ fn validate_backpressure(policy: &BackpressureConfig, account: &str) -> Result<(
     )
 }
 
-/// Plan §28.13 (WP27): the identity fields the local peer record needs.
-/// WP31 extends this with peers, staleness bounds and repo_owners.
+/// Plan §28.13 (WP27): the identity fields the local peer record needs, and
+/// (WP28) the peer list and §28.7 staleness bounds. WP31 extends this with
+/// repo_owners, `subgov peers`/`check`, and the state schema migration.
 fn validate_federation(federation: &FederationConfig, config: &Config) -> Result<()> {
     if federation.host_id.trim().is_empty() || federation.host_id.chars().any(char::is_whitespace) {
         bail!("federation.host_id must be non-empty and free of whitespace");
@@ -753,6 +791,40 @@ fn validate_federation(federation: &FederationConfig, config: &Config) -> Result
         if identifier.trim().is_empty() {
             bail!("federation.account_identities.{account} must be non-empty");
         }
+    }
+    let mut peer_hosts = BTreeSet::new();
+    for peer in &federation.peers {
+        if peer.host_id.trim().is_empty() || peer.host_id.chars().any(char::is_whitespace) {
+            bail!("federation.peers[].host_id must be non-empty and free of whitespace");
+        }
+        if peer.host_id == federation.host_id {
+            bail!(
+                "federation.peers lists this instance's own host {}: a peer is another subgov on a different host (plan.md §28.2)",
+                peer.host_id
+            );
+        }
+        if !peer_hosts.insert(peer.host_id.clone()) {
+            bail!(
+                "federation.peers lists host {} more than once",
+                peer.host_id
+            );
+        }
+        if let Some(argv) = &peer.argv {
+            validate_argv(
+                argv,
+                &format!("federation peer {} pull command", peer.host_id),
+                false,
+            )?;
+        }
+    }
+    if federation.peer_stale_after_seconds == 0 {
+        bail!("federation.peer_stale_after_seconds must be at least 1 second (plan.md §28.7)");
+    }
+    if federation.peer_expiry_seconds <= federation.peer_stale_after_seconds {
+        bail!(
+            "federation.peer_expiry_seconds ({}) must exceed peer_stale_after_seconds ({}): expiry is the recovery path out of a stale freeze (plan.md §28.7)",
+            federation.peer_expiry_seconds, federation.peer_stale_after_seconds
+        );
     }
     Ok(())
 }
@@ -1159,6 +1231,14 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 fn default_poll_interval() -> u64 {
     300
 }
+/// §28.7 `peer_stale_after` default: 120 s.
+fn default_peer_stale_after_seconds() -> u64 {
+    120
+}
+/// §28.7 `peer_expiry` default: 30 min.
+fn default_peer_expiry_seconds() -> u64 {
+    1_800
+}
 fn default_stale_after() -> u64 {
     900
 }
@@ -1264,6 +1344,73 @@ mod tests {
         assert!(policy.full_speed);
         assert!(serde_yaml::from_str::<BankedResetConfig>("full_speed: 1").is_err());
         assert!(serde_yaml::from_str::<BankedResetConfig>("full_speed: yes").is_err());
+    }
+
+    /// plan.md §28.7/§28.13 (WP28): the peer list and staleness bounds a
+    /// federation block may carry, and their defaults.
+    #[test]
+    fn federation_peers_default_and_validate() {
+        let base = |federation_yaml: &str| {
+            format!(
+                "version: 1\naccounts:\n  acct:\n    source: {{ type: normalized_file, path: /tmp/subgov-test-source.json }}\n    utilization: {{ reserve_fraction: 0.1 }}\n    fleet:\n      max_workers: 4\n      observer: {{ type: static, workers: 1 }}\n      actuator: {{ type: none }}\nfederation:\n{federation_yaml}"
+            )
+        };
+
+        // A federation block with no peer keys is a federation of one, with
+        // the §28.7 defaults: stale after 120 s, expiry after 30 min.
+        let config: Config = serde_yaml::from_str(&base("  host_id: codinghome")).unwrap();
+        config.validate().unwrap();
+        let federation = config.federation.as_ref().unwrap();
+        assert!(federation.peers.is_empty());
+        assert_eq!(federation.peer_stale_after_seconds, 120);
+        assert_eq!(federation.peer_expiry_seconds, 1_800);
+
+        // One peer with an explicit argv and bounds passes.
+        let config: Config = serde_yaml::from_str(&base(
+            "  host_id: codinghome\n  peer_stale_after_seconds: 60\n  peer_expiry_seconds: 600\n  peers:\n    - host_id: gmktec\n      argv: [\"/usr/local/bin/fake-ssh\", \"gmktec\", \"subgov\", \"peer-state\", \"--json\"]",
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let federation = config.federation.as_ref().unwrap();
+        assert_eq!(federation.peers.len(), 1);
+        assert_eq!(federation.peers[0].host_id, "gmktec");
+        assert_eq!(federation.peer_stale_after().as_secs(), 60);
+        assert_eq!(federation.peer_expiry().as_secs(), 600);
+
+        for (federation_yaml, expected) in [
+            // §28.2: a peer is another subgov on a different host.
+            (
+                "  host_id: codinghome\n  peers:\n    - host_id: codinghome",
+                "own host",
+            ),
+            (
+                "  host_id: codinghome\n  peers:\n    - host_id: gmktec\n    - host_id: gmktec",
+                "more than once",
+            ),
+            (
+                "  host_id: codinghome\n  peers:\n    - host_id: \"gmtec labs\"",
+                "free of whitespace",
+            ),
+            (
+                "  host_id: codinghome\n  peers:\n    - host_id: gmktec\n      argv: []",
+                "argv must contain non-empty arguments",
+            ),
+            // §28.7: expiry is the recovery path out of a freeze, so it must
+            // come after the freeze starts, and the freeze must have a
+            // non-zero width.
+            (
+                "  host_id: codinghome\n  peer_stale_after_seconds: 0",
+                "at least 1 second",
+            ),
+            (
+                "  host_id: codinghome\n  peer_stale_after_seconds: 120\n  peer_expiry_seconds: 120",
+                "must exceed peer_stale_after_seconds",
+            ),
+        ] {
+            let config: Config = serde_yaml::from_str(&base(federation_yaml)).unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(expected), "expected {expected:?}, got: {err}");
+        }
     }
 
     fn base_config(fleet_yaml: &str) -> String {

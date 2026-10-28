@@ -11,6 +11,26 @@ versioned config-schema contract; see
 
 ### Added
 
+- Plan §28.3/§28.7 federation peer pull, staleness and freeze-on-stale
+  (WP28): `federation:` gains `peers: [{host_id, argv}]` (argv defaulting
+  to the sanctioned `ssh -o ConnectTimeout=5 <host> subgov peer-state
+  --json`), `peer_stale_after_seconds` (default 120) and
+  `peer_expiry_seconds` (default 1800, validated to exceed the stale
+  bound). A pull runs through the existing generic command primitive with
+  the §7.4 bound covering the whole SSH round trip; any failure — spawn,
+  nonzero exit, timeout, oversize, truncated or trailing output, unknown
+  schema major — is a failed fetch, so a peer is ever stale or fresh,
+  never partially applied. Records age on the receiver's monotonic clock
+  from receipt, never from the peer's timestamp; a record more than 300 s
+  ahead of the local clock, or claiming a host other than the peer it was
+  pulled from, is rejected. While any configured peer is stale (including
+  one never yet heard from) the instance may scale down but never up
+  (`PeerTable::clamp_scale_up`) and assumes the stale peer still runs its
+  last published `governed_workers`; after `peer_expiry` the peer counts
+  as zero workers, a `peer_expired` event fires once per staleness
+  episode, and scale-up may resume. Peers are never removed automatically.
+  WP29 wires the table into the shared total and cross-host placement.
+
 - Plan §28.4/§28.13 federation peer record (WP27): new `federation:` config
   block (`host_id`, optional `instance_id_file`/`record_seq_file`,
   `host_capacity_state`, per-account `account_identities`) and a read-only

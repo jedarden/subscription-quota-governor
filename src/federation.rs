@@ -1,16 +1,24 @@
-//! plan.md §28 (WP27): the versioned federation peer record, its schema
-//! gate, account identity, and the read-only projection of this instance's
-//! state that `subgov peer-state --json` prints.
+//! plan.md §28 (WP27, WP28): the versioned federation peer record, its
+//! schema gate, account identity, the read-only projection of this
+//! instance's state that `subgov peer-state --json` prints, and the pull
+//! transport plus receiver-side staleness that age those records (§28.3,
+//! §28.7).
 //!
 //! A peer record is what one subgov instance publishes about itself and
-//! what its peers pull (§28.3, WP28's transport). It is versioned
-//! independently of the persisted state (§28.4): an unknown major version
-//! is rejected on its own terms, while unknown fields inside a known major
-//! are ignored so minor additions stay compatible. Everything here is
-//! read-only with respect to the fleet: no source is polled, no observer is
-//! asked, no worker is touched. The only files `build_local_record` writes
-//! are this instance's own identity (§28.4: a persisted random
-//! `instance_id` and a monotonic `record_seq`).
+//! what its peers pull (§28.3). It is versioned independently of the
+//! persisted state (§28.4): an unknown major version is rejected on its
+//! own terms, while unknown fields inside a known major are ignored so
+//! minor additions stay compatible. The record builders are read-only with
+//! respect to the fleet: no source is polled, no observer is asked, no
+//! worker is touched. The only files `build_local_record` writes are this
+//! instance's own identity (§28.4: a persisted random `instance_id` and a
+//! monotonic `record_seq`).
+//!
+//! On the receiving side, `PeerTable` ages each peer's last accepted
+//! record on this host's monotonic clock from receipt -- never from the
+//! peer's timestamp -- and freezes scale-up while any peer is stale
+//! (§28.7). WP29 wires that table into the shared total and cross-host
+//! placement.
 //!
 //! No credentials, prompts or raw provider bodies ever enter a record
 //! (§14): every field below is a count, a timestamp, a derived fingerprint,
@@ -28,6 +36,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
+use std::time::{Duration, Instant};
 
 /// The only peer-record major version this binary publishes, and the only
 /// one it accepts (§28.4: "versioned independently of state"). The state
@@ -338,6 +347,372 @@ pub fn fingerprint_mismatch_event(
         "local_fingerprint": local.account_fingerprint,
         "peer_fingerprint": peer.account_fingerprint,
         "action": "treated_as_different_account",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// §28.3/§28.7 (WP28): the pull transport, staleness on the receiver's
+// clock, freeze-on-stale and expiry
+// ---------------------------------------------------------------------------
+
+/// The §7.4 shared command bound, applied to a peer pull's whole round trip
+/// -- connection, authentication and the remote `peer-state` run -- not just
+/// local execution (§22.10).
+pub const PEER_PULL_TIMEOUT: Duration = crate::source::COMMAND_TIMEOUT;
+
+/// The bounded `ConnectTimeout` the default §28.3 argv passes to ssh
+/// (§22.10: key-based auth already present on the host; subgov never
+/// manages or stores an SSH credential itself). Smaller than the round-trip
+/// bound so an unreachable peer fails on connect rather than eating the
+/// whole budget.
+pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// §28.7: a record more than this many seconds ahead of the receiver's wall
+/// clock is rejected. Peer-reported timestamps order samples only; they are
+/// never the basis of a staleness or freshness decision.
+pub const PEER_CLOCK_SKEW_TOLERANCE_SECONDS: i64 = 300;
+
+/// Why a peer pull did not produce a usable record (§28.3). Every variant
+/// is a failed fetch: `subgov peer-state` prints exactly one record or
+/// fails, so a peer is ever stale or fresh, never partially applied.
+#[derive(Debug, thiserror::Error)]
+pub enum PeerPullError {
+    /// The generic command primitive failed: the command would not spawn,
+    /// exited non-zero, overshot the round-trip bound, wrote past the size
+    /// cap, or its stdout could not be read.
+    #[error("peer pull command `{command}` failed: {source}")]
+    Transport {
+        command: String,
+        #[source]
+        source: anyhow::Error,
+    },
+    /// The command succeeded but its stdout is not a record this binary
+    /// fully understands: malformed JSON, an unknown schema major, or a
+    /// field a conforming publisher could not have written.
+    #[error("peer pull command `{command}` produced an unusable record: {source}")]
+    Record {
+        command: String,
+        #[source]
+        source: PeerRecordError,
+    },
+}
+
+/// The sanctioned §28.3 pull argv for a peer that does not override one:
+/// `ssh` to the peer's host with a bounded `ConnectTimeout` ahead of it
+/// (§22.10), then the read-only `subgov peer-state --json`.
+pub fn default_peer_argv(host_id: &str, connect_timeout: Duration) -> Vec<String> {
+    vec![
+        "ssh".to_owned(),
+        "-o".to_owned(),
+        format!("ConnectTimeout={}", connect_timeout.as_secs().max(1)),
+        host_id.to_owned(),
+        "subgov".to_owned(),
+        "peer-state".to_owned(),
+        "--json".to_owned(),
+    ]
+}
+
+/// Pulls one configured peer's record over the §28.3 transport: the
+/// existing generic command primitive (§22.10) under the shared §7.4
+/// round-trip bound. The command runs argv directly, never through a local
+/// shell; whatever it prints must parse as one whole record or the pull
+/// fails.
+pub fn pull_peer_record(peer: &crate::config::PeerConfig) -> Result<PeerRecord, PeerPullError> {
+    let argv = peer
+        .argv
+        .clone()
+        .unwrap_or_else(|| default_peer_argv(&peer.host_id, PEER_CONNECT_TIMEOUT));
+    pull_peer_record_bounded(&argv, PEER_PULL_TIMEOUT)
+}
+
+/// The same transport with an explicit argv and round-trip bound -- the
+/// seam the staleness contract drives with a fake `ssh` and a short
+/// timeout, and the hook a caller with its own bound can use.
+pub fn pull_peer_record_bounded(
+    argv: &[String],
+    timeout: Duration,
+) -> Result<PeerRecord, PeerPullError> {
+    let command = argv.join(" ");
+    let bytes = crate::source::read_generic_command_bytes(argv, timeout).map_err(|source| {
+        PeerPullError::Transport {
+            command: command.clone(),
+            source,
+        }
+    })?;
+    PeerRecord::parse(&bytes).map_err(|source| PeerPullError::Record { command, source })
+}
+
+/// The receiver's two clocks at one instant (§28.7): the monotonic clock
+/// that ages peer records from receipt, and the wall clock the skew bound
+/// compares a record's own timestamp against. Both arrive as plain
+/// parameters -- the same no-singleton rule as `controller::evaluate`.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerMoment {
+    /// Monotonic, so an NTP step or manual clock change on the receiver can
+    /// neither fake freshness nor strand a peer in stale forever.
+    pub monotonic: Instant,
+    pub wall: DateTime<Utc>,
+}
+
+impl PeerMoment {
+    pub fn now() -> Self {
+        Self {
+            monotonic: Instant::now(),
+            wall: Utc::now(),
+        }
+    }
+}
+
+/// §28.7's classification of one peer, measured on the receiver's clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerFreshness {
+    /// Last receipt is within `peer_stale_after`: the record is used as
+    /// published and does not restrict scaling.
+    Fresh,
+    /// Older than `peer_stale_after` but not yet `peer_expiry`: the peer is
+    /// still assumed to run its last published `governed_workers`, and the
+    /// instance may scale down but never up.
+    Stale,
+    /// Older than `peer_expiry`: the peer counts as zero workers, a
+    /// `peer_expired` event has been emitted, and scale-up may resume.
+    Expired,
+}
+
+impl PeerFreshness {
+    /// Whether §28.7 forbids this instance from scaling up while any peer
+    /// is in this state.
+    pub fn freezes_scale_up(&self) -> bool {
+        matches!(self, Self::Stale)
+    }
+}
+
+/// Why `PeerTable::ingest` did not accept a fetched record. Every variant
+/// leaves the peer aging from its previous receipt unchanged: a rejected
+/// fetch is a stale peer, never a partial one (§28.3/§28.7).
+#[derive(Debug, thiserror::Error)]
+pub enum PeerRejection {
+    /// The fetch itself failed (transport or unusable record).
+    #[error("{source}")]
+    FetchFailed {
+        #[source]
+        source: PeerPullError,
+    },
+    /// The record's own timestamp is more than 300 s ahead of the
+    /// receiver's wall clock (§28.7): peer clocks order samples, they do
+    /// not set this host's.
+    #[error(
+        "record from peer {host_id} is {ahead_by_seconds}s ahead of the receiver's clock \
+         (tolerance {PEER_CLOCK_SKEW_TOLERANCE_SECONDS}s)"
+    )]
+    ClockSkew {
+        host_id: String,
+        ahead_by_seconds: i64,
+    },
+    /// The record names a host other than the peer it was pulled from.
+    #[error("record pulled from peer {expected} claims to be host {found}")]
+    HostMismatch { expected: String, found: String },
+    /// A record arrived for a host with no configured peer. Peers are added
+    /// and removed only by the operator editing `federation.peers`; the
+    /// tracker never grows or shrinks on its own (§28.7).
+    #[error("no configured peer named {host_id}")]
+    Unconfigured { host_id: String },
+}
+
+/// One peer's receiver-side state.
+#[derive(Debug, Default)]
+struct PeerEntry {
+    /// The last accepted record, kept whole: while stale, the peer is
+    /// assumed to run exactly what this published (§28.7).
+    record: Option<PeerRecord>,
+    /// Receipt time on this receiver's monotonic clock -- never the
+    /// record's own `observed_at`, which orders samples only.
+    received_at: Option<Instant>,
+    /// Whether the current staleness episode has already announced
+    /// `peer_expired`, so the event fires once per episode.
+    expired_announced: bool,
+}
+
+/// The receiver-side state of every configured peer (§28.7): each peer's
+/// last accepted record, the monotonic instant it was received, and the
+/// fresh/stale/expired classification derived from that age. Entries are
+/// created from `federation.peers` at construction and are never removed
+/// automatically -- removing a peer is the operator's act, not the
+/// tracker's.
+#[derive(Debug)]
+pub struct PeerTable {
+    entries: BTreeMap<String, PeerEntry>,
+    /// Aging origin for peers with no receipt yet: without a record there
+    /// is no basis to scale up against such a peer, so it is stale from
+    /// process start and expires `peer_expiry` after it.
+    started_at: Instant,
+    stale_after: Duration,
+    expiry: Duration,
+    events: Vec<Value>,
+}
+
+impl PeerTable {
+    /// Builds the table from the configured peers and §28.7 bounds.
+    pub fn new(federation: &crate::config::FederationConfig, started_at: Instant) -> Self {
+        Self {
+            entries: federation
+                .peers
+                .iter()
+                .map(|peer| (peer.host_id.clone(), PeerEntry::default()))
+                .collect(),
+            started_at,
+            stale_after: federation.peer_stale_after(),
+            expiry: federation.peer_expiry(),
+            events: Vec::new(),
+        }
+    }
+
+    /// The configured peer host ids, in configuration order. The set only
+    /// changes when the operator edits `federation.peers` (§28.7).
+    pub fn configured_peers(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
+    /// Offers one pull result to the table (§28.7). A fetched record must
+    /// claim the host it was pulled from and must not sit more than 300 s
+    /// ahead of the receiver's wall clock; it is then stored whole and
+    /// re-aged from this receipt. Any failure or rejection leaves the
+    /// peer's previous record and receipt time untouched, so the peer keeps
+    /// aging from its last successful receipt.
+    pub fn ingest(
+        &mut self,
+        peer: &crate::config::PeerConfig,
+        fetch: Result<PeerRecord, PeerPullError>,
+        now: &PeerMoment,
+    ) -> Result<(), PeerRejection> {
+        let record = fetch.map_err(|source| PeerRejection::FetchFailed { source })?;
+        let entry =
+            self.entries
+                .get_mut(&peer.host_id)
+                .ok_or_else(|| PeerRejection::Unconfigured {
+                    host_id: peer.host_id.clone(),
+                })?;
+        if record.host_id != peer.host_id {
+            return Err(PeerRejection::HostMismatch {
+                expected: peer.host_id.clone(),
+                found: record.host_id,
+            });
+        }
+        let ahead_by_seconds = (record.observed_at - now.wall).num_seconds();
+        if ahead_by_seconds > PEER_CLOCK_SKEW_TOLERANCE_SECONDS {
+            return Err(PeerRejection::ClockSkew {
+                host_id: peer.host_id.clone(),
+                ahead_by_seconds,
+            });
+        }
+        entry.record = Some(record);
+        entry.received_at = Some(now.monotonic);
+        // A new record ends any expiry episode; a later one can open another.
+        entry.expired_announced = false;
+        Ok(())
+    }
+
+    /// Classifies one peer on the receiver's clock, expiring peers whose
+    /// age has passed `peer_expiry` and queueing their `peer_expired`
+    /// event. `None` means the host is not a configured peer.
+    pub fn freshness(&mut self, host_id: &str, now: &PeerMoment) -> Option<PeerFreshness> {
+        let stale_after = self.stale_after;
+        let expiry = self.expiry;
+        let started_at = self.started_at;
+        let entry = self.entries.get_mut(host_id)?;
+        let age = now
+            .monotonic
+            .saturating_duration_since(entry.received_at.unwrap_or(started_at));
+        let freshness = if age >= expiry {
+            if !entry.expired_announced {
+                entry.expired_announced = true;
+                let event = peer_expired_event(host_id, entry, now.wall);
+                self.events.push(event);
+            }
+            PeerFreshness::Expired
+        } else if entry.received_at.is_none() || age > stale_after {
+            // A peer never heard from is stale immediately: with no record
+            // there is nothing to trust it with.
+            PeerFreshness::Stale
+        } else {
+            PeerFreshness::Fresh
+        };
+        Some(freshness)
+    }
+
+    /// §28.7's freeze over every configured peer: while any peer is stale
+    /// the instance must not scale up. Expired peers no longer freeze --
+    /// expiry is the defined recovery path -- and fresh ones never did.
+    pub fn any_peer_stale(&mut self, now: &PeerMoment) -> bool {
+        let host_ids: Vec<String> = self.entries.keys().cloned().collect();
+        host_ids
+            .iter()
+            .any(|host_id| self.freshness(host_id, now) == Some(PeerFreshness::Stale))
+    }
+
+    /// Applies §28.7's freeze to one scaling decision: with any peer stale,
+    /// `desired` may not exceed `current` -- scaling down stays allowed,
+    /// scaling up does not. With no stale peer the decision passes through.
+    pub fn clamp_scale_up(&mut self, desired: u32, current: u32, now: &PeerMoment) -> u32 {
+        if self.any_peer_stale(now) {
+            desired.min(current)
+        } else {
+            desired
+        }
+    }
+
+    /// The workers a peer contributes to one account's burn denominator on
+    /// this receiver (§28.7): the last published `governed_workers` summed
+    /// over the peer's pools while fresh or stale, zero once expired (and
+    /// for a peer whose record never mentioned the account). `None` means
+    /// the host is not a configured peer.
+    pub fn peer_account_workers(
+        &mut self,
+        host_id: &str,
+        account_id: &str,
+        now: &PeerMoment,
+    ) -> Option<u32> {
+        if self.freshness(host_id, now)? == PeerFreshness::Expired {
+            return Some(0);
+        }
+        let entry = self.entries.get(host_id)?;
+        Some(
+            entry
+                .record
+                .as_ref()
+                .map(|record| {
+                    record
+                        .accounts
+                        .get(account_id)
+                        .map(|account| {
+                            account
+                                .pools
+                                .values()
+                                .map(|pool| pool.governed_workers)
+                                .sum()
+                        })
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0),
+        )
+    }
+
+    /// Drains queued §28.7 events (`peer_expired`) for the caller to emit
+    /// through the ordinary decision-event surface.
+    pub fn drain_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.events)
+    }
+}
+
+/// The §28.7 expiry event: the peer is counted as zero workers from here
+/// until it is heard from again. Nothing in it is secret-shaped (§14).
+fn peer_expired_event(host_id: &str, entry: &PeerEntry, time: DateTime<Utc>) -> Value {
+    serde_json::json!({
+        "event": "peer_expired",
+        "severity": "warn",
+        "time": time,
+        "peer_host_id": host_id,
+        "last_record_seq": entry.record.as_ref().map(|record| record.record_seq),
+        "action": "counted_as_zero_workers",
     })
 }
 
@@ -1016,6 +1391,9 @@ mod tests {
                     "acct".to_owned(),
                     "provider:acct-1".to_owned(),
                 )]),
+                peers: Vec::new(),
+                peer_stale_after_seconds: 120,
+                peer_expiry_seconds: 1_800,
             }),
         }
     }

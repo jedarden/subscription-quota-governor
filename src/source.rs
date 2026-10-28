@@ -27,7 +27,7 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// network hop -- `ssh`'s own connection attempt, authentication, and the
 /// remote command's runtime all come out of this one budget, same as local
 /// execution.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum bytes read from a generic source's command stdout, file, or HTTP
 /// body (plan.md §7.4: "Files and HTTP bodies have explicit maximum sizes in
 /// v1."). A normalized quota snapshot is a small JSON document, so this is
@@ -279,7 +279,7 @@ fn collect_normalized_file(path: &Path) -> Result<QuotaSnapshot> {
 /// can be enforced at the same time: the main thread blocks on
 /// `recv_timeout` instead of on the read itself. Mirrors
 /// `src/fleet.rs`'s `command_observer_current_workers`.
-fn read_generic_command_bytes(argv: &[String], timeout: Duration) -> Result<Vec<u8>> {
+pub(crate) fn read_generic_command_bytes(argv: &[String], timeout: Duration) -> Result<Vec<u8>> {
     let command = argv[0].clone();
     let mut child = new_process_group_command(&argv[0])
         .args(&argv[1..])
