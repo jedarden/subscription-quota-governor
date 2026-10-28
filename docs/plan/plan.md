@@ -506,6 +506,12 @@ Only one controller may own a fleet. Different state paths are not permission
 to run competing governors against the same actuator; deployment tooling must
 enforce that operational invariant.
 
+*Amended 2026-10-28 (§28):* this rule governs one actuator and one worker set.
+It no longer forbids one instance per host for a shared account. §28 allows
+several instances, each owning only its own host's workers, that exchange peer
+records and derive the same account total. Two instances still must not
+actuate the same worker set.
+
 ## 11. Fleet integration
 
 ### 11.1 Observers
@@ -1364,7 +1370,9 @@ mid-build:
    extends across hosts) — never one process per host for the same account.
    A shared subscription used from multiple hosts must be governed
    centrally or it double-books, the same failure shape §10 already
-   forbids.
+   forbids. **Superseded 2026-10-28 by §28:** an account may be governed by one
+   instance per host. Double-booking is prevented by shared inputs and a
+   freeze-on-stale rule instead of a single process.
 2. Placement is strictly subordinate to the controller: it distributes, it
    never authorizes more workers than the controller already decided.
 3. Cross-host SSH reuses the existing generic `command` primitive rather
@@ -1697,7 +1705,8 @@ Goal: every NEEDLE worker on codinghome is launched and retired by subgov in
 response to provider capacity and real work. The static roster is a transition
 state, not a floor. Decisions below are locked; no open forks.
 
-**26.1 Scope.** All workers run on this host. Inventory on 2026-10-22: ten
+**26.1 Scope.** All workers run on this host (extended to further hosts by
+§28; each instance applies this section to its own host). Inventory on 2026-10-22: ten
 `needle-worker@glm-*` systemd units (already enumerated by the Z.AI roster, §25),
 `sg-claude-anthropic-N`, `sg-codex-N`, and stragglers started outside systemd
 (for example a `needle-stable` tmux worker). Out of scope: interactive
@@ -1765,3 +1774,144 @@ pool's ready demand, and scale-down takes idle workers first.
 One core binary plus out-of-process provider adapters over the existing JSON
 contract (§7.3). To be specified after WP23-26 land; the Claude, Codex and Z.AI
 scripts are the first conformance targets.
+
+## 28. Multi-instance federation (decided 2026-10-28)
+
+Goal: several subgov instances, normally one per host, run at the same time,
+exchange state, and together govern accounts and pools without double-booking
+quota or a host. Today's deployment, three `subgov-*` services on codinghome
+that each own one account, is a federation of one host. gmktec is the first
+second host. Decisions below are locked; no open forks.
+
+**28.1 Reversal.** §10 and §22.15(1) required a single governor process per
+account. That is replaced by this rule: each instance owns only the workers on
+its own host; the account total is derived identically by every instance from
+the same inputs. A second instance must not actuate another instance's host.
+
+**28.2 Topology: peers, no leader.** Every instance is equal. There is no
+elected leader, no shared database and no consensus protocol. Each instance
+lists its peers in config and pulls their records. A peer is another subgov on
+a different host; instances on one host keep coordinating through the host lock
+of §26/WP24.
+
+**28.3 Transport: pull over SSH.** A peer record is fetched with
+`argv: [ssh, <host>, subgov, peer-state, --json]` using the existing generic
+`command` primitive (§22.10, §22.15(3)). No new listener, no new credential
+and no tailnet ACL change. HTTP between instances was rejected: it adds a
+listening surface and a token to manage for no capability SSH lacks. `subgov
+peer-state` is read-only and prints one record, so any failure of the fetch is
+a stale peer, never a partial one.
+
+**28.4 Peer record** (`schema_version`, versioned independently of state):
+`instance_id` (stable random id, persisted), `host_id`, `record_seq`
+(monotonic), `observed_at`, and per account and pool: `account_id`,
+`account_fingerprint` (a truncated hash of the provider's non-secret account
+identifier), `governed_workers` (current, by pool), `pending_launches`,
+`desired`, the latest quota sample (`window`, `used_fraction`, `resets_at`,
+`observed_at`), `ready_demand` (count and `eligible_backlog_capacity` for this
+host's workspaces), the host's measured ceiling and reservations (WP24), its
+`resource_reserve`, and the git origin URLs of the workspaces it will seed. It
+contains no credentials, prompts or raw provider bodies (§14).
+
+**28.5 Account identity.** Instances belong to the same account only when
+`account_id` and `account_fingerprint` both match. A mismatch is an error event
+and the instance treats the other record as a different account. Distinct
+accounts never share a total.
+
+**28.6 One total, derived everywhere.** For each account every instance
+computes the controller decision (§9, pure) from: the freshest quota sample
+among itself and its peers, and the sum of `governed_workers` across all hosts
+as the burn denominator. If samples disagree on `used_fraction` by more than
+0.05, the larger one is used. Instances therefore reach the same account total
+without exchanging decisions. The total is then split across hosts by the
+placement function of §22.7, using each host's headroom from the peer records
+and weights capped by that host's `ready_demand`. Each instance actuates only
+its own host's share. Placement never exceeds the controller total (§22.15(2)).
+
+**28.7 Freeze on stale.** The §22.8 rule extends to peers. A peer record is
+stale when its age, measured on the receiver's monotonic clock from the time of
+receipt and not from the peer's timestamp, exceeds `peer_stale_after` (default
+120 s). While any configured peer is stale an instance may reduce its workers
+but must not scale up, and it assumes the stale peer still runs its last
+published `governed_workers`. After `peer_expiry` (default 30 min) the peer is
+counted as zero workers, a `peer_expired` event is emitted, and scale-up may
+resume. A peer is never removed automatically; removal from `peers:` is the
+operator's act. Peer-reported timestamps order samples only, and a record more
+than 300 s ahead of the receiver's clock is rejected.
+
+**28.8 Bounded overshoot.** Two instances can launch in the same interval
+before either sees the other. The bound is the sum of each instance's
+`max_step_up`. Config validation rejects any federation whose summed
+`max_step_up` exceeds the account's reserve in workers. Before launching, an
+instance publishes `pending_launches` and re-pulls its peers once; if the
+re-pulled total no longer permits the launch it abandons it.
+
+**28.9 Worker identity and ownership.** A worker belongs to the instance whose
+prefix it carries. The primary host keeps the legacy prefixes (`sg-zai-`,
+`sg-codex-`, `sg-claude-anthropic-`). Every other host uses
+`sg-<pool>-<host_id>-<n>`, for example `sg-zai-gmktec-3`. An instance
+retires, launches and counts only workers with its own prefix, and counts other
+prefixes only through peer records. Startup refuses a prefix that another
+record already claims.
+
+**28.10 Workspace ownership.** The same repository must not be worked from two
+hosts, because the failure mode is a bead claimed twice (CLAUDE.md, NEEDLE
+ADR-015). Each record lists the origin URLs of its workspaces. Startup and every
+pull check for overlap. On overlap the host named in `repo_owners` keeps the
+repo; without an entry the lexicographically lowest `host_id` keeps it. The
+other instance excludes the repo from demand and seeding and emits
+`workspace_overlap`. Cross-host bead-claim coordination remains a non-goal (§3).
+
+**28.11 Quota that is not shared.** Instances whose accounts differ (for
+example a Codex login that exists only on one host) are independent accounts and
+need no federation. Federation only matters where `account_fingerprint` matches.
+
+**28.12 Interactive load.** Interactive Claude/Codex/herdr sessions are not
+subgov workers. They reach the quota only through the provider sample and
+through each host's measured ceiling (WP24). They are never counted as
+`governed_workers`. This is the same boundary as §26.1.
+
+**28.13 Configuration and commands.** New `federation:` block: `instance_id`
+file, `host_id`, `peers: [{host_id, argv}]`, `peer_stale_after`, `peer_expiry`,
+`repo_owners`. With `peers` empty the instance behaves exactly as before
+(federation of one). New commands: `subgov peer-state --json` (read-only record),
+`subgov peers` (age, staleness, workers per host, overlap), and `subgov check`
+validates peers, prefixes and the overshoot bound. The state schema version is
+bumped with a migration that keeps old files readable.
+
+**28.14 Rollout.** (1) Add `federation:` to codinghome with no peers and
+confirm decisions are byte-identical to today. (2) Install on gmktec in
+observe-only mode with its own worker prefix and confirm `subgov peers` on both
+ends. (3) Enable actuation on gmktec for one pool and one repo with ready beads.
+(4) Widen to the other pools. (5) Run the seven-day window of §22.14 across both
+hosts, including a quota reset and one induced partition.
+
+**28.15 Work packages.**
+
+- WP27: peer record, `peer-state` command and schema, including account
+  fingerprint and workspace origins. Done when two fake peers round-trip and an
+  unknown major schema is rejected.
+- WP28: pull transport, staleness on the receiver's clock, freeze-on-stale and
+  expiry. Done when a killed peer freezes scale-up within `peer_stale_after` and
+  unfreezes after `peer_expiry` in a table-driven test.
+- WP29: shared total and cross-host placement from peer records. Done when two
+  in-process instances with identical inputs choose the same total and shares
+  that sum to it, and neither exceeds a host reserve.
+- WP30: worker identity, per-host prefixes, workspace-overlap exclusion and the
+  overshoot bound with `pending_launches` re-pull. Done when a simultaneous
+  launch test never exceeds the summed step limit.
+- WP31: federation configuration, `peers` and `check`, and the schema
+  migration. Done when an existing single-host config is accepted unchanged and
+  produces the same decisions.
+- WP32: gmktec installation (single binary, adapter files, NEEDLE config, host
+  reserve) and the staged rollout of §28.14. Done when gmktec processes ready
+  beads in its own repos under subgov for seven days with no host over-placed.
+
+**28.16 Acceptance.** Two instances, one account: the combined worker count
+never exceeds the controller total plus the overshoot bound across partition,
+restart of either instance, and a stale peer; no worker is launched from a
+workspace owned by another host; removing `peers` restores today's behavior; and
+no record, log or state file contains a credential.
+
+**28.17 Open question handling.** None. Anything not covered here is not
+permitted until this section is amended.
