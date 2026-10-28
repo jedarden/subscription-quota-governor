@@ -1,0 +1,7 @@
+[Unit]
+Description=Publish gmktec Codex ready-bead demand
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
+ExecStart=/home/coding/.needle/subgov/refresh-codex-demand.sh

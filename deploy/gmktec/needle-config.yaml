@@ -1,0 +1,21 @@
+# The gmktec governed fleet starts with one exclusive repository.
+# Interactive Codex and Claude sessions remain outside subgov's worker prefix.
+agent:
+  default: codex-gpt-6-sol-xhigh-gmktec
+  adapters_dir: /home/coding/.config/needle/adapters
+  timeout: 3600
+worker:
+  max_workers: 2
+  launch_stagger_seconds: 2
+  idle_timeout: 60
+  idle_action: wait
+workspace:
+  default: /home/coding/ibkr-service
+  home: /home/coding/.needle
+strands:
+  generation:
+    enabled: false
+  explore:
+    enabled: false
+    workspaces:
+      - /home/coding/ibkr-service

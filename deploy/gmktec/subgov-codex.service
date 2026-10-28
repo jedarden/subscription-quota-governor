@@ -1,0 +1,15 @@
+[Unit]
+Description=gmktec Codex subscription governor (federation observation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
+ExecStart=/home/coding/.local/bin/subgov --config /home/coding/.config/subgov/codex.yaml run --observe-only
+Restart=on-failure
+RestartSec=15
+KillMode=process
+
+[Install]
+WantedBy=default.target

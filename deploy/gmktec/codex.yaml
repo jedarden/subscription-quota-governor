@@ -1,0 +1,55 @@
+# gmktec Codex federation member. Keep observe-only in the installed unit
+# until peer transport, account identity and workspace ownership are verified.
+version: 1
+poll_interval_seconds: 300
+state_path: /home/coding/.needle/subgov/codex.json
+accounts:
+  codex:
+    source:
+      type: codex_app_server
+      timeout_seconds: 30
+    fleet:
+      min_workers: 0
+      max_workers: 12
+      bootstrap_workers: 1
+      max_scale_up_per_cycle: 1
+      max_scale_down_per_cycle: 1
+      hosts:
+        gmktec:
+          max_workers: 2
+          resource_reserve:
+            cpu_reserve_fraction: 0.25
+            mem_reserve_mb: 16384
+          resource_source:
+            type: command
+            argv: [/home/coding/.needle/subgov/resource-probe, gmktec]
+          observer:
+            type: needle_status
+            agent: codex-gpt-6-sol-xhigh-gmktec
+            identifier_prefix: sg-codex-gmktec-
+            stale_after_seconds: 60
+          actuator:
+            type: needle_run
+            repo: /home/coding/ibkr-service
+            adapter: codex-gpt-6-sol-xhigh-gmktec
+            identifier_prefix: sg-codex-gmktec-
+            seed_demand_state: /home/coding/.needle/subgov/codex-ready-demand.json
+            seed_heartbeats: /home/coding/.needle/state/heartbeats
+    utilization:
+      reserve_fraction: 0.05
+      strategy: linear_to_reset
+      stale_after_seconds: 900
+      stale_behavior: hold
+      minimum_sample_seconds: 240
+    banked_resets:
+      enabled: true
+      full_speed: true
+      minimum_pace_multiplier: 2.0
+      redeem_at_utilization: 1.0
+      deadline_safety_seconds: 21600
+federation:
+  host_id: gmktec
+  primary: false
+  peers:
+    - host_id: codinghome
+      argv: [ssh, -o, BatchMode=yes, -o, ConnectTimeout=5, codinghome, /home/coding/.local/bin/subgov, --config, /home/coding/.config/subgov/codex.yaml, peer-state, --json]

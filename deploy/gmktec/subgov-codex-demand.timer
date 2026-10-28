@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh gmktec Codex ready-bead demand
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=300s
+Unit=subgov-codex-demand.service
+
+[Install]
+WantedBy=timers.target

@@ -64,3 +64,7 @@ accounts:
           burn_rate_window_seconds: 86400
         weekly_scoped:
           enabled: false
+federation:
+  host_id: codinghome
+  primary: true
+  peers: []

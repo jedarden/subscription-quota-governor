@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "host": "gmktec",
+  "agent": "codex-gpt-6-sol-xhigh-gmktec",
+  "max_workers": 2,
+  "demand": {
+    "workspaces": ["/home/coding/ibkr-service"],
+    "needle_config": "/home/coding/.config/needle/config.yaml"
+  }
+}

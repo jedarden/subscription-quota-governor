@@ -122,3 +122,7 @@ accounts:
       windows:
         five_hour:
           reserve_fraction: 0.15
+federation:
+  host_id: codinghome
+  primary: true
+  peers: []

@@ -62,3 +62,7 @@ accounts:
       minimum_pace_multiplier: 2.0
       redeem_at_utilization: 1.0
       deadline_safety_seconds: 21600
+federation:
+  host_id: codinghome
+  primary: true
+  peers: []
