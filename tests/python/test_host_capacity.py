@@ -83,6 +83,21 @@ class CeilingTests(unittest.TestCase):
         self.assertEqual(result['ceiling'], 5)
         self.assertEqual(result['rss_basis'], 'cold_fallback')
 
+    def test_inactive_slice_is_a_zero_population_not_missing_evidence(self):
+        # A drained pool leaves needle.slice inactive; systemd then reports
+        # "[not set]" for both properties. That measures an empty slice --
+        # int('[not set]') must not become a probe failure, or an idle host
+        # could never publish a ceiling (gmktec WP32 rollout).
+        self.assertEqual(
+            host.slice_population({'MemoryCurrent': '[not set]', 'MemoryHigh': 'infinity'}),
+            (0, None))
+        self.assertEqual(
+            host.slice_population({'MemoryCurrent': '[not set]', 'MemoryHigh': '[not set]'}),
+            (0, None))
+        self.assertEqual(
+            host.slice_population({'MemoryCurrent': str(20 * host.GIB), 'MemoryHigh': str(100 * host.GIB)}),
+            (20 * host.GIB, 100 * host.GIB))
+
 
 class SplitTests(unittest.TestCase):
     def test_weighted_split_and_quota_cap_redistribution(self):

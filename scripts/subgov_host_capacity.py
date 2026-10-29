@@ -114,6 +114,21 @@ def process_sample(pools, proc=Path('/proc')):
     return counts, sum(pool is None for pool in roots.values()), list(rss.values())
 
 
+def slice_population(properties):
+    """Parses the needle.slice memory properties from systemctl --user show.
+
+    An idle host's slice is inactive and reports "[not set]" for both
+    properties: a measured zero population, not missing evidence, so the
+    host-memory limiter still applies. An unlimited or unset high supplies
+    no finite limiter; MemAvailable still bounds it.
+    """
+    unset = ('', '[not set]')
+    current = properties['MemoryCurrent']
+    population = 0 if current in unset else int(current)
+    high = properties['MemoryHigh']
+    return population, None if high in unset + ('infinity', str(2 ** 64 - 1)) else int(high)
+
+
 def probe(pools):
     counts, unmanaged, rss = process_sample(pools)
     meminfo = dict((line.split(':')[0], int(line.split()[1]) * 1024)
@@ -125,12 +140,10 @@ def probe(pools):
                              '--property=MemoryCurrent,MemoryHigh'], capture_output=True,
                             text=True, timeout=2, check=True)
     properties = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
-    high = properties['MemoryHigh']
-    # An unlimited slice supplies no finite limiter; MemAvailable still bounds it.
-    high = None if high in ('infinity', str(2 ** 64 - 1)) else int(high)
+    slice_current, slice_high = slice_population(properties)
     sample = dict(counts=counts, unmanaged=unmanaged, rss=rss,
-                  mem_available=meminfo['MemAvailable'], slice_current=int(properties['MemoryCurrent']),
-                  slice_high=high, memory_psi=psi('memory'), io_psi=psi('io'),
+                  mem_available=meminfo['MemAvailable'], slice_current=slice_current,
+                  slice_high=slice_high, memory_psi=psi('memory'), io_psi=psi('io'),
                   load=float(Path('/proc/loadavg').read_text().split()[0]),
                   cpus=len(os.sched_getaffinity(0)))
     for key in ('mem_available', 'slice_current', 'memory_psi', 'io_psi', 'load', 'cpus'):
