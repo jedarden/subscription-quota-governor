@@ -19,9 +19,12 @@ the binary on gmktec before enabling the unit.
 Install `codex.yaml` as `~/.config/subgov/codex.yaml` (mode 0600),
 `needle-config.yaml` as `~/.config/needle/config.yaml`, and the Codex adapter
 under `~/.config/needle/adapters/`. Install `resource-probe`,
-`refresh-codex-demand.sh`, and `codex-demand-settings.json` under
-`~/.needle/subgov/`; copy `scripts/subgov_ready_beads.py` and
-`scripts/subgov_adapter_common.py` into `~/.needle/subgov/adapters/`. The
+`refresh-codex-demand.sh`, `measure-host-capacity.py`,
+`host-capacity.json` (mode 0600), and `codex-demand-settings.json` under
+`~/.needle/subgov/`; copy `scripts/subgov_ready_beads.py`,
+`scripts/subgov_adapter_common.py`, and `scripts/subgov_host_capacity.py`
+into `~/.needle/subgov/adapters/`. Create `~/.local/state/subgov/` for the
+WP24 measured-ceiling state the publisher writes. The
 settings and published `codex-ready-demand.json` must be separate files: the
 publisher atomically replaces the latter on every run. Install the three
 systemd files under `~/.config/systemd/user/`, reload the user manager, and
@@ -42,9 +45,21 @@ and no origin overlap for the seed repository. Require a ready, admitted bead
 in that repository and a fresh positive demand file. A shared-origin repository
 requires an explicit owner and exclusion from every other host's NEEDLE route.
 Verify that the running binary applies the shared account total and that each
-peer record publishes a capacity bound appropriate to its host. Keep the
-combined step-up bound within the account worker reserve. Record the first
-successful governed claim and its host on the owning bead.
+peer record publishes a capacity bound appropriate to its host. gmktec
+publishes its own measured ceiling: the demand publisher's
+`measure-host-capacity.py` step writes the WP24 evidence that
+`federation.host_capacity_state` points at, so `subgov peer-state --json`
+carries `host_ceiling`. The codinghome peer's record needs the equivalent
+`host_capacity_state` on its three configs before both ends publish bounds.
+Keep the combined step-up bound within the account worker reserve. Record the
+first successful governed claim and its host on the owning bead.
+
+The codinghome peer pull is blocked by a deliberate tailnet ACL property:
+`policy.hujson`'s `tag:gmktec` TCP test denies `tag:codinghome:22` and no
+accept rule grants that flow, so gmktec's peer fetch times out and reports
+`stale (transport_failed)`. Enabling that flow is an operator decision that
+must edit both the accept list and that deny test; until then the rollout
+stays at this stage with codinghome at `peers: []`.
 
 Expand the workspace list and other account pools only after the first pool
 has stable placement. The seven-day acceptance window, one real quota reset,

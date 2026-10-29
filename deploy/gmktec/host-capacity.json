@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "state_path": "/home/coding/.local/state/subgov/host-capacity.json",
+  "pools": {
+    "codex": {
+      "prefixes": [
+        "sg-codex-gmktec-"
+      ],
+      "identifiers": [],
+      "demand_state": "/home/coding/.needle/subgov/codex-ready-demand.json"
+    }
+  }
+}

@@ -50,6 +50,7 @@ accounts:
 federation:
   host_id: gmktec
   primary: false
+  host_capacity_state: /home/coding/.local/state/subgov/host-capacity.json
   peers:
     - host_id: codinghome
       argv: [ssh, -o, BatchMode=yes, -o, ConnectTimeout=5, codinghome, /home/coding/.local/bin/subgov, --config, /home/coding/.config/subgov/codex.yaml, peer-state, --json]
