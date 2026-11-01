@@ -82,6 +82,11 @@ def _contains_secret_quarantine(value):
                             return True
                 elif isinstance(node, list):
                     return any(true_flag(child) for child in node)
+                elif isinstance(node, str):
+                    return (
+                        "secret_quarantined" in node.lower()
+                        and not re.search(r"secret_quarantined\s*[:=]\s*false\b", node, re.I)
+                    )
                 return False
 
             if true_flag(document):
@@ -150,6 +155,10 @@ def decide(issue, survivor_of, healthy):
 
 
 def plan_workspace(workspace, gate_dir):
+    status = run(["bead", "sync", "status", "--json"], workspace, 120)
+    if _contains_secret_quarantine(status):
+        return [{"workspace": str(workspace), "action": "skip-secret-quarantined",
+                 "reason": "bead store reports secret_quarantined", "title": ""}]
     r = run(["bead", "list", "--status", "open", "--json", "--limit", "20000"], workspace, 180)
     if _contains_secret_quarantine(r):
         return [{"workspace": str(workspace), "action": "skip-secret-quarantined",

@@ -76,7 +76,11 @@ class ProposalTriageTests(unittest.TestCase):
             first = issue("Fix quota refresh regression", "Observed failing refresh on 2026-10-12.", "subgov-rich")
             second = issue("Fix quota refresh regression now", "Observed failing refresh.", "subgov-dup")
             output = json.dumps([first, second])
-            with patch.object(triage, "run", return_value=CommandResult(stdout=output)):
+            with patch.object(
+                triage,
+                "run",
+                side_effect=[CommandResult(stdout="{}"), CommandResult(stdout=output)],
+            ):
                 plan = triage.plan_workspace(workspace, workspace / "gates")
         by_id = {item["id"]: item for item in plan}
         self.assertEqual(by_id["subgov-rich"]["action"], "admit-evidence")
@@ -101,7 +105,11 @@ class ProposalTriageTests(unittest.TestCase):
             (workspace / "Cargo.toml").write_text("[package]\nname='fixture'\nversion='0.1.0'\n")
             proposal = issue("Fix quota refresh regression", "Observed failing refresh on 2026-10-12.")
             result = CommandResult(stdout=json.dumps({"secret_quarantined": False, "issues": [proposal]}))
-            with patch.object(triage, "run", return_value=result):
+            with patch.object(
+                triage,
+                "run",
+                side_effect=[CommandResult(stdout=json.dumps({"secret_quarantined": False})), result],
+            ):
                 plan = triage.plan_workspace(workspace, workspace / "gates")
         self.assertEqual(plan[0]["action"], "admit-evidence")
 
