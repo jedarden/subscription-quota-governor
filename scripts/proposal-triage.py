@@ -8,7 +8,9 @@ Rules (RULE_VERSION below; bead subgov-91eebc6b):
   4. Security proposals citing a concrete vulnerability are admitted.
   5. Other proposals are admitted when the evidence check passes: a dated
      failure or live observation, a healthy gate, a working verifier.
-Everything else is left held. Admission removes `proposal-pending` and `human`.
+Proposals with no evidence, or that duplicate an admitted one, are discarded
+(reversible close). Only a proposal whose evidence is sound but whose workspace
+gate is unhealthy stays held, and is re-evaluated on every run. Admission removes `proposal-pending` and `human`.
 Every decision is appended to a JSONL receipt so mature outcomes can be joined
 to the rule version later (NEEDLE self-learning lifecycle).
 
@@ -26,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-RULE_VERSION = "proposal-triage-2026-10-23.1"
+RULE_VERSION = "proposal-triage-2026-11-01.1"
 HOLD_PREFIXES = ("deferred", "retry-cooldown", "over-budget", "failure-count",
                  "cycling", "umbrella", "split-child", "parent-")
 DOC_TITLE = re.compile(r"\b(document|documentation|docs?|readme|runbook|reference|"
@@ -37,7 +39,7 @@ HAZARD = re.compile(r"prohibited|retired path|forbidden|data loss|outage|inciden
                     r"unauthenticated|credential|secret|vulnerab|critical", re.I)
 DEFECT = re.compile(r"\b(regression|bug|fixed in|failed|failing|broke|crash|incident|outage)\b", re.I)
 DOC_EXCLUDE = re.compile(r"\b(ci|gate|enforce|beads?|alerts?|probe|deploy|release|version)\b", re.I)
-DATED = re.compile(r"2026-(09|10)-\d\d")
+DATED = re.compile(r"2026-(09|1[0-2])-\d\d")
 LIVE = re.compile(r"observed|verified|live|evidence|failed|failing", re.I)
 SEC_TITLE = re.compile(r"npm audit|vulnerab|\bcve\b|unauthenticated|authentication|authorization|"
                        r"ownership check|access.control", re.I)
@@ -102,7 +104,7 @@ def decide(issue, survivor_of, healthy):
     if dated_evidence:
         return ("admit-evidence", "dated failure or live observation; healthy gate and verifier") \
             if healthy else ("leave", "evidence present but workspace gate unhealthy or no verifier")
-    return "leave", "no dated evidence"
+    return "reject-noevidence", "no dated failure or live observation to justify the work"
 
 
 def plan_workspace(workspace, gate_dir):
@@ -132,7 +134,7 @@ def plan_workspace(workspace, gate_dir):
                 taken.add(b)
         for b in cluster:
             plan.append({"workspace": str(workspace), "id": props[b]["id"], "action": "reject-dup",
-                         "reason": f"duplicate of {props[a]['id']}", "survivor": props[a]["id"]})
+                         "reason": f"duplicate of {props[a]['id']}", "survivor": props[a]["id"], "title": props[b]["title"][:100]})
     for a, issue in enumerate(props):
         if a in taken:
             continue
@@ -148,7 +150,7 @@ def plan_workspace(workspace, gate_dir):
                        key=lambda x: richness(by_id_all[x["id"]]), reverse=True):
         topic = next((n for n, rx in topics if rx.search(item["title"])), item["id"])
         if topic in seen_topic:
-            item["action"], item["reason"] = "leave", f"same security topic as admitted {seen_topic[topic]}"
+            item["action"], item["reason"] = "reject-dup", f"same security topic as admitted {seen_topic[topic]}"
         else:
             seen_topic[topic] = item["id"]
     # 2b. Loose duplicate pass over admissions only: never admit two look-alikes.
@@ -160,7 +162,7 @@ def plan_workspace(workspace, gate_dir):
         twin = next((k for k in kept if ta and by_id[k][1]
                      and len(ta & by_id[k][1]) / len(ta | by_id[k][1]) >= 0.4), None)
         if twin:
-            item["action"], item["reason"] = "leave", f"possible duplicate of admitted {twin}"
+            item["action"], item["reason"] = "reject-dup", f"possible duplicate of admitted {twin}"
         else:
             kept.append(item["id"])
     return plan
@@ -192,6 +194,7 @@ def apply_workspace(workspace, items, receipts_path):
         except Exception as exc:  # keep going; record the failure
             it["ok"] = False
             it["error"] = str(exc)[:200]
+        it["fingerprint"] = hashlib.sha256((str(ws) + "|" + " ".join(sorted(tokens(it.get("title", ""))))).encode()).hexdigest()[:16]
         it["at"] = stamp
         it["rule"] = RULE_VERSION
         with receipts_path.open("a") as f:
