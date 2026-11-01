@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically triage held subgov proposal beads
+
+[Timer]
+# Wall-clock scheduling is deliberate: a monotonic-only timer can lose its
+# baseline when the user manager restarts and remain active but never fire.
+OnCalendar=*:0/15
+Persistent=true
+AccuracySec=1min
+Unit=subgov-proposal-triage.service
+
+[Install]
+WantedBy=timers.target

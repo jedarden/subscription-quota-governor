@@ -36,6 +36,10 @@ MANIFEST = {
         "subgov_source_watch.py",
         "subgov_adapter_common.py",
     ],
+    "subgov-proposal-triage": [
+        "proposal-triage.py",
+        "proposal-triage-watchdog.py",
+    ],
 }
 
 

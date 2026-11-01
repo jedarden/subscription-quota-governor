@@ -1,0 +1,14 @@
+# Independently scheduled from subgov-proposal-triage.timer so a silent
+# primary timer cannot also silence its own health check.
+[Unit]
+Description=Watch proposal-triage timer and recent execution
+OnFailure=repo-traffic-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
+ExecStart=/run/current-system/sw/bin/python3 -B /home/coding/.local/lib/subgov-proposal-triage/proposal-triage-watchdog.py
+TimeoutStartSec=30s
+UMask=0077
+NoNewPrivileges=true
+SyslogIdentifier=subgov-proposal-triage-watchdog

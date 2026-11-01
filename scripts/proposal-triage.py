@@ -53,6 +53,48 @@ def run(cmd, cwd, timeout=120):
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
+def _contains_secret_quarantine(value):
+    """Return whether a bead command reports a secret quarantine.
+
+    The native CLI uses a structured ``secret_quarantined`` field when it can
+    render JSON, but older/failing paths report the same condition in stderr.
+    Do not treat ``quarantined: false`` as a quarantine: advisory secret
+    findings are normal and must not suppress triage.
+    """
+    unparsed_texts = []
+    for attr in ("stdout", "stderr"):
+        text = getattr(value, attr, "") or ""
+        if text:
+            parsed = False
+            try:
+                document = json.loads(text)
+                parsed = True
+            except (TypeError, ValueError):
+                document = None
+                unparsed_texts.append(text)
+
+            def true_flag(node):
+                if isinstance(node, dict):
+                    for key, child in node.items():
+                        if key == "secret_quarantined" and child is True:
+                            return True
+                        if true_flag(child):
+                            return True
+                elif isinstance(node, list):
+                    return any(true_flag(child) for child in node)
+                return False
+
+            if true_flag(document):
+                return True
+            if parsed:
+                continue
+    return any(
+        "secret_quarantined" in text.lower()
+        and not re.search(r"secret_quarantined\s*[:=]\s*false\b", text, re.I)
+        for text in unparsed_texts
+    )
+
+
 def tokens(title):
     return frozenset(x for x in re.findall(r"[a-z0-9_]+", title.lower()) if len(x) > 3)
 
@@ -109,6 +151,9 @@ def decide(issue, survivor_of, healthy):
 
 def plan_workspace(workspace, gate_dir):
     r = run(["bead", "list", "--status", "open", "--json", "--limit", "20000"], workspace, 180)
+    if _contains_secret_quarantine(r):
+        return [{"workspace": str(workspace), "action": "skip-secret-quarantined",
+                 "reason": "bead store reports secret_quarantined", "title": ""}]
     try:
         data = json.loads(r.stdout)
     except ValueError:
@@ -221,20 +266,24 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         plans = list(pool.map(lambda w: plan_workspace(w, gate_dir), spaces))
     plan = [x for part in plans for x in part]
-    print(json.dumps(Counter(x["action"] for x in plan), indent=1))
+    counts = Counter(x["action"] for x in plan)
     if args.plan_out:
         Path(args.plan_out).write_text(json.dumps(plan))
+    skipped = counts.get("skip-secret-quarantined", 0)
     if not args.apply:
+        summary = " ".join(f"{key}={counts[key]}" for key in sorted(counts)) or "decisions=0"
+        print(f"proposal-triage rule={RULE_VERSION} {summary} skipped_secret_quarantined={skipped}")
         return 0
     grouped = defaultdict(list)
     for x in plan:
-        if x["action"] != "leave":
+        if x["action"] not in ("leave", "skip-secret-quarantined"):
             grouped[x["workspace"]].append(x)
     receipts = Path(args.receipts)
     receipts.parent.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         total = sum(pool.map(lambda kv: apply_workspace(kv[0], kv[1], receipts), grouped.items()))
-    print(f"applied {total} decisions; receipts: {receipts}")
+    summary = " ".join(f"{key}={counts[key]}" for key in sorted(counts)) or "decisions=0"
+    print(f"proposal-triage rule={RULE_VERSION} {summary} applied={total} skipped_secret_quarantined={skipped} receipts={receipts}")
     return 0
 
 

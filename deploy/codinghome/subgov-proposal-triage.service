@@ -1,0 +1,16 @@
+# Codinghome user unit. The interim adapter is intentionally isolated from
+# NEEDLE's eventual in-process proposal evaluator (needle-e782689c).
+[Unit]
+Description=Automatically triage held subgov proposal beads
+After=network-online.target
+Wants=network-online.target
+OnFailure=repo-traffic-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/coding/.local/bin:/home/coding/.cargo/bin:/run/current-system/sw/bin
+ExecStart=/run/current-system/sw/bin/python3 -B /home/coding/.local/lib/subgov-proposal-triage/proposal-triage.py --apply
+TimeoutStartSec=15min
+UMask=0077
+NoNewPrivileges=true
+SyslogIdentifier=subgov-proposal-triage

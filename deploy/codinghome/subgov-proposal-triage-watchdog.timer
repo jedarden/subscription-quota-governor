@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch the proposal-triage timer independently
+
+[Timer]
+OnCalendar=*:5/15
+Persistent=true
+AccuracySec=1min
+Unit=subgov-proposal-triage-watchdog.service
+
+[Install]
+WantedBy=timers.target

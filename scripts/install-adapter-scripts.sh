@@ -77,12 +77,13 @@ else
         fail "could not resolve repository HEAD"
 fi
 
-adapter_dirs=(subgov-codex subgov-zai subgov-anthropic subgov-source-watch)
+adapter_dirs=(subgov-codex subgov-zai subgov-anthropic subgov-source-watch subgov-proposal-triage)
 declare -A adapter_files=(
     [subgov-codex]='codex-productive.py subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-source-refresh.py'
     [subgov-zai]='subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-collector.py zai-fleet.py zai-source-refresh.py zai-takeover.py'
     [subgov-anthropic]='anthropic-productive.py codex-productive.py subgov_adapter_common.py subgov_ready_beads.py subgov_host_capacity.py zai-source-refresh.py'
     [subgov-source-watch]='subgov_source_watch.py subgov_adapter_common.py'
+    [subgov-proposal-triage]='proposal-triage.py proposal-triage-watchdog.py'
 )
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/subgov-adapter-scripts.XXXXXX")
