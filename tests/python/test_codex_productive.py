@@ -163,6 +163,24 @@ class ProductiveTests(unittest.TestCase):
             self.assertEqual(measured["ready_bead_count"], 0)
             self.assertEqual(measured["degraded_workers"][0]["reason"], "claim_mismatch")
 
+    def test_foreign_claim_still_reserves_both_workers_on_same_bead(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            workers = [{"worker_id": "sg-codex-1", "qualified_id": "codex-test-sg-codex-1",
+                        "current_bead": "shared-1", "workspace": root},
+                       {"worker_id": "sg-codex-2", "qualified_id": "codex-test-sg-codex-2",
+                        "current_bead": "shared-1", "workspace": root}]
+            issue = {"id": "shared-1", "status": "in_progress", "assignee": workers[1]["qualified_id"]}
+            with patch.object(adapter, "workers", return_value=workers), \
+                 patch.object(adapter, "policy_ok", return_value=True), \
+                 patch.object(adapter, "run", return_value=json.dumps(issue)), \
+                 patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[]):
+                measured = adapter.demand(s)
+            self.assertEqual(measured["eligible_backlog_capacity"], 2)
+            self.assertEqual(len(measured["busy"]), 2)
+            self.assertEqual(measured["degraded_workers"][0]["worker"], workers[0]["qualified_id"])
+
     def test_one_systemd_timeout_reserves_worker_without_losing_capacity(self):
         with tempfile.TemporaryDirectory() as root:
             s = self.adoption_settings(Path(root))

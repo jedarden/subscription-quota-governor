@@ -248,6 +248,7 @@ def install_adoption(settings):
 def demand(settings):
     owned_busy, degraded, unowned, classified = [], [], 0, 0
     unit_timeouts = []
+    pending_degraded = []
     observed = (inspect_fleet(settings, unit_timeouts=unit_timeouts)
                 if settings.get("adopted_workers") else workers(settings))
     timed_out = {entry["worker_id"] for entry in unit_timeouts}
@@ -282,10 +283,12 @@ def demand(settings):
         except Exception as exc:
             reason = ("claim_mismatch" if str(exc) == "busy worker claim identity mismatch"
                       else "probe_" + type(exc).__name__)
-            reserve(worker["qualified_id"], route, reason, task)
+            pending_degraded.append((worker["qualified_id"], route, reason, task))
             continue
         owned_busy.append({"id": task, "workspace": str(route)})
         classified += 1
+    for worker_id, route, reason, task in pending_degraded:
+        reserve(worker_id, route, reason, task)
     for entry in unit_timeouts:
         current = next((worker for worker in observed if worker["worker_id"] == entry["worker_id"]), None)
         task = (current.get("current_bead") or current.get("current_task")) if current else None
