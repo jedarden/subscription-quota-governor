@@ -358,10 +358,13 @@ def apply_lane_labels(settings, measured, label):
     timeout = settings["demand"].get("ready_timeout_seconds", 8)
     with ThreadPoolExecutor(max_workers=4) as pool:
         outcomes = list(pool.map(lambda job: label_job(job, label, timeout), pending))
-    failed = [(job, error) for job, error in zip(pending, outcomes) if error is not None]
-    if not failed:
-        for job in pending:
+    failed = []
+    for job, error in zip(pending, outcomes):
+        if error is None:
             job["labelled"] = True
+        else:
+            failed.append((job, error))
+    if not failed:
         return
     dropped = {(job["workspace"], job["id"]) for job, _ in failed}
     measured["eligible"] = [job for job in measured["eligible"]

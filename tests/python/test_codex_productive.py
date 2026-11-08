@@ -107,19 +107,29 @@ class ProductiveTests(unittest.TestCase):
     def test_failed_labelling_drops_the_bead_from_counted_demand(self):
         with tempfile.TemporaryDirectory() as root:
             s = self.dispatch_settings(Path(root))
-            issue = {"id": "new-1", "status": "open", "assignee": None, "labels": []}
+            s["demand"]["workspaces"] = [str(Path(root)), str(Path(root) / "other")]
+            good = {"id": "good-1", "status": "open", "assignee": None, "labels": []}
+            quarantined = {"id": "held-1", "status": "open", "assignee": None, "labels": []}
+            issues = {str(Path(root)): [good], str(Path(root) / "other"): [quarantined]}
             with patch.object(ready_beads, "policy_ok", return_value=True), \
-                 patch.object(ready_beads, "ready_issues", return_value=[issue]), \
+                 patch.object(ready_beads, "ready_issues",
+                              side_effect=lambda route, timeout=8: issues[route]), \
                  patch.object(adapter, "workers", return_value=[]), \
-                 patch.object(adapter, "run", side_effect=RuntimeError("store locked")):
+                 patch.object(adapter, "run",
+                              side_effect=lambda argv, cwd=None, timeout=5:
+                                  (_ for _ in ()).throw(RuntimeError("store locked"))
+                                  if argv[3] == "held-1" else ""):
                 measured = adapter.demand(s)
-            self.assertEqual(measured["ready_bead_count"], 0)
-            self.assertEqual(measured["eligible"], [])
-            self.assertEqual(measured["ready"], [])
+            self.assertEqual([job["id"] for job in measured["eligible"]], ["good-1"])
+            self.assertTrue(measured["eligible"][0]["labelled"])
+            self.assertEqual(measured["ready_bead_count"], 1)
             dropped = measured["blocked"][-1]
             self.assertEqual(dropped["reason"], "lane_labelling_failed")
             self.assertEqual(dropped["error"], "RuntimeError")
-            self.assertEqual(measured["workspaces"][0]["ready_beads"], 0)
+            other = next(summary for summary in measured["workspaces"]
+                         if summary["workspace"] == str(Path(root) / "other"))
+            self.assertEqual(other["ready_beads"], 0)
+            self.assertEqual(measured["eligible_backlog_capacity"], 1)
 
     def test_without_the_dispatch_flag_demand_stays_read_only(self):
         with tempfile.TemporaryDirectory() as root:
