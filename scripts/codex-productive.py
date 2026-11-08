@@ -177,7 +177,7 @@ def retirement_guard(settings, entry):
             f"EnvironmentFile={settings['adoption_env']}\n")
 
 
-def inspect_fleet(settings):
+def inspect_fleet(settings, unit_timeouts=None):
     if settings.get("adoption_env") and Path(settings["adoption_env"]).read_text() != "NEEDLE_STRANDS__GENERATION__ENABLED=false\n":
         raise ValueError("adopted launch policy changed")
     live = workers(settings, fresh=False)
@@ -191,7 +191,15 @@ def inspect_fleet(settings):
             if current:
                 check_adopted_routing(settings, entry, current["pid"])
             continue
-        info = unit_info(entry["unit"])
+        try:
+            info = unit_info(entry["unit"])
+        except subprocess.TimeoutExpired:
+            if unit_timeouts is None:
+                raise
+            # Demand can reserve this adopted slot without trusting its unit
+            # state. Actuation still requires the full identity check.
+            unit_timeouts.append(entry)
+            continue
         check_adopted_routing(settings, entry, info["pid"])
         dropin, marker = retirement_paths(settings, entry)
         if not dropin.exists() or dropin.read_text() != retirement_guard(settings, entry):
@@ -238,22 +246,56 @@ def install_adoption(settings):
 
 
 def demand(settings):
-    owned_busy, unowned = [], 0
-    for worker in inspect_fleet(settings) if settings.get("adopted_workers") else workers(settings):
+    owned_busy, degraded, unowned, classified = [], [], 0, 0
+    unit_timeouts = []
+    observed = (inspect_fleet(settings, unit_timeouts=unit_timeouts)
+                if settings.get("adopted_workers") else workers(settings))
+    timed_out = {entry["worker_id"] for entry in unit_timeouts}
+
+    def reserve(worker_id, route, reason, task=None):
+        # Keep the reported task out of ready demand during a claim race.
+        # If another worker already occupies that task, a synthetic ID still
+        # holds this worker's separate capacity slot.
+        occupied = {(item["workspace"], item["id"]) for item in owned_busy}
+        task_id = task if task and (str(route), task) not in occupied else "__degraded__:" + worker_id
+        owned_busy.append({"id": task_id, "workspace": str(route)})
+        degraded.append({"worker": worker_id, "reason": reason})
+
+    for worker in observed:
+        if worker["worker_id"] in timed_out:
+            continue
         if not owned(settings, worker):
             unowned += 1
+            classified += 1
             continue
         task = worker.get("current_bead") or worker.get("current_task")
         if not task:
+            classified += 1
             continue
         route = Path(worker["workspace"]).resolve()
-        if not policy_ok(route, settings["host"]):
-            raise ValueError("busy worker route ownership unknown")
-        issue = single(run(["bead", "show", task, "--json"], cwd=route))
-        if issue.get("status") != "in_progress" or issue.get("assignee") != worker["qualified_id"]:
-            raise ValueError("busy worker claim identity mismatch")
+        try:
+            if not policy_ok(route, settings["host"]):
+                raise ValueError("busy worker route ownership unknown")
+            issue = single(run(["bead", "show", task, "--json"], cwd=route))
+            if issue.get("status") != "in_progress" or issue.get("assignee") != worker["qualified_id"]:
+                raise ValueError("busy worker claim identity mismatch")
+        except Exception as exc:
+            reason = ("claim_mismatch" if str(exc) == "busy worker claim identity mismatch"
+                      else "probe_" + type(exc).__name__)
+            reserve(worker["qualified_id"], route, reason, task)
+            continue
         owned_busy.append({"id": task, "workspace": str(route)})
-    return ready_demand(settings, owned_busy, unowned)
+        classified += 1
+    for entry in unit_timeouts:
+        current = next((worker for worker in observed if worker["worker_id"] == entry["worker_id"]), None)
+        task = (current.get("current_bead") or current.get("current_task")) if current else None
+        reserve(entry["agent"] + "-" + entry["worker_id"],
+                Path(entry["workspace"]).resolve(), "unit_timeout", task)
+    if degraded and not classified:
+        raise ValueError("no worker claim state could be classified")
+    measured = ready_demand(settings, owned_busy, unowned)
+    measured["degraded_workers"] = degraded
+    return measured
 
 
 def refresh(settings):
@@ -267,7 +309,8 @@ def refresh(settings):
         except Exception as exc:
             # Unknown demand must hold existing workers, never manufacture zero
             # or grant capacity. Do not forward CLI output or credentials.
-            print(f"subgov-codex-source: demand unavailable "
+            source = settings.get("lane_label", "subgov-codex-productive").removesuffix("-productive") + "-source"
+            print(f"{source}: demand unavailable "
                   f"({type(exc).__name__}: {describe_error(exc)})", file=sys.stderr)
             quota["fresh"] = False
             measured = {"observed_at": current_time().isoformat(), "unknown": type(exc).__name__}

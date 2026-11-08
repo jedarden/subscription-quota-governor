@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
 import signal
@@ -6,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -115,6 +117,88 @@ class ProductiveTests(unittest.TestCase):
                  patch.object(adapter, "run", return_value=json.dumps({**issue, "assignee": "someone-else"})):
                 with self.assertRaises(ValueError):
                     adapter.demand(s)
+
+    def test_one_mismatched_busy_worker_preserves_observed_capacity(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            workers = [
+                {"worker_id": "sg-codex-1", "qualified_id": "codex-test-sg-codex-1",
+                 "current_bead": "busy-1", "workspace": root},
+                {"worker_id": "sg-codex-2", "qualified_id": "codex-test-sg-codex-2",
+                 "current_bead": "busy-2", "workspace": root},
+                {"worker_id": "sg-codex-3", "qualified_id": "codex-test-sg-codex-3",
+                 "current_bead": None, "workspace": root},
+            ]
+            def show(argv, cwd=None):
+                task = argv[2]
+                assignee = "foreign-worker" if task == "busy-2" else workers[0]["qualified_id"]
+                return json.dumps({"id": task, "status": "in_progress", "assignee": assignee})
+            with patch.object(adapter, "workers", return_value=workers), \
+                 patch.object(adapter, "policy_ok", return_value=True), \
+                 patch.object(adapter, "run", side_effect=show), \
+                 patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[
+                     {"id": "ready-1", "status": "open", "assignee": None, "labels": []}]):
+                measured = adapter.demand(s)
+            self.assertEqual(measured["eligible_backlog_capacity"], 3)
+            self.assertEqual(measured["ready_bead_count"], 1)
+            self.assertEqual(measured["degraded_workers"], [
+                {"worker": workers[1]["qualified_id"], "reason": "claim_mismatch"}])
+            self.assertEqual(len(measured["busy"]), 2)
+
+    def test_claiming_race_holds_its_bead_out_of_ready_demand(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            claiming = {"worker_id": "sg-codex-1", "qualified_id": "codex-test-sg-codex-1",
+                        "current_bead": "claiming-1", "workspace": root}
+            idle = {"worker_id": "sg-codex-2", "current_bead": None}
+            issue = {"id": "claiming-1", "status": "open", "assignee": None, "labels": []}
+            with patch.object(adapter, "workers", return_value=[claiming, idle]), \
+                 patch.object(adapter, "policy_ok", return_value=True), \
+                 patch.object(adapter, "run", return_value=json.dumps(issue)), \
+                 patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[issue]):
+                measured = adapter.demand(s)
+            self.assertEqual(measured["eligible_backlog_capacity"], 1)
+            self.assertEqual(measured["ready_bead_count"], 0)
+            self.assertEqual(measured["degraded_workers"][0]["reason"], "claim_mismatch")
+
+    def test_one_systemd_timeout_reserves_worker_without_losing_capacity(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.adoption_settings(Path(root))
+            idle = {"worker_id": "sg-codex-1", "model": "codex-test",
+                    "current_bead": None, "last_heartbeat": adapter.current_time().isoformat()}
+            with patch.object(adapter, "workers", return_value=[idle]), \
+                 patch.object(adapter, "unit_info", side_effect=subprocess.TimeoutExpired("systemctl", 5)), \
+                 patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[
+                     {"id": "ready-1", "status": "open", "assignee": None, "labels": []}]):
+                measured = adapter.demand(s)
+            self.assertEqual(measured["eligible_backlog_capacity"], 2)
+            self.assertEqual(measured["degraded_workers"], [
+                {"worker": "codex-sol-old-sol", "reason": "unit_timeout"}])
+            self.assertEqual(len(measured["busy"]), 1)
+
+    def test_all_unclassifiable_workers_publish_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            s["lane_label"] = "subgov-anthropic-productive"
+            worker = {"worker_id": "sg-codex-1", "qualified_id": "codex-test-sg-codex-1",
+                      "current_bead": "busy-1", "workspace": root}
+            def run(argv, cwd=None, timeout=5):
+                if argv[0] == "bead":
+                    return json.dumps({"id": "busy-1", "status": "open", "assignee": None})
+                return '{"fresh":true}'
+            stderr = io.StringIO()
+            with patch.object(adapter, "workers", return_value=[worker]), \
+                 patch.object(adapter, "policy_ok", return_value=True), \
+                 patch.object(adapter, "run", side_effect=run), redirect_stderr(stderr):
+                adapter.refresh(s)
+            self.assertIn("subgov-anthropic-source: demand unavailable", stderr.getvalue())
+            self.assertEqual(json.loads(Path(s["demand_state"]).read_text())["unknown"], "ValueError")
+            snapshot = json.loads(Path(s["snapshot"]).read_text())
+            self.assertFalse(snapshot["fresh"])
+            self.assertNotIn("eligible_backlog_capacity", snapshot)
 
     def test_busy_supervisor_never_signalled(self):
         with patch.object(adapter.signal, "pidfd_send_signal") as send:
