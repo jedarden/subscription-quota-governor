@@ -167,6 +167,7 @@ fn single_window_snapshot(
         reset_credits: None,
         backpressure: None,
         saturation: None,
+        lane_starved: None,
     }
 }
 

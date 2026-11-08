@@ -9,6 +9,24 @@ versioned config-schema contract; see
 
 ## [Unreleased]
 
+### Fixed
+
+- Lane starvation (subgov-6db97205): admitted ready demand was invisible to
+  the `subgov-codex-productive` lane because NEEDLE's Explore admits only
+  lane-labelled beads and no code path applied the label. The demand
+  publisher now applies its `lane_label` to every counted eligible bead at
+  refresh time when the pool sets `apply_lane_labels: true` (the label
+  belongs to the publisher, not to per-path admission hooks, which are
+  incomplete by construction; the lane stays bounded by verified demand). A
+  bead whose labelling fails is not counted that cycle
+  (`lane_labelling_failed` in `blocked`). The publisher also evaluates the
+  starvation invariant — counted demand while every lane worker stays
+  exhausted for more than 2 consecutive refreshes — publishing
+  `lane_starved` through the demand document and quota snapshot into the
+  account's `status.json` entry. `observe()` additionally exports `eligible`,
+  the full unclaimed set behind `ready_bead_count`, annotated with
+  `labelled` when a lane label is configured.
+
 ### Added
 
 - Plan §28.6 shared account total and cross-host placement (WP29): every

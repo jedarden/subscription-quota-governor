@@ -13,6 +13,12 @@ pub struct QuotaSnapshot {
     /// capacity; when absent, it holds the current worker count as the cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_backlog_capacity: Option<u32>,
+    /// The demand publisher's lane-starvation verdict (subgov-6db97205):
+    /// eligible demand exists while every lane worker is exhausted for more
+    /// than 2 consecutive refreshes. Omitted when the source evaluates no
+    /// lane invariant or demand was unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_starved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits: Option<ResetCreditsSnapshot>,
     /// Optional provider-pressure signal over a trailing observation window.

@@ -75,6 +75,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         }
     }
 

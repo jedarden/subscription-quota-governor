@@ -4,6 +4,7 @@
 NEEDLE owns placement and admission. Quota availability never creates work.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
 import os
@@ -26,7 +27,12 @@ IDLE = {"SELECTING", "IDLE", "WAITING", "BACKOFF", "SLEEPING", "EXHAUSTED", "ADM
 def run(argv, cwd=None, timeout=5):
     result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
-        label = "read-only command failed" if argv[0] == "bead" else "adapter command failed"
+        if argv[:2] == ["bead", "label"]:
+            label = "dispatch labelling failed"
+        elif argv[0] == "bead":
+            label = "read-only command failed"
+        else:
+            label = "adapter command failed"
         # The journal is where a failed command's own stderr belongs; the
         # published snapshot stays free of CLI output (subgov-28a476df).
         raise RuntimeError(describe_error(RuntimeError(label), result.stderr))
@@ -65,6 +71,11 @@ def settings_read(path):
         raise ValueError("invalid Codex adapter")
     if not isinstance(value.get("demand"), dict):
         raise ValueError("missing ready-bead workspace scope")
+    lane_labels = value.get("apply_lane_labels")
+    if lane_labels is not None and type(lane_labels) is not bool:
+        raise ValueError("apply_lane_labels must be a boolean")
+    if lane_labels and not value.get("lane_label"):
+        raise ValueError("apply_lane_labels requires the lane label")
     names = set()
     for worker in value.get("adopted_workers", []):
         name, agent = worker.get("worker_id", ""), worker.get("agent", "")
@@ -296,9 +307,114 @@ def demand(settings):
                 Path(entry["workspace"]).resolve(), "unit_timeout", task)
     if degraded and not classified:
         raise ValueError("no worker claim state could be classified")
-    measured = ready_demand(settings, owned_busy, unowned)
+    lane = dispatch_label(settings)
+    measured = ready_demand(settings, owned_busy, unowned, lane_label=lane)
+    if lane:
+        apply_lane_labels(settings, measured, lane)
     measured["degraded_workers"] = degraded
     return measured
+
+
+def dispatch_label(settings):
+    """The lane label this pool must keep claimable, when lane dispatch is on.
+
+    The lane binding confines the pool to beads carrying its label (NEEDLE
+    Explore `lane_admits`), so the publisher applies that label to every bead
+    it counts as eligible demand. The flag is explicit per pool: a pool whose
+    lane is not installed (unbound workers already admit everything) must not
+    write labels into foreign stores.
+    """
+    return settings["lane_label"] if settings.get("apply_lane_labels") else None
+
+
+def label_job(job, label, timeout):
+    """Apply the dispatch label to one counted bead; return the failure or None.
+
+    `bead label add` is idempotent, so a timeout leaves at most a label the
+    next refresh observes as already present; the bead is not counted this
+    cycle either way.
+    """
+    try:
+        run(["bead", "label", "add", job["id"], "--label", label],
+            cwd=job["workspace"], timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - every failure drops the bead from counted demand
+        return exc
+    return None
+
+
+def apply_lane_labels(settings, measured, label):
+    """Make counted demand claimable: label every eligible bead, count only labelled ones.
+
+    The invariant this enforces (subgov-6db97205): a bead the demand document
+    counts as eligible demand is claimable by an idle lane worker. A bead
+    whose labelling fails is not counted this cycle -- it moves to `blocked`
+    with reason `lane_labelling_failed` and its slot evidence is reduced
+    conservatively. Labels are sticky; a later hold still governs dispatch
+    because NEEDLE's own admission filters run after `lane_admits`.
+    """
+    pending = [job for job in measured.get("eligible", []) if not job.get("labelled")]
+    if not pending:
+        return
+    timeout = settings["demand"].get("ready_timeout_seconds", 8)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(lambda job: label_job(job, label, timeout), pending))
+    failed = [(job, error) for job, error in zip(pending, outcomes) if error is not None]
+    if not failed:
+        for job in pending:
+            job["labelled"] = True
+        return
+    dropped = {(job["workspace"], job["id"]) for job, _ in failed}
+    measured["eligible"] = [job for job in measured["eligible"]
+                            if (job["workspace"], job["id"]) not in dropped]
+    removed_seeds = sum(1 for job in measured["ready"]
+                        if (job["workspace"], job["id"]) in dropped)
+    measured["ready"] = [job for job in measured["ready"]
+                         if (job["workspace"], job["id"]) not in dropped]
+    measured["ready_bead_count"] = len(measured["eligible"])
+    # Only seeded jobs held capacity; dropping them reduces it, never raises it.
+    measured["eligible_backlog_capacity"] = max(
+        0, measured.get("eligible_backlog_capacity", 0) - removed_seeds)
+    for summary in measured["workspaces"]:
+        failures = sum(1 for job, _ in failed if job["workspace"] == summary["workspace"])
+        if failures:
+            summary["ready_beads"] = max(0, summary["ready_beads"] - failures)
+            summary["eligible_slots"] = max(0, summary["eligible_slots"]
+                                            - min(failures, summary["eligible_slots"]))
+    for job, error in failed:
+        measured["blocked"].append({"workspace": job["workspace"], "id": job["id"],
+                                    "reason": "lane_labelling_failed",
+                                    "error": type(error).__name__})
+
+
+def lane_starvation(settings, measured):
+    """The lane-starvation invariant across consecutive refreshes.
+
+    `ready_bead_count > 0` while every fresh owned lane worker is exhausted
+    (an EXHAUSTED state: it scanned and found nothing its lane admits) for
+    more than 2 consecutive refreshes is `lane_starved`. The counter lives in
+    the published demand document: an unknown-demand cycle publishes without
+    it, so the next successful refresh restarts the streak at 1. Evaluation
+    failure breaks the streak and is recorded, never invented either way.
+    """
+    workers_lane = [worker for worker in workers(settings) if owned(settings, worker)]
+    result = {"lane_starved": False, "lane_starved_refreshes": 0,
+              "lane_starved_condition": False}
+    try:
+        exhausted = bool(workers_lane) and all(
+            str(worker.get("state", "")).startswith("EXHAUSTED") for worker in workers_lane)
+        ready = int(measured.get("ready_bead_count") or 0) > 0
+        result["lane_starved_condition"] = bool(exhausted and ready)
+        previous = read_json(settings["demand_state"], {})
+        streak = previous.get("lane_starved_refreshes", 0) if previous.get(
+            "lane_starved_condition") else 0
+        if type(streak) is not int or streak < 0:
+            streak = 0
+        result["lane_starved_refreshes"] = streak + 1 if result["lane_starved_condition"] else 0
+        result["lane_starved"] = result["lane_starved_refreshes"] > 2
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not block capacity publication
+        result["lane_starved_error"] = type(exc).__name__
+        result["lane_starved_refreshes"] = 0
+    return result
 
 
 def refresh(settings):
@@ -306,9 +422,14 @@ def refresh(settings):
         quota = document(run([settings["quota_binary"], "--config", settings["quota_config"],
                               "snapshot", settings.get("quota_account", "codex")], timeout=35))
         quota.pop("eligible_backlog_capacity", None)
+        quota.pop("lane_starved", None)
         try:
             measured = demand(settings)
             quota["eligible_backlog_capacity"] = measured["eligible_backlog_capacity"]
+            if dispatch_label(settings):
+                measured.update(lane_starvation(settings, measured))
+                if not measured.get("lane_starved_error"):
+                    quota["lane_starved"] = measured["lane_starved"]
         except Exception as exc:
             # Unknown demand must hold existing workers, never manufacture zero
             # or grant capacity. Do not forward CLI output or credentials.

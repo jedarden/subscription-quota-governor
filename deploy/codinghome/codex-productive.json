@@ -7,6 +7,7 @@
   "prefix": "sg-codex-",
   "max_workers": 12,
   "lane_label": "subgov-codex-productive",
+  "apply_lane_labels": true,
   "heartbeat_dir": "/home/coding/.needle/state/heartbeats",
   "gate_health_dir": "/home/coding/.needle/state/gate-health",
   "snapshot": "/home/coding/.local/state/subgov/codex-productive-snapshot.json",

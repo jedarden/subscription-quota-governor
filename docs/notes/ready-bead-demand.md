@@ -46,7 +46,10 @@ Optional demand settings:
 
 `ready_bead_count` counts eligible unclaimed beads before slot limits. `ready`
 is the launchable subset after slot limits; it is not a persistent assignment.
-`workspaces` records ready counts, busy claims, worker limits and eligible slots.
+`eligible` is the full unclaimed eligible set the count is taken from, one
+`{id, workspace}` entry per bead (with `labelled` when a lane label is
+configured). `workspaces` records ready counts, busy claims, worker limits and
+eligible slots.
 `eligible_backlog_capacity` includes validated executing claims as retention
 capacity and is bounded by the pool's `max_workers`. An executing claim consumes
 its workspace slot and never appears as new ready demand. Existing busy claims
@@ -54,6 +57,44 @@ are retained even when workspace eligibility changes. Worker retirement still
 uses the existing idle-only safety checks. Pool arbitration/host limits are
 WP24 work; WP26 orders `ready` into per-launch seeds — see
 [seed-workspace-selection.md](seed-workspace-selection.md).
+
+## Lane dispatch and the starvation invariant (subgov-6db97205)
+
+A lane binding in NEEDLE's `strands.pluck.lanes` confines its workers to beads
+carrying the lane label (Explore `lane_admits`); unlabelled demand is invisible
+to that lane. The dispatch label therefore belongs to the demand publisher,
+not to admission paths: a label applied at each admission write-site is
+incomplete by construction (the 2026-11-08 triage admitted 80 beads and
+labelled none), and removing the positive-label requirement would unbind the
+lane from verified demand entirely. Applying it here mechanizes the original
+subgov-564a5b9a step — the label goes on exactly the records the publisher
+already verified as admitted eligible demand — and keeps the lane bounded by
+verified demand (the 10-18 directive).
+
+A pool opts in with `"apply_lane_labels": true` alongside its `lane_label`
+(validation rejects the flag without a label). At each refresh, after the
+ready frontier is measured, the publisher applies the label to every counted
+eligible bead that does not already carry it (`bead label add` is idempotent;
+already-labelled beads are never re-written). The invariant is exact:
+**every bead the demand document counts is claimable by an idle lane worker.**
+A bead whose labelling fails is not counted that cycle — it moves to `blocked`
+with reason `lane_labelling_failed`, its slot evidence is reduced
+conservatively, and the next successful refresh counts it if the label landed.
+Labels are sticky by design: a bead that later gains a hold still cannot
+dispatch, because NEEDLE's own admission filters run after `lane_admits`.
+
+The publisher also evaluates the starvation invariant each refresh:
+`ready_bead_count > 0` while every fresh owned lane worker reports an
+`EXHAUSTED` state — it scanned and found nothing its lane admits — for more
+than 2 consecutive refreshes is `lane_starved: true`. The streak counter and
+verdict are recorded in the demand document (`lane_starved`,
+`lane_starved_refreshes`, `lane_starved_condition`); an unknown-demand cycle
+publishes without them, so the next successful refresh restarts the streak at
+1, and an evaluation error breaks the streak and is recorded as
+`lane_starved_error` without blocking capacity publication. The verdict rides
+the quota snapshot (`lane_starved`) into the governor, which surfaces it
+verbatim in the account's `status.json` entry. It is an alarm surface only —
+actuation never reads it; the labelling above is the fix, this is the detector.
 
 Each publisher atomically writes `demand_state`, with `observed_at` and these
 fields. Codex and Anthropic use the shared `refresh` implementation, with separate

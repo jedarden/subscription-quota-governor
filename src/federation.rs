@@ -1029,6 +1029,7 @@ pub fn shared_account_total(
                 reset_credits: None,
                 backpressure: None,
                 saturation: None,
+                lane_starved: None,
             };
             crate::controller::evaluate(account_name, config, &snapshot, prior, denominator, now)?
         }
@@ -1043,6 +1044,7 @@ pub fn shared_account_total(
                 reset_credits: None,
                 backpressure: None,
                 saturation: None,
+                lane_starved: None,
             };
             crate::controller::evaluate(account_name, config, &snapshot, prior, denominator, now)?
         }

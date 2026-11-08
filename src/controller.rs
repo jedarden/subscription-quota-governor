@@ -1090,6 +1090,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let decision = evaluate("acct", &cfg, &snapshot, &prior, 1, now).unwrap();
         assert_eq!(decision.desired_workers, 2);
@@ -1217,6 +1218,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let decision = evaluate(
             "test",
@@ -1248,6 +1250,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let plain = evaluate("t", &account(), &snapshot, &AccountState::default(), 4, now).unwrap();
         let pooled = evaluate_pool(
@@ -1286,6 +1289,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let decision = evaluate_pool(
             "t",
@@ -1323,6 +1327,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         for unowned in [0_u32, 1, 5, 20] {
             let decision = evaluate_pool(
@@ -1360,6 +1365,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let decision = evaluate(
             "test",
@@ -1403,6 +1409,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let decision =
             evaluate("test", &config, &snapshot, &AccountState::default(), 4, now).unwrap();
@@ -1429,6 +1436,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1473,6 +1481,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1515,6 +1524,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1549,6 +1559,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let decision = evaluate(
             "test",
@@ -1580,6 +1591,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let decision = evaluate(
             "test",
@@ -1658,6 +1670,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1693,6 +1706,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let mut prior = AccountState::default();
         prior.windows.insert(
@@ -1736,6 +1750,7 @@ mod tests {
             }),
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let mut prior = AccountState::default();
         add_banked_burn_history(&mut prior, now, reset, 0.30, 0.001, 0.01);
@@ -1800,6 +1815,7 @@ mod tests {
             }),
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         (config, snapshot)
     }
@@ -2119,6 +2135,7 @@ mod tests {
             }),
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let mut prior = AccountState::default();
         add_banked_burn_history(&mut prior, now, reset, 0.20, 0.001, 0.01);
@@ -2166,6 +2183,7 @@ mod tests {
                 reset_credits,
                 backpressure: None,
                 saturation: None,
+                lane_starved: None,
             }
         }
 
@@ -2357,6 +2375,7 @@ mod tests {
             }),
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
 
         let decision =
@@ -2392,6 +2411,7 @@ mod tests {
             }),
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         let mut prior = AccountState::default();
 
@@ -2490,6 +2510,7 @@ mod tests {
             }),
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
 
         let decision =
@@ -2659,6 +2680,7 @@ mod tests {
                 reset_credits: None,
                 backpressure: None,
                 saturation: None,
+                lane_starved: None,
             };
 
             let decision = evaluate("test", &config, &snapshot, &AccountState::default(), 2, now)
@@ -2723,6 +2745,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
 
         let decision =
@@ -2759,6 +2782,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
 
         let error =
@@ -2799,6 +2823,7 @@ mod tests {
             eligible_backlog_capacity: None,
             reset_credits: None,
             saturation: None,
+            lane_starved: None,
             backpressure: Some(crate::model::BackpressureSnapshot {
                 upstream_429_fraction: fraction,
                 attempts: fraction.map_or(0, |_| 30),
@@ -3125,6 +3150,7 @@ mod tests {
                 reset_credits: None,
                 backpressure: None,
                 saturation: None,
+                lane_starved: None,
             }
         }
 
@@ -3185,6 +3211,7 @@ mod tests {
                     reset_credits: None,
                     backpressure: None,
                     saturation: None,
+                    lane_starved: None,
                 };
                 let decision = evaluate_pool(
                     "prop",
@@ -3244,6 +3271,7 @@ mod tests {
                     reset_credits: None,
                     backpressure: None,
                     saturation: None,
+                    lane_starved: None,
                 };
                 let decision = evaluate(
                     "prop",
@@ -3300,6 +3328,7 @@ mod tests {
                     reset_credits: None,
                     backpressure: None,
                     saturation: None,
+                    lane_starved: None,
                 };
                 let snapshot_two = QuotaSnapshot {
                     observed_at: now,
@@ -3309,6 +3338,7 @@ mod tests {
                     reset_credits: None,
                     backpressure: None,
                     saturation: None,
+                    lane_starved: None,
                 };
                 let decision_one = evaluate(
                     "prop",
@@ -3434,6 +3464,7 @@ mod tests {
                     reset_credits: None,
                     backpressure: None,
                     saturation: None,
+                    lane_starved: None,
                 };
                 let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                 assert_bounded_step(workers, &decision, &config);
@@ -3491,6 +3522,7 @@ mod tests {
                     reset_credits: None,
                     backpressure: None,
                     saturation: None,
+                    lane_starved: None,
                 };
                 let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                 assert_bounded_step(workers, &decision, &config);
@@ -3567,6 +3599,7 @@ mod tests {
                         reset_credits: None,
                         backpressure: None,
                         saturation: None,
+                        lane_starved: None,
                     };
                     let decision = step(&config, &mut prior, workers, &snapshot, clock.now());
                     assert_bounded_step(workers, &decision, &config);
@@ -3603,6 +3636,7 @@ mod tests {
                     reset_credits: None,
                     backpressure: None,
                     saturation: None,
+                    lane_starved: None,
                 };
                 let decision = step(&config, &mut prior, workers, &pending_rollover, clock.now());
                 assert_eq!(

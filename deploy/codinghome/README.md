@@ -11,6 +11,16 @@ worker is retained until it is task-free, fresh, and child-free.
 The shared adapter reads NEEDLE's native ready frontier, retaining human,
 proposal, timed and external holds, backend/host ownership and workspace gates.
 It caps build-heavy workspaces at one worker and validates current owned claims.
+`apply_lane_labels: true` keeps the owned `subgov-codex-productive` lane
+claimable: every refresh applies the lane label to the demand the publisher
+counted, so counted demand and lane-dispatchable work stay equal
+(subgov-6db97205 — without this, admitted work starved the lane because no
+code path applied the label). It also publishes the lane-starvation verdict
+(`ready_bead_count > 0` while every lane worker stays exhausted for more than
+2 consecutive refreshes) into the demand document and snapshot; the governor
+surfaces it as `lane_starved` in the account's `status.json` entry. A pool
+without its lane installed must not set the flag: unbound workers already
+admit everything, and the labels would be write churn nothing consumes.
 See [ready-bead demand](../../docs/notes/ready-bead-demand.md) for the contract,
 all-pool settings, evidence fields and migration from curated positive lanes.
 New workers keep NEEDLE generation disabled. The adopted roster retains its

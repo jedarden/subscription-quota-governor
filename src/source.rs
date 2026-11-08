@@ -715,6 +715,7 @@ pub fn parse_anthropic_usage(payload: &Value, observed_at: DateTime<Utc>) -> Res
         reset_credits: None,
         backpressure: None,
         saturation: None,
+        lane_starved: None,
     })
 }
 
@@ -1290,6 +1291,7 @@ pub fn parse_codex_rate_limits(
         reset_credits: parse_reset_credits(result),
         backpressure: None,
         saturation: None,
+        lane_starved: None,
     })
 }
 

@@ -767,6 +767,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         }
     }
 
@@ -902,6 +903,7 @@ mod tests {
             reset_credits: None,
             backpressure: None,
             saturation: None,
+            lane_starved: None,
         };
         account.record(&empty_snapshot, 1, 3);
         assert!(

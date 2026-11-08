@@ -252,11 +252,17 @@ def allowed(issue, now):
 
 
 
-def observe(settings, busy=(), unowned_floor=0):
+def observe(settings, busy=(), unowned_floor=0, lane_label=None):
     """Return ready count plus a bounded total fleet capacity including claims.
 
     Claims already executing are retention evidence, never ready demand. A
     build-heavy workspace contributes one slot; existing claims occupy it.
+
+    When `lane_label` is given, every eligible job is annotated with
+    `labelled` -- an exact, case-sensitive match against the bead's labels,
+    mirroring NEEDLE Explore's `lane_admits`. A lane-bound worker claims only
+    labelled beads, so `labelled: false` demand is invisible to that lane
+    until its publisher applies the label (subgov-6db97205).
     """
     now = datetime.now(timezone.utc)
     config = settings['demand']
@@ -331,7 +337,10 @@ def observe(settings, busy=(), unowned_floor=0):
             if reason:
                 blocked.append({'workspace': route, 'id': issue['id'], 'reason': reason})
             elif (route, issue['id']) not in busy_keys:
-                jobs[issue['id']] = {'id': issue['id'], 'workspace': route}
+                job = {'id': issue['id'], 'workspace': route}
+                if lane_label is not None:
+                    job['labelled'] = lane_label in issue.get('labels', [])
+                jobs[issue['id']] = job
         jobs = list(jobs.values())
         active = sum(workspace == route for workspace, _ in busy_keys)
         build_heavy = any((route_path / marker).exists() for marker in BUILD_MARKERS)
@@ -359,6 +368,10 @@ def observe(settings, busy=(), unowned_floor=0):
     # Keep validated claims even if scope/health changed since their dispatch.
     capacity += sum(workspace not in observed for workspace, _ in busy_keys)
     return {'observed_at': now.isoformat(), 'ready': seeds, 'ready_bead_count': len(ready),
+            # Every counted unclaimed job, unbounded by slot limits: the set a
+            # lane publisher must make claimable so counted demand and
+            # lane-dispatchable work stay equal (subgov-6db97205).
+            'eligible': ready,
             'busy': list(busy), 'blocked': blocked, 'workspaces': summaries,
             'unowned_floor': unowned_floor,
             'eligible_backlog_capacity': min(settings['max_workers'], capacity)}

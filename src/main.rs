@@ -927,6 +927,12 @@ struct AccountReadiness {
     current_workers: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     desired_workers: Option<u32>,
+    /// The demand publisher's lane-starvation verdict, surfaced verbatim from
+    /// the quota snapshot (subgov-6db97205): counted ready demand exists while
+    /// every lane worker stayed exhausted across more than 2 consecutive
+    /// refreshes. It is an alarm surface only -- actuation never reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lane_starved: Option<bool>,
 }
 
 fn readiness_for_decision(decision: &Decision) -> AccountReadiness {
@@ -937,6 +943,7 @@ fn readiness_for_decision(decision: &Decision) -> AccountReadiness {
         observed_at: Some(decision.observed_at),
         current_workers: Some(decision.current_workers),
         desired_workers: Some(decision.desired_workers),
+        lane_starved: None,
     };
     if decision.stale {
         return AccountReadiness {
@@ -990,6 +997,7 @@ fn readiness_for_failure(failure: &AccountFailure) -> AccountReadiness {
         observed_at: None,
         current_workers: None,
         desired_workers: None,
+        lane_starved: None,
     }
 }
 
@@ -1907,7 +1915,13 @@ fn run_cycle(
                     workers
                 };
             }
-            let readiness = readiness_for_decision(&decision);
+            // The lane-starvation verdict is a source observation, so it is
+            // surfaced into the readiness report verbatim (subgov-6db97205).
+            // The scaling decision deliberately never reads it.
+            let readiness = AccountReadiness {
+                lane_starved: snapshot.lane_starved,
+                ..readiness_for_decision(&decision)
+            };
             metrics.apply_decision(&decision, readiness.reason.clone(), now);
             if let Some(banked) = &decision.banked_resets {
                 for advisory in &banked.advisories {
@@ -2873,6 +2887,45 @@ mod status_tests {
     fn stale_decision_is_a_stale_drain() {
         let readiness = readiness_for_decision(&decision(true, Vec::new()));
         assert_eq!(readiness.state, ReadinessState::StaleDrain);
+    }
+
+    fn snapshot_with_lane_starved(lane_starved: Option<bool>) -> QuotaSnapshot {
+        QuotaSnapshot {
+            observed_at: Utc::now(),
+            fresh: true,
+            windows: Vec::new(),
+            eligible_backlog_capacity: None,
+            lane_starved,
+            reset_credits: None,
+            backpressure: None,
+            saturation: None,
+        }
+    }
+
+    /// subgov-6db97205: the demand publisher's lane-starvation verdict lands
+    /// in the account's status.json entry exactly as published, and stays
+    /// absent when the source publishes no verdict.
+    #[test]
+    fn lane_starvation_verdict_is_surfaced_into_the_readiness_report() {
+        let surfaced = serde_json::to_value(AccountReadiness {
+            lane_starved: snapshot_with_lane_starved(Some(true)).lane_starved,
+            ..readiness_for_decision(&decision(false, Vec::new()))
+        })
+        .unwrap();
+        assert_eq!(surfaced["lane_starved"], serde_json::json!(true));
+
+        let silent = serde_json::to_value(AccountReadiness {
+            lane_starved: snapshot_with_lane_starved(None).lane_starved,
+            ..readiness_for_decision(&decision(false, Vec::new()))
+        })
+        .unwrap();
+        assert!(silent.get("lane_starved").is_none());
+
+        let failed = serde_json::to_value(readiness_for_failure(&AccountFailure::Observation(
+            anyhow!("source unavailable"),
+        )))
+        .unwrap();
+        assert!(failed.get("lane_starved").is_none());
     }
 
     #[test]

@@ -64,6 +64,171 @@ class ProductiveTests(unittest.TestCase):
             self.assertEqual(measured["eligible_backlog_capacity"], 1)
             self.assertEqual(measured["ready"][0]["id"], "new-1")
 
+    # --- Lane dispatch: counted demand must be claimable (subgov-6db97205).
+
+    def dispatch_settings(self, root):
+        settings = self.settings(root)
+        settings["apply_lane_labels"] = True
+        return settings
+
+    def test_eligible_ready_bead_without_the_label_is_labelled_and_counted(self):
+        # Option (a): the demand adapter applies the lane label to the demand
+        # it counts, so an eligible ready bead is claimable by an idle lane
+        # worker without any admission path having labelled it by hand.
+        with tempfile.TemporaryDirectory() as root:
+            s = self.dispatch_settings(Path(root))
+            issue = {"id": "new-1", "status": "open", "assignee": None, "labels": []}
+            with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[issue]), \
+                 patch.object(adapter, "workers", return_value=[]), \
+                 patch.object(adapter, "run", return_value="") as run:
+                measured = adapter.demand(s)
+            argv, kwargs = run.call_args.args[0], run.call_args.kwargs
+            self.assertEqual(argv, ["bead", "label", "add", "new-1",
+                                    "--label", "subgov-codex-productive"])
+            self.assertEqual(kwargs["cwd"], measured["eligible"][0]["workspace"])
+            self.assertEqual(measured["ready_bead_count"], 1)
+            self.assertTrue(measured["eligible"][0]["labelled"])
+
+    def test_already_labelled_demand_is_counted_without_relabelling(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.dispatch_settings(Path(root))
+            issue = {"id": "done-1", "status": "open", "assignee": None,
+                     "labels": ["subgov-codex-productive"]}
+            with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[issue]), \
+                 patch.object(adapter, "workers", return_value=[]), \
+                 patch.object(adapter, "run") as run:
+                measured = adapter.demand(s)
+            run.assert_not_called()
+            self.assertEqual(measured["ready_bead_count"], 1)
+            self.assertTrue(measured["eligible"][0]["labelled"])
+
+    def test_failed_labelling_drops_the_bead_from_counted_demand(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.dispatch_settings(Path(root))
+            issue = {"id": "new-1", "status": "open", "assignee": None, "labels": []}
+            with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[issue]), \
+                 patch.object(adapter, "workers", return_value=[]), \
+                 patch.object(adapter, "run", side_effect=RuntimeError("store locked")):
+                measured = adapter.demand(s)
+            self.assertEqual(measured["ready_bead_count"], 0)
+            self.assertEqual(measured["eligible"], [])
+            self.assertEqual(measured["ready"], [])
+            dropped = measured["blocked"][-1]
+            self.assertEqual(dropped["reason"], "lane_labelling_failed")
+            self.assertEqual(dropped["error"], "RuntimeError")
+            self.assertEqual(measured["workspaces"][0]["ready_beads"], 0)
+
+    def test_without_the_dispatch_flag_demand_stays_read_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            issue = {"id": "new-1", "status": "open", "assignee": None, "labels": []}
+            with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "ready_issues", return_value=[issue]), \
+                 patch.object(adapter, "workers", return_value=[]), \
+                 patch.object(adapter, "run") as run:
+                measured = adapter.demand(s)
+            run.assert_not_called()
+            self.assertEqual(measured["ready_bead_count"], 1)
+            self.assertNotIn("labelled", measured["eligible"][0])
+
+    def test_dispatch_flag_requires_a_lane_label(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            s["apply_lane_labels"] = True
+            del s["lane_label"]
+            path = Path(root) / "settings.json"
+            path.write_text(json.dumps(s))
+            with self.assertRaises(ValueError):
+                adapter.settings_read(str(path))
+            s["lane_label"] = "subgov-codex-productive"
+            s["apply_lane_labels"] = "yes"
+            path.write_text(json.dumps(s))
+            with self.assertRaises(ValueError):
+                adapter.settings_read(str(path))
+
+    # --- Lane-starvation invariant (subgov-6db97205).
+
+    def exhausted_workers(self, state):
+        return [{"worker_id": "sg-codex-1", "state": state},
+                {"worker_id": "sg-codex-2", "state": state}]
+
+    def refresh_measured(self, ready_bead_count):
+        return {"observed_at": "2026-11-08T00:00:00+00:00", "ready_bead_count": ready_bead_count,
+                "eligible_backlog_capacity": 2, "ready": [], "eligible": []}
+
+    def test_lane_starved_fires_after_more_than_two_exhausted_refreshes(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.dispatch_settings(Path(root))
+            Path(s["demand_state"]).write_text(json.dumps(
+                {"lane_starved_condition": True, "lane_starved_refreshes": 2}))
+            with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                 patch.object(adapter, "demand", return_value=self.refresh_measured(5)), \
+                 patch.object(adapter, "workers", return_value=self.exhausted_workers("EXHAUSTED_IDLE")):
+                adapter.refresh(s)
+            snapshot = json.loads(Path(s["snapshot"]).read_text())
+            self.assertTrue(snapshot["lane_starved"])
+            doc = json.loads(Path(s["demand_state"]).read_text())
+            self.assertTrue(doc["lane_starved"])
+            self.assertEqual(doc["lane_starved_refreshes"], 3)
+            self.assertTrue(doc["lane_starved_condition"])
+
+    def test_lane_starvation_never_fires_below_the_streak_or_demand(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.dispatch_settings(Path(root))
+            # Two exhausted refreshes are "more than 2" only from the third on;
+            # demand unknown (count 0) and no fresh workers never starve.
+            Path(s["demand_state"]).write_text(json.dumps(
+                {"lane_starved_condition": True, "lane_starved_refreshes": 1}))
+            for workers, count in [(self.exhausted_workers("EXHAUSTED_IDLE"), 5),
+                                   (self.exhausted_workers("EXHAUSTED_IDLE"), 0),
+                                   ([], 5)]:
+                with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                     patch.object(adapter, "demand", return_value=self.refresh_measured(count)), \
+                     patch.object(adapter, "workers", return_value=workers):
+                    adapter.refresh(s)
+                self.assertFalse(json.loads(Path(s["snapshot"]).read_text())["lane_starved"])
+
+    def test_lane_starvation_resets_when_any_lane_worker_is_not_exhausted(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.dispatch_settings(Path(root))
+            Path(s["demand_state"]).write_text(json.dumps(
+                {"lane_starved_condition": True, "lane_starved_refreshes": 5}))
+            mixed = self.exhausted_workers("EXHAUSTED_IDLE")
+            mixed[1]["state"] = "EXECUTING"
+            for workers in [mixed, self.exhausted_workers("SELECTING")]:
+                with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                     patch.object(adapter, "demand", return_value=self.refresh_measured(5)), \
+                     patch.object(adapter, "workers", return_value=workers):
+                    adapter.refresh(s)
+                self.assertFalse(json.loads(Path(s["snapshot"]).read_text())["lane_starved"])
+                doc = json.loads(Path(s["demand_state"]).read_text())
+                self.assertEqual(doc["lane_starved_refreshes"], 0)
+
+    def test_unknown_demand_breaks_the_starvation_streak(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.dispatch_settings(Path(root))
+            Path(s["demand_state"]).write_text(json.dumps(
+                {"lane_starved_condition": True, "lane_starved_refreshes": 5}))
+            with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                 patch.object(adapter, "demand", side_effect=RuntimeError("query failed")), \
+                 patch.object(adapter, "workers", return_value=self.exhausted_workers("EXHAUSTED_IDLE")):
+                adapter.refresh(s)
+            doc = json.loads(Path(s["demand_state"]).read_text())
+            self.assertIn("unknown", doc)
+            self.assertNotIn("lane_starved_refreshes", doc)
+            self.assertNotIn("lane_starved", json.loads(Path(s["snapshot"]).read_text()))
+            # The next successful refresh restarts the streak at 1.
+            with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                 patch.object(adapter, "demand", return_value=self.refresh_measured(5)), \
+                 patch.object(adapter, "workers", return_value=self.exhausted_workers("EXHAUSTED_IDLE")):
+                adapter.refresh(s)
+            doc = json.loads(Path(s["demand_state"]).read_text())
+            self.assertEqual(doc["lane_starved_refreshes"], 1)
+            self.assertFalse(json.loads(Path(s["snapshot"]).read_text())["lane_starved"])
+
     def test_failed_demand_withholds_capacity_instead_of_zero(self):
         with tempfile.TemporaryDirectory() as root:
             s = self.settings(Path(root))
