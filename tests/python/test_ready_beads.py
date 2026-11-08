@@ -106,7 +106,7 @@ class ReadyBeadsTests(unittest.TestCase):
                         {'id': 'excluded', 'status': 'open', 'labels': ['test-only']}]) as query:
                 result = demand.observe(settings)
             self.assertEqual(result['eligible_backlog_capacity'], 0)
-            query.assert_called_once_with(str(repo))
+            query.assert_called_once_with(str(repo), demand.DEFAULT_READY_TIMEOUT)
 
     def test_unreadable_gate_records_block_only_their_workspaces(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -127,7 +127,7 @@ class ReadyBeadsTests(unittest.TestCase):
             (gate_dir / f'{key}.json').write_text('{"degraded": true}')
             settings = self.settings(empty, truncated, healthy, absent, degraded)
             settings['gate_health_dir'] = str(gate_dir)
-            with patch.object(demand, 'ready_issues', side_effect=lambda route: [
+            with patch.object(demand, 'ready_issues', side_effect=lambda route, timeout: [
                     {'id': Path(route).name + '-ready', 'status': 'open', 'labels': []}]) as query:
                 measured = demand.observe(settings)
             self.assertEqual(measured['ready_bead_count'], 2)
@@ -154,6 +154,65 @@ class ReadyBeadsTests(unittest.TestCase):
                     subprocess.CompletedProcess([], 0, '[{"id":"truncated"}]', '')):
                 with self.assertRaises(ValueError):
                     demand.observe(self.settings(route))
+
+    def test_slow_or_malformed_store_is_blocked_and_never_blanks_fleet_demand(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slow, malformed, healthy = (self.workspace(root, name)
+                                        for name in ('slow', 'malformed', 'healthy'))
+            settings = self.settings(slow, malformed, healthy)
+
+            def flaky(args, cwd=None, **kwargs):
+                if cwd == str(slow):
+                    raise subprocess.TimeoutExpired(args, 8)
+                if cwd == str(malformed):
+                    return subprocess.CompletedProcess(args, 0, '{"id": "not-an-array"}', '')
+                return subprocess.CompletedProcess([], 0, json.dumps(
+                    [{'id': 'healthy-ready', 'status': 'open', 'labels': []}]), '')
+
+            with patch.object(demand.subprocess, 'run', side_effect=flaky) as run:
+                measured = demand.observe(settings)
+            self.assertEqual(measured['ready_bead_count'], 1)
+            self.assertEqual([job['id'] for job in measured['ready']], ['healthy-ready'])
+            self.assertEqual({(row['workspace'], row['reason'], row['error']) for row in measured['blocked']
+                              if row['reason'] == 'ready_query_unavailable'},
+                             {(str(slow), 'ready_query_unavailable', 'TimeoutExpired'),
+                              (str(malformed), 'ready_query_unavailable', 'ValueError')})
+            self.assertEqual({row['workspace'] for row in measured['blocked']} & {str(healthy)}, set())
+            self.assertEqual(sorted(call.kwargs['timeout'] for call in run.call_args_list), [8, 8, 8])
+            # A failed workspace keeps its busy claims as retention capacity and
+            # contributes no seeds.
+            busy = [{'workspace': str(slow), 'id': 'claimed'}, {'workspace': str(healthy), 'id': 'live'}]
+            with patch.object(demand.subprocess, 'run', side_effect=flaky):
+                measured = demand.observe(settings, busy)
+            self.assertEqual(measured['eligible_backlog_capacity'], 3)
+            self.assertEqual([job['id'] for job in measured['ready']], ['healthy-ready'])
+
+    def test_all_selected_stores_failing_still_makes_demand_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            first, second = (self.workspace(Path(temp), name) for name in ('one', 'two'))
+            settings = self.settings(first, second)
+            with patch.object(demand.subprocess, 'run',
+                              side_effect=subprocess.TimeoutExpired('bead', 8)):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    demand.observe(settings)
+            with patch.object(demand.subprocess, 'run', return_value=
+                    subprocess.CompletedProcess([], 0, 'not json at all', '')):
+                with self.assertRaises(ValueError):
+                    demand.observe(settings)
+
+    def test_ready_timeout_is_configurable_and_validated(self):
+        with tempfile.TemporaryDirectory() as temp:
+            route = self.workspace(Path(temp))
+            settings = self.settings(route)
+            settings['demand']['ready_timeout_seconds'] = 31
+            with patch.object(demand.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '[]', '')) as run:
+                demand.observe(settings)
+            self.assertEqual(run.call_args.kwargs['timeout'], 31)
+            for bad in (0, -1, '8', 2.5, None):
+                settings['demand']['ready_timeout_seconds'] = bad
+                with self.assertRaises(ValueError):
+                    demand.observe(settings)
 
     def test_discovery_respects_needle_pins_and_skips_hidden_build_and_symlink_trees(self):
         with tempfile.TemporaryDirectory() as temp:

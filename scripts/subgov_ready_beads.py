@@ -1,7 +1,9 @@
 """Read-only NEEDLE ready-bead demand, shared by all provider pools.
 
 Native bead-rs owns dependency readiness; this module adds NEEDLE's dispatch
-holds and pool/workspace boundaries. A failed query is unknown, never zero.
+holds and pool/workspace boundaries. A failed query marks only that workspace
+unknown; demand goes unknown (never zero) only when every selected workspace
+fails.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +17,9 @@ import subprocess
 from subgov_adapter_common import read_json
 
 LIMIT = 999999
+DEFAULT_READY_TIMEOUT = 8
+READY_QUERY_ERRORS = (subprocess.TimeoutExpired, subprocess.CalledProcessError,
+                      ValueError, OSError)
 BUILD_MARKERS = ('Cargo.toml', 'go.mod', 'CMakeLists.txt', 'pom.xml', 'build.gradle',
                  'build.gradle.kts', 'Makefile', 'package.json')
 
@@ -173,15 +178,28 @@ def routes(settings):
                   if path not in restrictions or settings['agent'] in restrictions[path])
 
 
-def ready_issues(route):
+def ready_issues(route, timeout=DEFAULT_READY_TIMEOUT):
     result = subprocess.run(['bead', 'list', '--ready', '--json', '--limit', str(LIMIT)],
-                            cwd=route, text=True, capture_output=True, timeout=8, check=True)
+                            cwd=route, text=True, capture_output=True, timeout=timeout, check=True)
     issues = json.loads(result.stdout)
     if not isinstance(issues, list) or len(issues) >= LIMIT:
         raise ValueError('invalid or truncated native ready array')
     if any(not isinstance(issue, dict) or not isinstance(issue.get('id'), str) for issue in issues):
         raise ValueError('invalid native issue')
     return issues
+
+
+def query_ready(route, timeout=DEFAULT_READY_TIMEOUT):
+    """Run one workspace's ready query, returning the failure instead of raising.
+
+    Unicode decode failures of stdout also arrive as ValueError subclasses, so
+    this tuple covers timeouts, nonzero exits, malformed/truncated output and
+    unreadable stores alike.
+    """
+    try:
+        return ready_issues(route, timeout)
+    except READY_QUERY_ERRORS as error:
+        return error
 
 
 def native_internal_artifact(issue):
@@ -244,6 +262,12 @@ def observe(settings, busy=(), unowned_floor=0):
     config = settings['demand']
     if type(settings['max_workers']) is not int or settings['max_workers'] < 0:
         raise ValueError('invalid pool ceiling')
+    # Fleet-wide ready queries measured p50 0.06s with a 0.33s worst store
+    # (NEEDLE, ~6k beads); 8s only trips on host-wide stalls. Configurable so a
+    # slower fleet can raise it without re-measuring.
+    timeout = config.get('ready_timeout_seconds', DEFAULT_READY_TIMEOUT)
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError('invalid ready query timeout')
     if any(not item.get('reason') for item in config.get('external_holds', [])):
         raise ValueError('external hold has no reason')
     holds = {(str(Path(item['workspace']).expanduser().resolve()), item['id'])
@@ -277,48 +301,63 @@ def observe(settings, busy=(), unowned_floor=0):
             selected.append(route)
     ready, seeds, summaries, capacity = [], [], [], unowned_floor
     busy_keys = {(str(Path(job['workspace']).resolve()), job['id']) for job in busy}
+    failures, observed = [], set()
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for route, issues in zip(selected, pool.map(ready_issues, selected)):
-            route_path = Path(route)
-            policy = workspace_policy(route_path / '.needle.yaml') if (route_path / '.needle.yaml').exists() else {}
-            excludes = policy.get('exclude_labels', global_excludes)
-            if not isinstance(excludes, list):
-                raise ValueError('invalid excluded labels')
-            jobs = {}
-            for issue in issues:
-                reason = None
-                if (route, issue['id']) in holds or issue.get('external_hold'):
-                    reason = 'recorded_external_hold'
-                elif native_internal_artifact(issue):
-                    reason = 'native_internal_artifact'
-                elif not allowed(issue, now) or set(issue.get('labels', [])) & set(excludes):
-                    reason = 'not_currently_claimable'
-                if reason:
-                    blocked.append({'workspace': route, 'id': issue['id'], 'reason': reason})
-                elif (route, issue['id']) not in busy_keys:
-                    jobs[issue['id']] = {'id': issue['id'], 'workspace': route}
-            jobs = list(jobs.values())
-            active = sum(workspace == route for workspace, _ in busy_keys)
-            build_heavy = any((route_path / marker).exists() for marker in BUILD_MARKERS)
-            limit = limits.get(route, 1 if build_heavy else settings['max_workers'])
-            if type(limit) is not int or limit < 0:
-                raise ValueError('invalid workspace capacity')
-            if build_heavy:
-                limit = min(limit, 1)
-            native_limit = policy.get('max_workers')
-            if native_limit is not None:
-                if type(native_limit) is not int or native_limit < 0:
-                    raise ValueError('invalid native workspace capacity')
-                if native_limit:
-                    limit = min(limit, native_limit)
-            slots = min(len(jobs), max(0, limit - active))
-            ready.extend(jobs)
-            seeds.extend(jobs[:slots])
-            capacity += active + slots
-            summaries.append({'workspace': route, 'ready_beads': len(jobs), 'busy_claims': active,
-                              'worker_limit': limit, 'eligible_slots': slots})
+        outcomes = list(pool.map(lambda route: query_ready(route, timeout), selected))
+    for route, outcome in zip(selected, outcomes):
+        route_path = Path(route)
+        if isinstance(outcome, READY_QUERY_ERRORS):
+            # One slow or unreadable store must never blank fleet demand: this
+            # workspace stays unknown, keeps its busy claims as retention
+            # evidence, and contributes no seeds.
+            failures.append((route, outcome))
+            blocked.append({'workspace': route, 'reason': 'ready_query_unavailable',
+                            'error': type(outcome).__name__})
+            continue
+        observed.add(route)
+        policy = workspace_policy(route_path / '.needle.yaml') if (route_path / '.needle.yaml').exists() else {}
+        excludes = policy.get('exclude_labels', global_excludes)
+        if not isinstance(excludes, list):
+            raise ValueError('invalid excluded labels')
+        jobs = {}
+        for issue in outcome:
+            reason = None
+            if (route, issue['id']) in holds or issue.get('external_hold'):
+                reason = 'recorded_external_hold'
+            elif native_internal_artifact(issue):
+                reason = 'native_internal_artifact'
+            elif not allowed(issue, now) or set(issue.get('labels', [])) & set(excludes):
+                reason = 'not_currently_claimable'
+            if reason:
+                blocked.append({'workspace': route, 'id': issue['id'], 'reason': reason})
+            elif (route, issue['id']) not in busy_keys:
+                jobs[issue['id']] = {'id': issue['id'], 'workspace': route}
+        jobs = list(jobs.values())
+        active = sum(workspace == route for workspace, _ in busy_keys)
+        build_heavy = any((route_path / marker).exists() for marker in BUILD_MARKERS)
+        limit = limits.get(route, 1 if build_heavy else settings['max_workers'])
+        if type(limit) is not int or limit < 0:
+            raise ValueError('invalid workspace capacity')
+        if build_heavy:
+            limit = min(limit, 1)
+        native_limit = policy.get('max_workers')
+        if native_limit is not None:
+            if type(native_limit) is not int or native_limit < 0:
+                raise ValueError('invalid native workspace capacity')
+            if native_limit:
+                limit = min(limit, native_limit)
+        slots = min(len(jobs), max(0, limit - active))
+        ready.extend(jobs)
+        seeds.extend(jobs[:slots])
+        capacity += active + slots
+        summaries.append({'workspace': route, 'ready_beads': len(jobs), 'busy_claims': active,
+                          'worker_limit': limit, 'eligible_slots': slots})
+    if failures and len(failures) == len(selected):
+        # Demand is unknown, never zero: a fleet where every selected store
+        # failed still withholds capacity instead of publishing a partial 0.
+        raise failures[0][1]
     # Keep validated claims even if scope/health changed since their dispatch.
-    capacity += sum(workspace not in selected for workspace, _ in busy_keys)
+    capacity += sum(workspace not in observed for workspace, _ in busy_keys)
     return {'observed_at': now.isoformat(), 'ready': seeds, 'ready_bead_count': len(ready),
             'busy': list(busy), 'blocked': blocked, 'workspaces': summaries,
             'unowned_floor': unowned_floor,

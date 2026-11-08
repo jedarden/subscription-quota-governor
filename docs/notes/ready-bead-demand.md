@@ -6,10 +6,15 @@ native frontier owns dependency readiness; assigned, non-open and manually
 blocked rows are also rejected defensively. Human/proposal labels, timed holds,
 recorded external holds, NEEDLE internal artifacts, custom excluded labels,
 foreign queue ownership and degraded workspace gates contribute no ready work.
-A query failure, malformed output or possible truncation makes demand unknown.
-The publisher withholds capacity, marks the combined sample incomplete
-(`fresh: false`) and records the failure type; controller freshness policy holds
-scale-up. Quota collection failures leave the prior snapshot untouched.
+A query failure, malformed output or possible truncation marks only that
+workspace unknown (`blocked` reason `ready_query_unavailable`, with the
+exception type in `error`): it contributes no seeds and its busy claims stay
+counted as retention capacity. Demand goes unknown — withholding capacity,
+`fresh: false` and the failure type recorded — only when every selected
+workspace fails. Quota collection failures leave the prior snapshot untouched.
+The per-query timeout defaults to 8 seconds (measured: p50 0.06s per store,
+0.33s worst store across 86 workspaces; only host-wide stalls trip it) and is
+settable as `demand.ready_timeout_seconds` (positive integer seconds).
 
 The `demand` object replaces the old `work` allowlist. By default the maintained
 settings read the authoritative NEEDLE configuration at
@@ -34,6 +39,10 @@ Optional demand settings:
 - `workspace_limits`: additional per-workspace ceilings. Build-heavy repositories
   (Cargo, Go, CMake, Maven, Gradle, Make or Node build manifests) always contribute
   at most one slot. Native `workspace.max_workers` can further reduce capacity.
+- `ready_timeout_seconds`: per-workspace `bead list --ready` timeout in seconds
+  (default 8). The limit cannot be dropped from the query: the CLI's default
+  `--limit 100` would silently truncate the frontier, and no cheaper projection
+  exists (`--comments none` is already the default).
 
 `ready_bead_count` counts eligible unclaimed beads before slot limits. `ready`
 is the launchable subset after slot limits; it is not a persistent assignment.
