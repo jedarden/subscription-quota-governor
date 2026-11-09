@@ -5,6 +5,11 @@ edition = "2021"
 license = "MIT"
 description = "Provider-neutral subscription quota pacing for AI coding agents"
 repository = "https://git.ardenone.com/jedarden/subscription-quota-governor"
+# plan.md §19's documented baseline runs `cargo run -- --config examples/…`.
+# With two [[bin]] targets (subgov + the test-only fake_codex_app_server) and
+# no default-run, cargo refuses to pick one and every documented invocation
+# exits 101. Name the shipped binary explicitly.
+default-run = "subgov"
 
 [[bin]]
 name = "subgov"
