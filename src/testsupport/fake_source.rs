@@ -62,6 +62,7 @@ mod tests {
     fn snapshot(used_fraction: f64) -> QuotaSnapshot {
         let now = Utc::now();
         QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {

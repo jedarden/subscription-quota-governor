@@ -11,6 +11,12 @@ versioned config-schema contract; see
 
 ### Fixed
 
+- Demand refresh resilience (subgov-bceb936a): failed ready-bead refreshes now
+  retain the last successful demand observation, track the unknown episode, and
+  page once after 30 minutes through the local Telegram relay house template.
+  Successful refreshes reset the episode. The publisher also emits a compact
+  ready/blocked demand summary that the governor preserves in `status.json`.
+
 - Lane starvation (subgov-6db97205): admitted ready demand was invisible to
   the `subgov-codex-productive` lane because NEEDLE's Explore admits only
   lane-labelled beads and no code path applied the label. The demand

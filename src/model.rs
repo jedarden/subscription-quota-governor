@@ -1,6 +1,17 @@
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Compact operator-facing demand evidence published by the ready-bead
+/// adapter. It is deliberately separate from the full demand document so the
+/// status surface stays small and stable.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DemandSummary {
+    pub dispatchable_ready: u32,
+    pub blocked_by_reason: BTreeMap<String, u32>,
+    pub gate_degraded_workspaces: u32,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct QuotaSnapshot {
@@ -19,6 +30,9 @@ pub struct QuotaSnapshot {
     /// lane invariant or demand was unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_starved: Option<bool>,
+    /// Ready/blocked demand evidence for the operator status surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demand_summary: Option<DemandSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits: Option<ResetCreditsSnapshot>,
     /// Optional provider-pressure signal over a trailing observation window.

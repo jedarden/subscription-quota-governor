@@ -250,6 +250,65 @@ class ProductiveTests(unittest.TestCase):
             self.assertFalse(value["fresh"])
             self.assertEqual(json.loads(Path(s["demand_state"]).read_text())["unknown"], "RuntimeError")
 
+    def test_failed_refresh_preserves_last_good_demand(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            good = {"observed_at": "2026-11-09T00:00:00+00:00", "ready_bead_count": 11,
+                    "ready": [{"id": "ready-1"}],
+                    "demand_summary": {"dispatchable_ready": 1,
+                                        "blocked_by_reason": {"workspace_gate_degraded": 3},
+                                        "gate_degraded_workspaces": 3}}
+            Path(s["demand_state"]).write_text(json.dumps(good))
+            with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                 patch.object(adapter, "demand", side_effect=RuntimeError("query failed")), \
+                 patch.object(adapter, "current_time", return_value=adapter.parse_timestamp(
+                     "2026-11-09T00:01:00Z")):
+                adapter.refresh(s)
+            state = json.loads(Path(s["demand_state"]).read_text())
+            self.assertEqual(state["last_good"], good)
+            self.assertEqual(state["consecutive_unknown"], 1)
+            self.assertEqual(state["unknown_since"], "2026-11-09T00:01:00+00:00")
+
+    def test_successful_refresh_resets_unknown_counter(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            Path(s["demand_state"]).write_text(json.dumps({
+                "observed_at": "2026-11-09T00:00:00Z", "unknown": "RuntimeError",
+                "consecutive_unknown": 4, "unknown_since": "2026-11-08T23:00:00Z",
+                "unknown_alerted_at": "2026-11-08T23:31:00Z"}))
+            measured = {"observed_at": "2026-11-09T01:00:00Z", "ready": [],
+                        "eligible": [], "blocked": [], "eligible_backlog_capacity": 0}
+            with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                 patch.object(adapter, "demand", return_value=measured):
+                adapter.refresh(s)
+            state = json.loads(Path(s["demand_state"]).read_text())
+            self.assertEqual(state["consecutive_unknown"], 0)
+            self.assertIsNone(state["unknown_since"])
+            self.assertNotIn("unknown", state)
+            self.assertNotIn("unknown_alerted_at", state)
+
+    def test_unknown_alert_threshold_uses_injected_clock(self):
+        with tempfile.TemporaryDirectory() as root:
+            s = self.settings(Path(root))
+            s["unknown_demand_alert_command"] = ["/bin/true"]
+            Path(s["demand_state"]).write_text(json.dumps({
+                "observed_at": "2026-11-09T00:00:00Z", "unknown": "RuntimeError",
+                "consecutive_unknown": 1, "unknown_since": "2026-11-09T00:00:00Z"}))
+            with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                 patch.object(adapter, "demand", side_effect=RuntimeError("query failed")), \
+                 patch.object(adapter, "current_time", return_value=adapter.parse_timestamp(
+                     "2026-11-09T00:30:00Z")), \
+                 patch.object(adapter, "send_unknown_alert") as alert:
+                adapter.refresh(s)
+            alert.assert_not_called()
+            with patch.object(adapter, "run", return_value='{"fresh":true,"windows":[]}'), \
+                 patch.object(adapter, "demand", side_effect=RuntimeError("query failed")), \
+                 patch.object(adapter, "current_time", return_value=adapter.parse_timestamp(
+                     "2026-11-09T00:30:01Z")), \
+                 patch.object(adapter, "send_unknown_alert") as alert:
+                adapter.refresh(s)
+            alert.assert_called_once()
+
     def test_shared_refresh_publishes_anthropic_quota_and_demand_state(self):
         with tempfile.TemporaryDirectory() as root:
             settings = self.settings(Path(root))
@@ -260,7 +319,11 @@ class ProductiveTests(unittest.TestCase):
                  patch.object(adapter, "demand", return_value=measured):
                 adapter.refresh(settings)
             self.assertEqual(run.call_args.args[0][-2:], ["snapshot", "claude-anthropic"])
-            self.assertEqual(json.loads(Path(settings["demand_state"]).read_text()), measured)
+            state = json.loads(Path(settings["demand_state"]).read_text())
+            self.assertEqual(state["observed_at"], measured["observed_at"])
+            self.assertEqual(state["consecutive_unknown"], 0)
+            self.assertIsNone(state["unknown_since"])
+            self.assertEqual(state["demand_summary"]["dispatchable_ready"], 0)
             self.assertEqual(json.loads(Path(settings["snapshot"]).read_text())["eligible_backlog_capacity"], 2)
 
     def test_failed_quota_does_not_refresh_old_snapshot(self):

@@ -4,8 +4,9 @@
 NEEDLE owns placement and admission. Quota availability never creates work.
 """
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,8 @@ from subgov_host_capacity import admission
 from subgov_ready_beads import allowed, native_internal_artifact, policy_ok, seed_order, observe as ready_demand
 
 IDLE = {"SELECTING", "IDLE", "WAITING", "BACKOFF", "SLEEPING", "EXHAUSTED", "ADMISSION_BLOCKED"}
+UNKNOWN_ALERT_AFTER = timedelta(minutes=30)
+UNKNOWN_ALERT_COMMAND = "/home/coding/jedarden.com/scripts/repo-traffic-alert.sh"
 
 
 def run(argv, cwd=None, timeout=5):
@@ -420,15 +423,100 @@ def lane_starvation(settings, measured):
     return result
 
 
+def demand_summary(measured):
+    """Return the operator-facing ready/blocked summary for status.json."""
+    blocked = measured.get("blocked", [])
+    blocked_by_reason = Counter(str(item.get("reason", "unknown")) for item in blocked)
+    gate_workspaces = {
+        str(item["workspace"])
+        for item in blocked
+        if item.get("reason") == "workspace_gate_degraded" and item.get("workspace")
+    }
+    return {
+        "dispatchable_ready": len(measured.get("ready", [])),
+        "blocked_by_reason": dict(sorted(blocked_by_reason.items())),
+        "gate_degraded_workspaces": len(gate_workspaces),
+    }
+
+
+def parse_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def unknown_alert_due(state, now):
+    """Use the supplied clock to decide whether an unknown episode should page."""
+    since = parse_timestamp(state.get("unknown_since"))
+    return (since is not None and now - since > UNKNOWN_ALERT_AFTER
+            and not state.get("unknown_alerted_at"))
+
+
+def send_unknown_alert(settings, state, now):
+    """Send through the host's scrubbed Telegram relay house template."""
+    command = settings.get("unknown_demand_alert_command", UNKNOWN_ALERT_COMMAND)
+    if isinstance(command, str):
+        command = [command]
+    if not isinstance(command, list) or not command or not all(isinstance(item, str) for item in command):
+        raise ValueError("invalid unknown demand alert command")
+    account = settings.get("quota_account") or settings.get("lane_label", "demand").removesuffix("-productive")
+    last_good = state.get("last_good", {})
+    summary = last_good.get("demand_summary", {}) if isinstance(last_good, dict) else {}
+    text = (f"[subgov] {account} demand unknown for {state['consecutive_unknown']} refreshes "
+            f"since {state['unknown_since']} (error={state['unknown']}); "
+            f"last good dispatchable_ready={summary.get('dispatchable_ready', 'unknown')}")
+    subprocess.run(command + [text], capture_output=True, text=True, timeout=30, check=True)
+
+
+def track_unknown_demand(settings, error, prior, now):
+    """Build the failure document without discarding the last good observation."""
+    prior = prior if isinstance(prior, dict) else {}
+    last_good = prior.get("last_good")
+    if not isinstance(last_good, dict) and "unknown" not in prior and prior.get("observed_at"):
+        last_good = prior
+    streak = prior.get("consecutive_unknown", 0)
+    if type(streak) is not int or streak < 0:
+        streak = 0
+    unknown_since = parse_timestamp(prior.get("unknown_since"))
+    state = {
+        "observed_at": now.isoformat(),
+        "unknown": type(error).__name__,
+        "consecutive_unknown": streak + 1,
+        "unknown_since": (unknown_since or now).isoformat(),
+    }
+    if isinstance(last_good, dict):
+        state["last_good"] = last_good
+    if prior.get("unknown_alerted_at"):
+        state["unknown_alerted_at"] = prior["unknown_alerted_at"]
+    if unknown_alert_due(state, now):
+        try:
+            send_unknown_alert(settings, state, now)
+        except Exception as alert_error:  # noqa: BLE001 - alert failure must not hide demand state
+            print(f"demand alert unavailable ({type(alert_error).__name__}: "
+                  f"{describe_error(alert_error)})", file=sys.stderr)
+        else:
+            state["unknown_alerted_at"] = now.isoformat()
+    return state
+
+
 def refresh(settings):
     with locked(settings["snapshot"]):
+        prior_snapshot = read_json(settings["snapshot"], {})
         quota = document(run([settings["quota_binary"], "--config", settings["quota_config"],
                               "snapshot", settings.get("quota_account", "codex")], timeout=35))
         quota.pop("eligible_backlog_capacity", None)
         quota.pop("lane_starved", None)
+        quota.pop("demand_summary", None)
         try:
             measured = demand(settings)
             quota["eligible_backlog_capacity"] = measured["eligible_backlog_capacity"]
+            measured["demand_summary"] = demand_summary(measured)
+            measured["consecutive_unknown"] = 0
+            measured["unknown_since"] = None
+            quota["demand_summary"] = measured["demand_summary"]
             if dispatch_label(settings):
                 measured.update(lane_starvation(settings, measured))
                 if not measured.get("lane_starved_error"):
@@ -440,7 +528,10 @@ def refresh(settings):
             print(f"{source}: demand unavailable "
                   f"({type(exc).__name__}: {describe_error(exc)})", file=sys.stderr)
             quota["fresh"] = False
-            measured = {"observed_at": current_time().isoformat(), "unknown": type(exc).__name__}
+            measured = track_unknown_demand(settings, exc,
+                                            read_json(settings["demand_state"], {}), current_time())
+            if isinstance(prior_snapshot, dict) and "demand_summary" in prior_snapshot:
+                quota["demand_summary"] = prior_snapshot["demand_summary"]
         atomic_json(settings["demand_state"], measured)
         atomic_json(settings["snapshot"], quota)
 

@@ -96,6 +96,15 @@ the quota snapshot (`lane_starved`) into the governor, which surfaces it
 verbatim in the account's `status.json` entry. It is an alarm surface only —
 actuation never reads it; the labelling above is the fix, this is the detector.
 
+Each successful refresh also publishes `demand_summary` in the normalized quota
+snapshot and the account's `status.json` entry. It contains `dispatchable_ready`,
+the count of the slot-limited `ready` set; `blocked_by_reason`, a count of every
+row in `blocked`; and `gate_degraded_workspaces`, the number of distinct
+workspaces blocked by an unhealthy gate. This keeps the daily operator readout
+useful even when a large ready frontier has little immediately dispatchable
+capacity. If demand becomes unknown, the last successful summary remains in
+the demand document's `last_good` observation.
+
 Each publisher atomically writes `demand_state`, with `observed_at` and these
 fields. Codex and Anthropic use the shared `refresh` implementation, with separate
 native quota configs; Z.AI combines its existing collector with the same demand

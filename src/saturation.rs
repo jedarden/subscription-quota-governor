@@ -341,6 +341,7 @@ accounts:
     fn snapshot(t: i64, completed: u64) -> QuotaSnapshot {
         let now = DateTime::from_timestamp(1_800_000_000 + t, 0).unwrap();
         QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {

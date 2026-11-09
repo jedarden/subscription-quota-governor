@@ -1015,6 +1015,7 @@ pub fn shared_account_total(
     let decision = match freshest_sample(samples) {
         Some(freshest) => {
             let snapshot = crate::model::QuotaSnapshot {
+                demand_summary: None,
                 observed_at: freshest.observed_at,
                 fresh: true,
                 windows: vec![crate::model::QuotaWindow {
@@ -1037,6 +1038,7 @@ pub fn shared_account_total(
         // combined fleet holds the total at the combined current.
         None => {
             let snapshot = crate::model::QuotaSnapshot {
+                demand_summary: None,
                 observed_at: now,
                 fresh: false,
                 windows: Vec::new(),

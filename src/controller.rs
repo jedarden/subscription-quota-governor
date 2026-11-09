@@ -1083,6 +1083,7 @@ mod tests {
             duration_minutes: None,
         };
         let mut snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![weekly.clone()],
@@ -1196,6 +1197,7 @@ mod tests {
     fn chooses_most_conservative_window() {
         let now = Utc::now();
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![
@@ -1237,6 +1239,7 @@ mod tests {
     fn pool_evaluation_with_no_unowned_workers_equals_plain_evaluation() {
         let now = Utc::now();
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1276,6 +1279,7 @@ mod tests {
         // workers already running, the elastic tier must drop to zero and the
         // governor must not try to stop the roster to get below the floor.
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1314,6 +1318,7 @@ mod tests {
         config.fleet.max_workers = 2;
         config.fleet.max_scale_up_per_cycle = 10;
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1352,6 +1357,7 @@ mod tests {
     fn stale_decision_has_no_binding_window() {
         let now = Utc::now();
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now - Duration::hours(1),
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1387,6 +1393,7 @@ mod tests {
         config.utilization.strategy = Strategy::CeilingOnly;
         config.utilization.target_utilization = Some(0.9);
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![
@@ -1423,6 +1430,7 @@ mod tests {
         let now = Utc::now();
         let reset = now + Duration::hours(8);
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1468,6 +1476,7 @@ mod tests {
         let now = Utc::now();
         let reset = now + Duration::hours(8);
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1511,6 +1520,7 @@ mod tests {
         let now = Utc::now();
         let reset = now + Duration::hours(8);
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1546,6 +1556,7 @@ mod tests {
     fn stale_data_never_scales_up() {
         let now = Utc::now();
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now - Duration::hours(1),
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1578,6 +1589,7 @@ mod tests {
     fn bootstraps_an_empty_fleet_to_learn_burn() {
         let now = Utc::now();
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1657,6 +1669,7 @@ mod tests {
         let now = Utc::now();
         let reset = now + Duration::hours(8);
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1693,6 +1706,7 @@ mod tests {
         let now = Utc::now();
         let reset = now + Duration::hours(8);
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1734,6 +1748,7 @@ mod tests {
         config.banked_resets.enabled = true;
         config.fleet.max_workers = 20;
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -1772,6 +1787,7 @@ mod tests {
         assert_eq!(decision.desired_workers, 2);
 
         let no_backlog_signal = QuotaSnapshot {
+            demand_summary: None,
             eligible_backlog_capacity: None,
             ..snapshot.clone()
         };
@@ -1784,6 +1800,7 @@ mod tests {
         );
 
         let one_worker_backlog = QuotaSnapshot {
+            demand_summary: None,
             eligible_backlog_capacity: Some(1),
             ..snapshot
         };
@@ -1799,6 +1816,7 @@ mod tests {
         config.banked_resets.enabled = true;
         config.banked_resets.full_speed = true;
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -2111,6 +2129,7 @@ mod tests {
         config.banked_resets.enabled = true;
         config.fleet.max_workers = 20;
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -2170,6 +2189,7 @@ mod tests {
             reset_credits: Option<ResetCreditsSnapshot>,
         ) -> QuotaSnapshot {
             QuotaSnapshot {
+                demand_summary: None,
                 observed_at: sample.observed_at,
                 fresh: true,
                 windows: vec![QuotaWindow {
@@ -2359,6 +2379,7 @@ mod tests {
         let mut config = account();
         config.banked_resets.enabled = true;
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -2395,6 +2416,7 @@ mod tests {
         config.fleet.min_workers = 1;
         config.fleet.max_scale_down_per_cycle = 1;
         let mut snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -2486,6 +2508,7 @@ mod tests {
         let mut config = account();
         config.banked_resets.enabled = true;
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -2667,6 +2690,7 @@ mod tests {
             config.utilization.windows = windows;
 
             let snapshot = QuotaSnapshot {
+                demand_summary: None,
                 observed_at: now,
                 fresh: true,
                 windows: vec![QuotaWindow {
@@ -2723,6 +2747,7 @@ mod tests {
         config.utilization.windows = windows;
 
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![
@@ -2769,6 +2794,7 @@ mod tests {
         config.utilization.windows = windows;
 
         let snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: now,
             fresh: true,
             windows: vec![QuotaWindow {
@@ -2817,6 +2843,7 @@ mod tests {
         fraction: Option<f64>,
     ) -> QuotaSnapshot {
         QuotaSnapshot {
+            demand_summary: None,
             observed_at,
             fresh,
             windows: Vec::new(),
@@ -2908,6 +2935,7 @@ mod tests {
         };
         for snapshot in [
             QuotaSnapshot {
+                demand_summary: None,
                 backpressure: None,
                 saturation: None,
                 ..backpressure_snapshot(now + Duration::seconds(30), true, None)
@@ -3137,6 +3165,7 @@ mod tests {
             reached: bool,
         ) -> QuotaSnapshot {
             QuotaSnapshot {
+                demand_summary: None,
                 observed_at: now,
                 fresh: true,
                 windows: vec![QuotaWindow {
@@ -3198,6 +3227,7 @@ mod tests {
                 let owned = owned.min(config.fleet.max_workers).max(config.fleet.min_workers);
                 let now = Utc::now();
                 let snapshot = QuotaSnapshot {
+            demand_summary: None,
                     observed_at: now,
                     fresh: true,
                     windows: vec![QuotaWindow {
@@ -3258,6 +3288,7 @@ mod tests {
                     )
                 };
                 let snapshot = QuotaSnapshot {
+            demand_summary: None,
                     observed_at,
                     fresh: !stale_via_fresh_flag,
                     windows: vec![QuotaWindow {
@@ -3321,6 +3352,7 @@ mod tests {
                     reached: reached_b,
                 };
                 let snapshot_one = QuotaSnapshot {
+            demand_summary: None,
                     observed_at: now,
                     fresh: true,
                     windows: vec![window_a.clone()],
@@ -3331,6 +3363,7 @@ mod tests {
                     lane_starved: None,
                 };
                 let snapshot_two = QuotaSnapshot {
+            demand_summary: None,
                     observed_at: now,
                     fresh: true,
                     windows: vec![window_a, window_b],
@@ -3451,6 +3484,7 @@ mod tests {
             for cycle in 0..40u32 {
                 clock.advance(hours(cycle_hours));
                 let snapshot = QuotaSnapshot {
+                    demand_summary: None,
                     observed_at: clock.now(),
                     fresh: true,
                     windows: vec![QuotaWindow {
@@ -3509,6 +3543,7 @@ mod tests {
                     used_fraction = (used_fraction + workers as f64 * rate * cycle_hours).min(1.0);
                 }
                 let snapshot = QuotaSnapshot {
+                    demand_summary: None,
                     observed_at: clock.now(),
                     fresh: !stale,
                     windows: vec![QuotaWindow {
@@ -3586,6 +3621,7 @@ mod tests {
                         + workers as f64 * per_worker_rate * cycle_gap_hours)
                         .min(1.0);
                     let snapshot = QuotaSnapshot {
+                        demand_summary: None,
                         observed_at: clock.now(),
                         fresh: true,
                         windows: vec![QuotaWindow {
@@ -3623,6 +3659,7 @@ mod tests {
                 // holding, not extrapolating.
                 clock.set(resets_at + Duration::seconds(1));
                 let pending_rollover = QuotaSnapshot {
+                    demand_summary: None,
                     observed_at: clock.now(),
                     fresh: true,
                     windows: vec![QuotaWindow {

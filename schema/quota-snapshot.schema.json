@@ -30,6 +30,10 @@
       "type": "boolean",
       "description": "The demand publisher's lane-starvation verdict (subgov-6db97205): eligible ready demand exists while every fresh lane worker reported an exhausted state for more than 2 consecutive refresh cycles. Omitted when the source evaluates no lane invariant, when demand was unknown, or when evaluation failed. An alarm surface for the operator only; the governor's actuation never reads it."
     },
+    "demand_summary": {
+      "$ref": "#/$defs/demandSummary",
+      "description": "Compact ready/blocked demand evidence surfaced in the account's status.json entry."
+    },
     "saturation": {
       "$ref": "#/$defs/saturation",
       "description": "Optional completed-request throughput and provider error 1302 interval evidence; not generic HTTP 429."
@@ -44,6 +48,32 @@
       "description": "Every active consumption limit relevant to the account. An empty array is invalid, not unlimited capacity (\u00a76.1). `id` must be unique within this array (\u00a76.2); JSON Schema has no portable keyword for uniqueness of a single property across array items, so this constraint is documented here but not mechanically enforced by this schema -- verify it separately (subgov-bbe7889c tracks the matching gap in validate_snapshot()).",
       "items": {
         "$ref": "#/$defs/window"
+      }
+    },
+    "demandSummary": {
+      "type": "object",
+      "required": [
+        "dispatchable_ready",
+        "blocked_by_reason",
+        "gate_degraded_workspaces"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "dispatchable_ready": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blocked_by_reason": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "gate_degraded_workspaces": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "reset_credits": {

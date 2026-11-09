@@ -708,6 +708,7 @@ pub fn parse_anthropic_usage(payload: &Value, observed_at: DateTime<Utc>) -> Res
         bail!("Anthropic usage response contained no usable quota windows");
     }
     Ok(QuotaSnapshot {
+        demand_summary: None,
         observed_at,
         fresh: true,
         windows: windows.into_values().collect(),
@@ -1284,6 +1285,7 @@ pub fn parse_codex_rate_limits(
         return Err(CodexSourceError::NoUsableWindows.into());
     }
     Ok(QuotaSnapshot {
+        demand_summary: None,
         observed_at,
         fresh: true,
         windows,

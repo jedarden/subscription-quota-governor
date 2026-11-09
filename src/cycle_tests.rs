@@ -154,6 +154,7 @@ fn single_window_snapshot(
     resets_at: DateTime<Utc>,
 ) -> QuotaSnapshot {
     QuotaSnapshot {
+        demand_summary: None,
         observed_at,
         fresh,
         windows: vec![QuotaWindow {

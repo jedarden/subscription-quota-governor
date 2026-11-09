@@ -23,7 +23,7 @@ use subscription_governor::federation::{
     self, FederationHost, PeerFreshness, PeerMoment, PeerQuotaSample, PeerRecord, PeerTable,
 };
 use subscription_governor::fleet;
-use subscription_governor::model::{QuotaSnapshot, ResourceSnapshot};
+use subscription_governor::model::{DemandSummary, QuotaSnapshot, ResourceSnapshot};
 use subscription_governor::ownership::{self, OwnershipCycle};
 use subscription_governor::placement::{self, HostPlacement};
 use subscription_governor::source;
@@ -933,6 +933,10 @@ struct AccountReadiness {
     /// refreshes. It is an alarm surface only -- actuation never reads it.
     #[serde(skip_serializing_if = "Option::is_none")]
     lane_starved: Option<bool>,
+    /// The publisher's compact ready/blocked demand summary, retained as a
+    /// daily operator line even when the quota sample itself is stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    demand_summary: Option<DemandSummary>,
 }
 
 fn readiness_for_decision(decision: &Decision) -> AccountReadiness {
@@ -944,6 +948,7 @@ fn readiness_for_decision(decision: &Decision) -> AccountReadiness {
         current_workers: Some(decision.current_workers),
         desired_workers: Some(decision.desired_workers),
         lane_starved: None,
+        demand_summary: None,
     };
     if decision.stale {
         return AccountReadiness {
@@ -998,6 +1003,7 @@ fn readiness_for_failure(failure: &AccountFailure) -> AccountReadiness {
         current_workers: None,
         desired_workers: None,
         lane_starved: None,
+        demand_summary: None,
     }
 }
 
@@ -1920,6 +1926,7 @@ fn run_cycle(
             // The scaling decision deliberately never reads it.
             let readiness = AccountReadiness {
                 lane_starved: snapshot.lane_starved,
+                demand_summary: snapshot.demand_summary.clone(),
                 ..readiness_for_decision(&decision)
             };
             metrics.apply_decision(&decision, readiness.reason.clone(), now);
@@ -2891,6 +2898,7 @@ mod status_tests {
 
     fn snapshot_with_lane_starved(lane_starved: Option<bool>) -> QuotaSnapshot {
         QuotaSnapshot {
+            demand_summary: None,
             observed_at: Utc::now(),
             fresh: true,
             windows: Vec::new(),
@@ -2926,6 +2934,29 @@ mod status_tests {
         )))
         .unwrap();
         assert!(failed.get("lane_starved").is_none());
+    }
+
+    #[test]
+    fn demand_summary_is_surfaced_into_status_json() {
+        let summary = DemandSummary {
+            dispatchable_ready: 11,
+            blocked_by_reason: BTreeMap::from([
+                ("not_currently_claimable".to_owned(), 142),
+                ("workspace_gate_degraded".to_owned(), 153),
+            ]),
+            gate_degraded_workspaces: 6,
+        };
+        let surfaced = serde_json::to_value(AccountReadiness {
+            demand_summary: Some(summary),
+            ..readiness_for_decision(&decision(false, Vec::new()))
+        })
+        .unwrap();
+        assert_eq!(surfaced["demand_summary"]["dispatchable_ready"], 11);
+        assert_eq!(
+            surfaced["demand_summary"]["blocked_by_reason"]["workspace_gate_degraded"],
+            153
+        );
+        assert_eq!(surfaced["demand_summary"]["gate_degraded_workspaces"], 6);
     }
 
     #[test]

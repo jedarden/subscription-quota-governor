@@ -754,6 +754,7 @@ mod tests {
         resets_at: DateTime<Utc>,
     ) -> QuotaSnapshot {
         QuotaSnapshot {
+            demand_summary: None,
             observed_at: Utc::now(),
             fresh: true,
             windows: vec![QuotaWindow {
@@ -896,6 +897,7 @@ mod tests {
         assert!(account.history.contains_key("5h"));
 
         let empty_snapshot = QuotaSnapshot {
+            demand_summary: None,
             observed_at: Utc::now(),
             fresh: true,
             windows: Vec::new(),
