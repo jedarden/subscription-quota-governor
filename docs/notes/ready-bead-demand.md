@@ -5,7 +5,8 @@ All three provider publishers use `scripts/subgov_ready_beads.py`. They query
 native frontier owns dependency readiness; assigned, non-open and manually
 blocked rows are also rejected defensively. Human/proposal labels, timed holds,
 recorded external holds, NEEDLE internal artifacts, custom excluded labels,
-foreign queue ownership and degraded workspace gates contribute no ready work.
+authoritative-backend and queue-ownership refusals and degraded workspace gates
+contribute no ready work.
 A query failure, malformed output or possible truncation marks only that
 workspace unknown (`blocked` reason `ready_query_unavailable`, with the
 exception type in `error`): it contributes no seeds and its busy claims stay
@@ -20,9 +21,11 @@ The `demand` object replaces the old `work` allowlist. By default the maintained
 settings read the authoritative NEEDLE configuration at
 `~/.config/needle/config.yaml`: a nonempty Explore workspace list restricts the
 scope, otherwise discovery follows `workspace_root`. Discovery skips hidden,
-`target`, `node_modules` and symlink directories. An absent local `.needle.yaml`
-uses the native store binding; an explicit incompatible backend is never queried.
-The adapter never reads a legacy store with the bead-rs CLI or repairs any store.
+`target`, `node_modules` and symlink directories. A route without an explicit
+authoritative `bead_cli.backend` binding (`bead-rs`, its `bead` alias, or the
+deprecated `br` alias — exactly NEEDLE's BeadBackend::Bead spellings) is
+refused before its frontier is read (see the dispatch-health gate below). The
+adapter never reads a legacy store with the bead-rs CLI or repairs any store.
 
 Optional demand settings:
 
@@ -43,6 +46,9 @@ Optional demand settings:
   (default 8). The limit cannot be dropped from the query: the CLI's default
   `--limit 100` would silently truncate the frontier, and no cheaper projection
   exists (`--comments none` is already the default).
+- `dispatch_health_timeout_seconds`: per-workspace `bead sync status` timeout
+  for the dispatch-health gate (default 30), applied only to routes with
+  demand (see the gate section above).
 
 `ready_bead_count` counts eligible unclaimed beads before slot limits. `ready`
 is the launchable subset after slot limits; it is not a persistent assignment.
@@ -57,6 +63,98 @@ are retained even when workspace eligibility changes. Worker retirement still
 uses the existing idle-only safety checks. Pool arbitration/host limits are
 WP24 work; WP26 orders `ready` into per-launch seeds — see
 [seed-workspace-selection.md](seed-workspace-selection.md).
+
+## Dispatch health gate (subgov-06b69094)
+
+A counted bead must be work NEEDLE can actually claim now. The 2026-11-11/12
+fleet measured exactly the failure mode that motivates this gate: the
+publisher counted seven launch slots across bead-rs, halfonadouble.com,
+investment-research-mcp and spaxel while NEEDLE Explore refused every one of
+those routes — missing authoritative backend binding (halfonadouble.com had
+no `.needle.yaml`), `secret_quarantined` publication withholding plus
+sync-flush exit 4 and incomplete retained-generation coverage (bead-rs,
+investment-research-mcp), and `secret_quarantined`/`workspace_sync_busy`
+(spaxel). Counting refused routes launches workers that cannot claim, which
+is a false scale-up signal and wasted provider quota.
+
+Every route with demand is therefore gated by a versioned health observation
+(`dispatch_health_version: 1` in the demand document) that mirrors NEEDLE's
+own claim-path admission, verified from local read-only sources:
+
+1. **Backend binding authority** — NEEDLE `open_configured`
+   (`NEEDLE/src/bead_store/mod.rs`) bails with "no authoritative bead backend
+   binding" unless `.needle.yaml` sets `bead_cli.backend` explicitly;
+   `auto` — the resolution of a missing file or absent key — is refused, and
+   the retired bead-forge names (`bf`, `bead-forge`) are refused with a
+   migration hint (`NEEDLE/src/config/mod.rs`: "use 'bead-rs' or 'bead'
+   instead"). The dispatchable spellings are exactly `BeadBackend::Bead`'s:
+   `bead-rs`, `bead`, `br`. The publisher classifies these as
+   `backend_binding_missing`, `backend_binding_retired` and
+   `backend_binding_invalid` before a route is ever queried.
+2. **Checkpoint admission** — the publisher reads
+   `bead sync status --format json`, the same payload NEEDLE's sync_guard
+   (`NEEDLE/src/bead_store/sync_guard.rs`) reads before any claim, and
+   applies its match arms verbatim: `aligned` AND publication consistent
+   (`checkpoint_consistent`, falling back to `ready_to_commit` on bead-rs
+   builds predating the split) is admitted; aligned-but-unverified
+   publication is a verified refusal (`checkpoint_publication_unverified` —
+   secret quarantine, incomplete retained-generation coverage and
+   uncommitted checkpoint files all surface this way; the bounded
+   `not_ready_reasons` text rides the `blocked` row as `detail`); and a
+   relationship that is not a remedy state — bead-rs's
+   `covered-ahead-integrity-failure` — is a verified refusal
+   (`checkpoint_not_aligned`), exactly the arm NEEDLE hard-bails on. The
+   repairable relationships (`behind`, `absent`, `remote-advanced`) are
+   **unknown**, not refusals: NEEDLE repairs those itself (flush-only /
+   reconcile) under its own budget at claim time and refuses only when the
+   repair fails, which a read-only observation cannot predict. They are
+   recorded as `checkpoint_repair_pending` in `blocked` (with the
+   relationship as `detail`), contribute no slots, and count toward the
+   demand-unknown rule below instead of a verified-empty zero.
+3. **Sync-lock contention** — a read-only `flock` probe of
+   `.beads/needle-sync.lock` (never created, never written), applied with
+   NEEDLE's own discipline: a flushing worker holds the lock only for a
+   flush-duration, and sync_guard waits out a held lock for its full sync
+   budget before refusing `workspace_sync_busy`. The probe likewise polls
+   for up to the per-route health timeout and refuses only a lock that
+   never frees — a transiently-held lock is claimable (NEEDLE would wait
+   and claim), so an instant refusal there would systematically under-count
+   exactly the busiest routes. The probe runs before the status read, so
+   the payload is not observed mid-publication.
+
+Scope and cost: only routes with at least one eligible unclaimed bead are
+probed — zero-demand routes contribute no slots under any health verdict, so
+probing them would only spend cycles. The full 86-workspace fleet probe
+measures ~13s at 4-way parallelism when demand is broad; the per-route
+health timeout defaults to 30 seconds and bounds both the lock wait and the
+status read (NEEDLE's own sync budget is 180s). It is settable as
+`demand.dispatch_health_timeout_seconds` (positive integer seconds); a
+contended route can therefore cost up to twice its timeout before a
+`workspace_sync_busy` refusal.
+
+Unknown is not zero: a probe that times out, exits nonzero or returns a
+malformed contract marks that route `dispatch_health_unavailable` in
+`blocked` (with the exception type in `error`), and a repairable
+relationship marks it `checkpoint_repair_pending`; both contribute no seeds
+and keep their busy claims as retention capacity. When every selected route
+either fails its ready query or cannot verify claimability, demand is
+unknown — the same fail-closed rule as the ready query — so the controller
+freezes at the last good demand instead of scaling down over unverifiable
+work. Verified refusals are different: they are precise observations, so
+they simply remove that route's slots while the underlying store stays
+broken. Workspaces summaries carry the verdict per route
+(`dispatch_health`: `admitted`, the refusal reason, `checkpoint_repair_pending`,
+`dispatch_health_unavailable`, or `not_probed` for zero-demand routes). Busy
+claims are retained even when a route's health verdict changes after their
+dispatch.
+
+Repairs stay out of scope by design: the publisher never flushes,
+reconciles, redacts or reinitializes another repository's store. Recovery
+belongs to the owning repository (fix the binding, clear the quarantine,
+republish the checkpoint); subgov's job is to stop counting the route until
+that happens. No NEEDLE-side interface change is required — the gate
+consumes only documented local sources (`bead sync status`, `.needle.yaml`,
+the sync lock).
 
 ## Lane dispatch and the starvation invariant (subgov-6db97205)
 

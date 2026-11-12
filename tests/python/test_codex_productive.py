@@ -27,6 +27,10 @@ class ProductiveTests(unittest.TestCase):
                 "quota_binary": "subgov", "quota_config": "native.yaml",
                 "demand": {"workspaces": [str(root)]}}
 
+    @staticmethod
+    def admitted(*args, **kwargs):
+        return {"state": "admitted"}
+
     def test_native_array_and_single_object_are_understood(self):
         self.assertEqual(adapter.document('[{"id":"test-1"}]')[0]["id"], "test-1")
         self.assertEqual(adapter.single('{"id":"test-1"}')["id"], "test-1")
@@ -58,6 +62,7 @@ class ProductiveTests(unittest.TestCase):
             settings = self.settings(Path(root))
             issue = {"id": "new-1", "revision": 99, "status": "open", "labels": []}
             with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "dispatch_health", self.admitted), \
                  patch.object(ready_beads, "ready_issues", return_value=[issue]), \
                  patch.object(adapter, "workers", return_value=[]):
                 measured = adapter.demand(settings)
@@ -79,6 +84,7 @@ class ProductiveTests(unittest.TestCase):
             s = self.dispatch_settings(Path(root))
             issue = {"id": "new-1", "status": "open", "assignee": None, "labels": []}
             with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "dispatch_health", self.admitted), \
                  patch.object(ready_beads, "ready_issues", return_value=[issue]), \
                  patch.object(adapter, "workers", return_value=[]), \
                  patch.object(adapter, "run", return_value="") as run:
@@ -96,6 +102,7 @@ class ProductiveTests(unittest.TestCase):
             issue = {"id": "done-1", "status": "open", "assignee": None,
                      "labels": ["subgov-codex-productive"]}
             with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "dispatch_health", self.admitted), \
                  patch.object(ready_beads, "ready_issues", return_value=[issue]), \
                  patch.object(adapter, "workers", return_value=[]), \
                  patch.object(adapter, "run") as run:
@@ -112,6 +119,7 @@ class ProductiveTests(unittest.TestCase):
             quarantined = {"id": "held-1", "status": "open", "assignee": None, "labels": []}
             issues = {str(Path(root)): [good], str(Path(root) / "other"): [quarantined]}
             with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "dispatch_health", self.admitted), \
                  patch.object(ready_beads, "ready_issues",
                               side_effect=lambda route, timeout=8: issues[route]), \
                  patch.object(adapter, "workers", return_value=[]), \
@@ -136,6 +144,7 @@ class ProductiveTests(unittest.TestCase):
             s = self.settings(Path(root))
             issue = {"id": "new-1", "status": "open", "assignee": None, "labels": []}
             with patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "dispatch_health", self.admitted), \
                  patch.object(ready_beads, "ready_issues", return_value=[issue]), \
                  patch.object(adapter, "workers", return_value=[]), \
                  patch.object(adapter, "run") as run:
@@ -375,6 +384,7 @@ class ProductiveTests(unittest.TestCase):
                  patch.object(adapter, "policy_ok", return_value=True), \
                  patch.object(adapter, "run", side_effect=show), \
                  patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "dispatch_health", self.admitted), \
                  patch.object(ready_beads, "ready_issues", return_value=[
                      {"id": "ready-1", "status": "open", "assignee": None, "labels": []}]):
                 measured = adapter.demand(s)
@@ -427,6 +437,7 @@ class ProductiveTests(unittest.TestCase):
             with patch.object(adapter, "workers", return_value=[idle]), \
                  patch.object(adapter, "unit_info", side_effect=subprocess.TimeoutExpired("systemctl", 5)), \
                  patch.object(ready_beads, "policy_ok", return_value=True), \
+                 patch.object(ready_beads, "dispatch_health", self.admitted), \
                  patch.object(ready_beads, "ready_issues", return_value=[
                      {"id": "ready-1", "status": "open", "assignee": None, "labels": []}]):
                 measured = adapter.demand(s)

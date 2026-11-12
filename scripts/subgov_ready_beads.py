@@ -1,23 +1,44 @@
 """Read-only NEEDLE ready-bead demand, shared by all provider pools.
 
 Native bead-rs owns dependency readiness; this module adds NEEDLE's dispatch
-holds and pool/workspace boundaries. A failed query marks only that workspace
-unknown; demand goes unknown (never zero) only when every selected workspace
-fails.
+holds, pool/workspace boundaries and dispatch health. A route contributes
+launch slots only when NEEDLE's own claim path would admit it: an explicit
+authoritative `bead_cli.backend` binding (`bead-rs`/`bead`/`br`) plus an
+aligned, published checkpoint (`bead sync status --format json`, the same
+contract NEEDLE's sync_guard reads) with no other worker holding the sync
+lock past the probe budget. A failed query or failed health observation
+marks only that workspace unknown; demand goes unknown (never zero) only
+when every selected workspace fails.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import time
 
 from subgov_adapter_common import read_json
 
 LIMIT = 999999
 DEFAULT_READY_TIMEOUT = 8
+DEFAULT_HEALTH_TIMEOUT = 30
+# Version of the dispatch-health observation contract this module emits in
+# `dispatch_health_version`: mirror of NEEDLE bead_store::sync_guard's
+# admission predicate over `bead sync status --format json` (bead-rs), plus
+# the authoritative backend binding from `.needle.yaml` and the
+# needle-sync.lock busy probe. Bump when the mirrored contract changes.
+DISPATCH_HEALTH_VERSION = 1
+# bead-rs sync relationships NEEDLE repairs itself (flush-only/reconcile)
+# before deciding admission: a read-only probe cannot know whether that
+# repair would succeed, so these stay unknown rather than refusals.
+# `covered-ahead-integrity-failure` — and anything else — is not a remedy
+# state; NEEDLE hard-bails on it, so it is a verified refusal.
+REPAIRABLE_RELATIONSHIPS = frozenset({'behind', 'absent', 'remote-advanced'})
 READY_QUERY_ERRORS = (subprocess.TimeoutExpired, subprocess.CalledProcessError,
                       ValueError, OSError)
 BUILD_MARKERS = ('Cargo.toml', 'go.mod', 'CMakeLists.txt', 'pom.xml', 'build.gradle',
@@ -105,21 +126,70 @@ def policy_fields(path, fields):
 def workspace_policy(path):
     values = policy_fields(path, {('bead_cli', 'backend'), ('queue', 'owner_host'),
                                   ('workspace', 'max_workers'), ('strands', 'pluck', 'exclude_labels')})
-    return {'bead_cli': {'backend': values.get(('bead_cli', 'backend'), 'bead-rs')},
+    # The backend is deliberately not defaulted here: NEEDLE dispatch requires
+    # an explicit authoritative binding (binding_refusal), so an absent key
+    # must stay distinguishable from a written `bead-rs`.
+    return {'bead_cli': {'backend': values.get(('bead_cli', 'backend'))},
             'queue': {'owner_host': values.get(('queue', 'owner_host'))},
             'max_workers': values.get(('workspace', 'max_workers')),
             **({'exclude_labels': values[('strands', 'pluck', 'exclude_labels')]}
                if ('strands', 'pluck', 'exclude_labels') in values else {})}
 
 
+def binding_refusal(route, policy):
+    """Classify the route's bead backend binding the way NEEDLE dispatch does.
+
+    NEEDLE's open_configured (src/bead_store/mod.rs) bails with "no
+    authoritative bead backend binding" when bead_cli.backend resolves to
+    `auto` — which is exactly what a missing `.needle.yaml` or an absent key
+    resolves to — and config resolution (src/config/mod.rs) refuses the retired
+    bead-forge names with a migration hint before backend resolution. The
+    dispatchable spellings are exactly NEEDLE's BeadBackend::Bead serde
+    spellings: `bead-rs`, its `bead` alias, and the deprecated `br` alias
+    (which resolve_bead_cli maps to the same `bead` binary). Returns the
+    refusal reason, or None when bound.
+    """
+    if not (Path(route) / '.needle.yaml').exists():
+        return 'backend_binding_missing'
+    backend = (policy or {}).get('bead_cli', {}).get('backend')
+    if backend in (None, 'auto'):
+        return 'backend_binding_missing'
+    if backend in ('bf', 'bead-forge'):
+        return 'backend_binding_retired'
+    if backend not in ('bead-rs', 'bead', 'br'):
+        return 'backend_binding_invalid'
+    return None
+
+
+def route_policy(route):
+    route = Path(route)
+    return (workspace_policy(route / '.needle.yaml')
+            if (route / '.needle.yaml').exists() else {'bead_cli': {}, 'queue': {}})
+
+
 def policy_ok(route, host):
     route = Path(route)
     if not (route / '.beads/config.json').is_file():
         return False
-    policy = workspace_policy(route / '.needle.yaml') if (route / '.needle.yaml').exists() else {
-        'bead_cli': {'backend': 'bead-rs'}, 'queue': {}}
-    return (policy['bead_cli']['backend'] in ('bead-rs', 'bead', 'auto')
-            and policy['queue'].get('owner_host') in (None, host))
+    policy = route_policy(route)
+    if binding_refusal(route, policy):
+        return False
+    return policy.get('queue', {}).get('owner_host') in (None, host)
+
+
+def route_block_reason(route, host):
+    """Name why policy_ok refused a route, mirroring NEEDLE's refusal classes.
+
+    Binding authority is decided first because NEEDLE refuses it before the
+    queue-owner check in its own claim path.
+    """
+    route = Path(route)
+    if not (route / '.beads/config.json').is_file():
+        return 'backend_binding_missing'
+    try:
+        return binding_refusal(route, route_policy(route)) or 'queue_owner_mismatch'
+    except (ValueError, OSError):
+        return 'policy_unreadable'
 
 
 def gate_degraded(settings, route):
@@ -133,6 +203,107 @@ def gate_degraded(settings, route):
     if not isinstance(value, dict):
         return 'gate_state_unreadable'
     return 'workspace_gate_degraded' if value.get('degraded', False) is not False else None
+
+
+def summarize_reasons(reasons, budget=240):
+    """Bound the status payload's reason text for the blocked record."""
+    return '; '.join(str(reason) for reason in (reasons or [])[:4])[:budget]
+
+
+def sync_lock_busy(route, budget=DEFAULT_HEALTH_TIMEOUT, poll=0.25):
+    """Read-only mirror of the needle-sync.lock guard (NEEDLE sync_guard).
+
+    bead-rs workers hold this exclusive flock only for a flush-duration while
+    publishing checkpoints; NEEDLE waits out the same lock for its full sync
+    budget and refuses dispatch (`workspace_sync_busy`) only when it stays
+    held past that deadline — a transiently-held lock is claimable, not
+    refused. This probe applies the same discipline without writing: poll the
+    exclusive flock for up to `budget` seconds and count only a lock that
+    never frees as busy. The probe never creates the file — a missing lock
+    simply means no synchronized writer has ever run here — and never writes
+    to it. Re-opening on each poll keeps the wait honest if the file is
+    replaced mid-probe.
+    """
+    deadline = time.monotonic() + max(0, budget)
+    while True:
+        try:
+            handle = os.open(Path(route) / '.beads/needle-sync.lock', os.O_RDONLY)
+        except FileNotFoundError:
+            return False
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False  # acquired: nobody holds it; closing releases our probe
+        except BlockingIOError:
+            pass
+        finally:
+            os.close(handle)
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(poll)
+
+
+def sync_status(route, timeout=DEFAULT_HEALTH_TIMEOUT):
+    """Read the checkpoint contract NEEDLE's sync_guard reads before any claim."""
+    result = subprocess.run(['bead', 'sync', 'status', '--format', 'json'],
+                            cwd=route, text=True, capture_output=True, timeout=timeout, check=True)
+    status = json.loads(result.stdout)
+    if not isinstance(status, dict):
+        raise ValueError('invalid sync status contract')
+    if not isinstance(status.get('relationship'), str) or not isinstance(status.get('ready_to_commit'), bool):
+        raise ValueError('incomplete sync status contract')
+    consistent = status.get('checkpoint_consistent')
+    if consistent is not None and not isinstance(consistent, bool):
+        raise ValueError('invalid checkpoint_consistent field')
+    return status
+
+
+def dispatch_health(route, timeout=DEFAULT_HEALTH_TIMEOUT):
+    """Classify one route's dispatch admission the way NEEDLE's claim path does.
+
+    Returns {'state': 'admitted'} when a worker could claim here now,
+    {'state': 'refused', 'reason', ...} for a verified refusal, or
+    {'state': 'unknown', 'reason': 'dispatch_health_unavailable', ...} when the
+    observation itself failed. Unknown is never treated as claimable and never
+    as verified-empty work.
+
+    Admission mirrors NEEDLE bead_store::sync_guard arm for arm, in its
+    order: first the needle-sync lock (waited out for the probe budget,
+    exactly the deadline NEEDLE gives a flushing worker before refusing
+    `workspace_sync_busy`), then — once no publication is in flight — the
+    status payload's own predicate: relationship `aligned` AND publication
+    consistent (`checkpoint_consistent`, falling back to `ready_to_commit`
+    on bead-rs builds predating the split). Secret quarantine, incomplete
+    retained-generation coverage and uncommitted checkpoint files surface
+    through the same status payload as publication failures and are verified
+    refusals (`checkpoint_publication_unverified`), as is any relationship
+    NEEDLE hard-bails on (`checkpoint_not_aligned`). The repairable
+    relationships — `behind`, `absent`, `remote-advanced` — are different:
+    NEEDLE repairs them under its own budget at claim time and refuses only
+    when that repair fails, which a read-only observation cannot predict, so
+    they are recorded as unknown (`checkpoint_repair_pending`): never
+    counted demand, and never a verified-empty claim either.
+    """
+    try:
+        if sync_lock_busy(route, timeout):
+            return {'state': 'refused', 'reason': 'workspace_sync_busy'}
+        status = sync_status(route, timeout)
+    except READY_QUERY_ERRORS as error:
+        return {'state': 'unknown', 'reason': 'dispatch_health_unavailable',
+                'error': type(error).__name__, 'exception': error}
+    relationship = status['relationship']
+    if relationship != 'aligned':
+        if relationship in REPAIRABLE_RELATIONSHIPS:
+            return {'state': 'unknown', 'reason': 'checkpoint_repair_pending',
+                    'detail': relationship,
+                    'exception': ValueError(f'checkpoint repair pending: {relationship}')}
+        return {'state': 'refused', 'reason': 'checkpoint_not_aligned',
+                'detail': relationship}
+    consistent = status.get('checkpoint_consistent')
+    published = status['ready_to_commit'] if consistent is None else consistent
+    if not published:
+        return {'state': 'refused', 'reason': 'checkpoint_publication_unverified',
+                'detail': summarize_reasons(status.get('not_ready_reasons'))}
+    return {'state': 'admitted'}
 
 
 def discover(root):
@@ -257,6 +428,10 @@ def observe(settings, busy=(), unowned_floor=0, lane_label=None):
 
     Claims already executing are retention evidence, never ready demand. A
     build-heavy workspace contributes one slot; existing claims occupy it.
+    Routes are gated by NEEDLE's own dispatch admission before they count:
+    authoritative backend binding, queue ownership, gate health, and — for
+    routes with demand — a verified dispatch-health observation
+    (`dispatch_health`), so no route NEEDLE would refuse contributes slots.
 
     When `lane_label` is given, every eligible job is annotated with
     `labelled` -- an exact, case-sensitive match against the bead's labels,
@@ -274,6 +449,9 @@ def observe(settings, busy=(), unowned_floor=0, lane_label=None):
     timeout = config.get('ready_timeout_seconds', DEFAULT_READY_TIMEOUT)
     if type(timeout) is not int or timeout <= 0:
         raise ValueError('invalid ready query timeout')
+    health_timeout = config.get('dispatch_health_timeout_seconds', DEFAULT_HEALTH_TIMEOUT)
+    if type(health_timeout) is not int or health_timeout <= 0:
+        raise ValueError('invalid dispatch health timeout')
     if any(not item.get('reason') for item in config.get('external_holds', [])):
         raise ValueError('external hold has no reason')
     holds = {(str(Path(item['workspace']).expanduser().resolve()), item['id'])
@@ -300,14 +478,15 @@ def observe(settings, busy=(), unowned_floor=0, lane_label=None):
             blocked.append({'workspace': route, 'reason': 'policy_unreadable'})
             continue
         if not owned:
-            blocked.append({'workspace': route, 'reason': 'backend_or_queue_owner'})
+            # Name the refusal the way NEEDLE's own claim path would report it.
+            blocked.append({'workspace': route, 'reason': route_block_reason(route, settings['host'])})
         elif gate_reason := gate_degraded(settings, route):
             blocked.append({'workspace': route, 'reason': gate_reason})
         else:
             selected.append(route)
     ready, seeds, summaries, capacity = [], [], [], unowned_floor
     busy_keys = {(str(Path(job['workspace']).resolve()), job['id']) for job in busy}
-    failures, observed = [], set()
+    failures, health_unknown, observed = [], [], set()
     with ThreadPoolExecutor(max_workers=4) as pool:
         outcomes = list(pool.map(lambda route: query_ready(route, timeout), selected))
     for route, outcome in zip(selected, outcomes):
@@ -356,18 +535,51 @@ def observe(settings, busy=(), unowned_floor=0, lane_label=None):
             if native_limit:
                 limit = min(limit, native_limit)
         slots = min(len(jobs), max(0, limit - active))
+        # Dispatch health gate (subgov-06b69094): counted demand must be work
+        # NEEDLE can claim now. A route whose verified health refuses dispatch
+        # — unbound backend, unverified or unrecoverable checkpoint, secret
+        # quarantine, busy sync lock — contributes no slots; a route whose
+        # claimability could not be verified (observation failed, or a repair
+        # NEEDLE would run at claim time is still pending) likewise keeps
+        # only its busy claims as retention evidence, and withholds demand
+        # entirely when no route could be verified. Zero-demand routes are
+        # not probed: they contribute no slots under any health verdict.
+        health = 'not_probed'
+        if jobs:
+            verdict = dispatch_health(route, health_timeout)
+            if verdict['state'] == 'admitted':
+                health = 'admitted'
+            else:
+                health = verdict['reason']
+                row = {'workspace': route, 'reason': verdict['reason']}
+                if verdict.get('detail'):
+                    row['detail'] = verdict['detail']
+                if verdict.get('error'):
+                    row['error'] = verdict['error']
+                blocked.append(row)
+                if verdict['state'] == 'unknown':
+                    health_unknown.append((route, verdict['exception']))
+                jobs, slots = [], 0
         ready.extend(jobs)
         seeds.extend(jobs[:slots])
         capacity += active + slots
         summaries.append({'workspace': route, 'ready_beads': len(jobs), 'busy_claims': active,
-                          'worker_limit': limit, 'eligible_slots': slots})
+                          'worker_limit': limit, 'eligible_slots': slots,
+                          'dispatch_health': health})
     if failures and len(failures) == len(selected):
         # Demand is unknown, never zero: a fleet where every selected store
         # failed still withholds capacity instead of publishing a partial 0.
         raise failures[0][1]
+    if health_unknown and len(failures) + len(health_unknown) == len(selected):
+        # Same rule for dispatch health: when every selected route that could
+        # carry demand either failed its ready query or could not verify
+        # claimability, demand is unknown — publishing verified-empty zeros
+        # would tell the controller to scale down over unverifiable work.
+        raise health_unknown[0][1]
     # Keep validated claims even if scope/health changed since their dispatch.
     capacity += sum(workspace not in observed for workspace, _ in busy_keys)
     return {'observed_at': now.isoformat(), 'ready': seeds, 'ready_bead_count': len(ready),
+            'dispatch_health_version': DISPATCH_HEALTH_VERSION,
             # Every counted unclaimed job, unbounded by slot limits: the set a
             # lane publisher must make claimable so counted demand and
             # lane-dispatchable work stay equal (subgov-6db97205).
