@@ -3690,4 +3690,131 @@ mod tests {
             }
         }
     }
+
+    /// subgov-a5c14e89: eligible backlog capacity is a hard bound on desired
+    /// workers for every provider and strategy, so no quota window -- however
+    /// permissive -- can outvote measured demand (plan §26.4: spare quota
+    /// alone never launches a worker).
+    #[test]
+    fn eligible_backlog_capacity_binds_desired_across_binding_windows() {
+        let now = Utc::now();
+        let mut cfg = account();
+        cfg.fleet.max_workers = 10;
+        cfg.fleet.max_scale_down_per_cycle = 10;
+        cfg.utilization.target_utilization = Some(0.9);
+        cfg.utilization.windows.insert(
+            "five_hour".into(),
+            WindowPolicy {
+                strategy: Some(Strategy::CeilingOnly),
+                ..Default::default()
+            },
+        );
+        let snapshot = QuotaSnapshot {
+            demand_summary: None,
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "five_hour".into(),
+                used_fraction: 0.1,
+                resets_at: now + Duration::hours(3),
+                reached: false,
+                duration_minutes: Some(300),
+            }],
+            eligible_backlog_capacity: Some(4),
+            reset_credits: None,
+            backpressure: None,
+            saturation: None,
+            lane_starved: None,
+        };
+        // Below the target, CeilingOnly alone would ask for max_workers;
+        // with no published capacity the controller reads demand as
+        // unbounded and grows straight to it -- exactly the legacy Z.AI
+        // command-source defect (desired pinned at max_workers).
+        let unbounded = QuotaSnapshot {
+            eligible_backlog_capacity: None,
+            ..snapshot.clone()
+        };
+        assert_eq!(
+            evaluate("acct", &cfg, &unbounded, &AccountState::default(), 2, now)
+                .unwrap()
+                .desired_workers,
+            10,
+            "a snapshot without eligible_backlog_capacity is unbounded demand"
+        );
+        assert_eq!(
+            evaluate("acct", &cfg, &snapshot, &AccountState::default(), 8, now)
+                .unwrap()
+                .desired_workers,
+            4,
+            "measured demand must bound the quota window's max_workers ask"
+        );
+        // A smaller current fleet can only grow within measured demand.
+        assert_eq!(
+            evaluate("acct", &cfg, &snapshot, &AccountState::default(), 1, now)
+                .unwrap()
+                .desired_workers,
+            4,
+            "growth stops at the measured bound, not at fleet max_workers"
+        );
+    }
+
+    /// subgov-a5c14e89: converging down to measured demand steps gradually
+    /// (idle-only, at most max_scale_down_per_cycle) and never overshoots
+    /// below the demand bound.
+    #[test]
+    fn backlog_capacity_down_steps_converge_gradually_to_demand() {
+        let now = Utc::now();
+        let mut cfg = account();
+        cfg.fleet.max_workers = 18;
+        cfg.fleet.max_scale_up_per_cycle = 1;
+        cfg.fleet.max_scale_down_per_cycle = 1;
+        cfg.utilization.target_utilization = Some(0.9);
+        cfg.utilization.windows.insert(
+            "five_hour".into(),
+            WindowPolicy {
+                strategy: Some(Strategy::CeilingOnly),
+                ..Default::default()
+            },
+        );
+        let snapshot = QuotaSnapshot {
+            demand_summary: None,
+            observed_at: now,
+            fresh: true,
+            windows: vec![QuotaWindow {
+                id: "five_hour".into(),
+                used_fraction: 0.1,
+                resets_at: now + Duration::hours(3),
+                reached: false,
+                duration_minutes: Some(300),
+            }],
+            eligible_backlog_capacity: Some(10),
+            reset_credits: None,
+            backpressure: None,
+            saturation: None,
+            lane_starved: None,
+        };
+        let mut current = 18;
+        for expected in (10..=17).rev() {
+            let decision = evaluate(
+                "acct",
+                &cfg,
+                &snapshot,
+                &AccountState::default(),
+                current,
+                now,
+            )
+            .unwrap();
+            assert_eq!(
+                decision.desired_workers, expected,
+                "each cycle steps down exactly one worker toward measured demand"
+            );
+            current = decision.desired_workers;
+        }
+        let converged =
+            evaluate("acct", &cfg, &snapshot, &AccountState::default(), 10, now).unwrap();
+        assert_eq!(
+            converged.desired_workers, 10,
+            "convergence holds at the measured bound"
+        );
+    }
 }

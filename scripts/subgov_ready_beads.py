@@ -586,6 +586,9 @@ def observe(settings, busy=(), unowned_floor=0, lane_label=None):
             'eligible': ready,
             'busy': list(busy), 'blocked': blocked, 'workspaces': summaries,
             'unowned_floor': unowned_floor,
+            # Occupied, identity-validated claims: the retention floor the
+            # caller's busy scan contributed (subgov-a5c14e89).
+            'busy_count': len(busy_keys),
             'eligible_backlog_capacity': min(settings['max_workers'], capacity)}
 
 

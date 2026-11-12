@@ -17,8 +17,14 @@ state_path: /home/coding/.local/state/subgov/claude-zai.json
 accounts:
   claude-zai:
     source:
-      type: command
-      argv: [/home/coding/.local/bin/subgov-zai-quota]
+      # One fresh normalized snapshot (telemetry + measured eligible demand)
+      # published by the zai-source-refresh timer. The legacy
+      # subgov-zai-quota command carried no eligible_backlog_capacity, so
+      # the controller read demand as unbounded and pinned desired at
+      # max_workers; a failed or stale demand measurement now holds the
+      # fleet instead (subgov-a5c14e89).
+      type: normalized_file
+      path: /home/coding/.local/state/subgov/zai-saturation-live-snapshot.json
     fleet:
       min_workers: 0
       max_workers: 18

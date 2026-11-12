@@ -107,6 +107,7 @@ class ReadyBeadsTests(unittest.TestCase):
                 busy = [{'workspace': str(rust), 'id': 'claimed'}]
                 measured = demand.observe(settings, busy)
                 self.assertEqual(measured['eligible_backlog_capacity'], 4)
+                self.assertEqual(measured['busy_count'], 1)
                 self.assertEqual(len(measured['ready']), 3)
                 self.assertTrue(all(job['workspace'] == str(docs) for job in measured['ready']))
                 settings['max_workers'] = 2

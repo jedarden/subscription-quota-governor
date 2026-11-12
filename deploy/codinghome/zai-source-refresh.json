@@ -22,6 +22,7 @@
   ],
   "heartbeat_dir": "/home/coding/.needle/state/heartbeats",
   "gate_health_dir": "/home/coding/.needle/state/gate-health",
+  "identifier_prefix": "sg-zai-",
   "roster": "/home/coding/.config/subgov/zai-saturation-roster.json",
   "snapshot": "/home/coding/.local/state/subgov/zai-saturation-live-snapshot.json",
   "demand_state": "/home/coding/.local/state/subgov/zai-ready-demand.json",

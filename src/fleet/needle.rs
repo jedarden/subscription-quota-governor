@@ -367,6 +367,63 @@ struct TmuxSession {
     attached: bool,
 }
 
+/// The heartbeat fields elastic scale-down needs: a fresh heartbeat
+/// carrying a current bead marks the worker mid-claim (plan §26.2/§26.6 —
+/// retirement is idle-only, scale-down takes idle workers first).
+#[derive(Deserialize)]
+struct StopHeartbeat {
+    #[serde(rename = "last_heartbeat", alias = "timestamp")]
+    last_heartbeat: DateTime<Utc>,
+    #[serde(default)]
+    current_bead: Option<String>,
+}
+
+/// Names of `sessions` whose fresh heartbeat is mid-claim. A session with
+/// no heartbeat at all, or a stale one, is idle or gone and may be
+/// stopped; an unreadable or malformed heartbeat fails closed as busy
+/// rather than licensing the stop of a worker whose idleness is unproven.
+fn busy_sessions(
+    heartbeat_dir: &Path,
+    adapter: &str,
+    sessions: &[TmuxSession],
+    now: DateTime<Utc>,
+) -> Result<BTreeSet<String>> {
+    let prefix = session_prefix(adapter);
+    let mut busy = BTreeSet::new();
+    for session in sessions {
+        let Some(worker_id) = session.name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let path = heartbeat_dir.join(format!("{adapter}-{worker_id}.json"));
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to open NEEDLE heartbeat {}", path.display())
+                });
+            }
+        };
+        let bytes = super::read_bounded(&mut file, super::MAX_OBSERVER_BYTES)
+            .with_context(|| format!("NEEDLE heartbeat {}", path.display()))?;
+        let heartbeat: StopHeartbeat = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid NEEDLE heartbeat {}", path.display()))?;
+        let age = now
+            .signed_duration_since(heartbeat.last_heartbeat)
+            .num_seconds();
+        let fresh = age < 0 || age < SEED_STALE_AFTER_SECONDS;
+        if fresh
+            && heartbeat
+                .current_bead
+                .as_deref()
+                .is_some_and(|bead| !bead.is_empty())
+        {
+            busy.insert(session.name.clone());
+        }
+    }
+    Ok(busy)
+}
+
 #[allow(clippy::too_many_arguments)] // The adapter's explicit programs, seed policy and exclusion set are independently testable.
 fn reconcile_needle_workers(
     needle_program: &str,
@@ -450,7 +507,14 @@ fn reconcile_needle_workers(
         }
         std::cmp::Ordering::Less => {
             let count = (matching.len() as u32 - desired) as usize;
-            let selected = stop_candidates(&matching, &sessions, count)?;
+            // Idle-first retirement needs the heartbeat dir; without seed
+            // sources configured there is no idleness evidence, so the
+            // stop stays lexicographic over detached sessions (v1 shape).
+            let busy = match seeds {
+                Some(sources) => busy_sessions(sources.heartbeats, adapter, &matching, Utc::now())?,
+                None => BTreeSet::new(),
+            };
+            let selected = stop_candidates(&matching, &sessions, count, &busy)?;
             for session in selected {
                 // NEEDLE's identifier selector is a substring match. Passing
                 // the full session name is exact unless a longer NEEDLE
@@ -537,6 +601,7 @@ fn stop_candidates<'a>(
     matching: &'a [TmuxSession],
     all_sessions: &[TmuxSession],
     count: usize,
+    busy: &BTreeSet<String>,
 ) -> Result<Vec<&'a TmuxSession>> {
     let detached: Vec<_> = matching
         .iter()
@@ -549,7 +614,17 @@ fn stop_candidates<'a>(
         );
     }
 
-    let selected = &detached[..count];
+    // Plan §26.6: scale-down takes idle workers first. A session with a
+    // fresh heartbeat mid-claim is never a stop candidate — `needle stop`
+    // kills the whole process tree, which would end a live attempt
+    // mid-bead (subgov-a5c14e89). When fewer idle workers than the delta
+    // exist, stop only the idle ones; busy workers retire in a later
+    // cycle once their claim finishes.
+    let idle: Vec<_> = detached
+        .into_iter()
+        .filter(|session| !busy.contains(&session.name))
+        .collect();
+    let selected = &idle[..count.min(idle.len())];
     for session in selected {
         let ambiguous = all_sessions.iter().any(|other| {
             other.name != session.name
@@ -898,14 +973,16 @@ mod tests {
             .filter(|session| session.name.starts_with(&session_prefix("codex")))
             .cloned()
             .collect::<Vec<_>>();
-        let selected = stop_candidates(&matching, &all, 1).unwrap();
+        let selected = stop_candidates(&matching, &all, 1, &BTreeSet::new()).unwrap();
         assert_eq!(selected[0].name, "needle-codex-alpha");
     }
 
     #[test]
     fn scale_down_fails_without_stopping_attached_sessions() {
         let all = parse_sessions("needle-codex-alpha\t1\n").unwrap();
-        let err = stop_candidates(&all, &all, 1).unwrap_err().to_string();
+        let err = stop_candidates(&all, &all, 1, &BTreeSet::new())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("only 0 matching sessions are detached"),
             "{err}"
@@ -915,8 +992,79 @@ mod tests {
     #[test]
     fn scale_down_fails_when_needles_substring_selector_is_ambiguous() {
         let all = parse_sessions("needle-codex-alpha\t0\nneedle-codex-alpha-extra\t0\n").unwrap();
-        let err = stop_candidates(&all, &all, 1).unwrap_err().to_string();
+        let err = stop_candidates(&all, &all, 1, &BTreeSet::new())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("another session contains its name"), "{err}");
+    }
+
+    fn stop_heartbeat(dir: &Path, adapter: &str, worker_id: &str, bead: Option<&str>) {
+        let qualified_id = format!("{adapter}-{worker_id}");
+        let mut body = serde_json::json!({
+            "qualified_id": qualified_id,
+            "worker_id": worker_id,
+            "last_heartbeat": Utc::now().to_rfc3339(),
+        });
+        if let Some(bead) = bead {
+            body["current_bead"] = serde_json::Value::String(bead.to_owned());
+        }
+        fs::write(dir.join(format!("{qualified_id}.json")), body.to_string()).unwrap();
+    }
+
+    #[test]
+    fn scale_down_skips_workers_with_a_fresh_mid_claim_heartbeat() {
+        // subgov-a5c14e89: `needle stop` kills the process tree, so a busy
+        // worker must never be a stop candidate, and a busy-blocked delta
+        // stops fewer rather than failing the whole reconciliation.
+        let all = parse_sessions("needle-codex-alpha\t0\nneedle-codex-bravo\t0\n").unwrap();
+        let dir = TempDir::new().unwrap();
+        stop_heartbeat(dir.path(), "codex", "alpha", Some("codex-1"));
+        let busy = busy_sessions(dir.path(), "codex", &all, Utc::now()).unwrap();
+        assert_eq!(busy, BTreeSet::from(["needle-codex-alpha".to_owned()]));
+        let selected = stop_candidates(&all, &all, 2, &busy).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "needle-codex-bravo");
+    }
+
+    #[test]
+    fn scale_down_treats_stale_or_absent_heartbeats_as_idle() {
+        let all = parse_sessions("needle-codex-alpha\t0\nneedle-codex-bravo\t0\n").unwrap();
+        let dir = TempDir::new().unwrap();
+        let stale = Utc::now() - ChronoDuration::seconds(SEED_STALE_AFTER_SECONDS + 1);
+        stop_heartbeat(dir.path(), "codex", "alpha", Some("codex-1"));
+        // alpha's only heartbeat is stale: the worker is gone, not busy.
+        let path = dir.path().join("codex-alpha.json");
+        let mut body: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        body["last_heartbeat"] = serde_json::Value::String(stale.to_rfc3339());
+        fs::write(&path, body.to_string()).unwrap();
+        let busy = busy_sessions(dir.path(), "codex", &all, Utc::now()).unwrap();
+        assert!(busy.is_empty());
+        // bravo has no heartbeat file at all: idle by absence.
+        let selected = stop_candidates(&all, &all, 2, &busy).unwrap();
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn scale_down_fails_closed_on_a_malformed_busy_heartbeat() {
+        let all = parse_sessions("needle-codex-alpha\t0\n").unwrap();
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("codex-alpha.json"), "{not json").unwrap();
+        let err = busy_sessions(dir.path(), "codex", &all, Utc::now())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid NEEDLE heartbeat"), "{err}");
+    }
+
+    #[test]
+    fn busy_sessions_ignore_heartbeats_of_other_workers() {
+        let all = parse_sessions("needle-codex-alpha\t0\n").unwrap();
+        let dir = TempDir::new().unwrap();
+        // A busy heartbeat for a worker with no session must not leak into
+        // the set: names are matched through the adapter session prefix.
+        stop_heartbeat(dir.path(), "codex", "straggler", Some("codex-9"));
+        let busy = busy_sessions(dir.path(), "codex", &all, Utc::now()).unwrap();
+        assert!(busy.is_empty());
     }
 
     #[cfg(unix)]
