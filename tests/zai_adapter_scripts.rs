@@ -14,7 +14,6 @@ fn python_adapter_contracts() {
             "-p",
             "test_*.py",
         ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("HOME", isolated_home.path())
         .env("PYTHONDONTWRITEBYTECODE", "1");
     // The host's `bead` may be a router that locates the native binary through

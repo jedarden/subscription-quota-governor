@@ -47,7 +47,7 @@ fn cycle(busy: bool, observe_only: bool) {
         .to_string(),
     )
     .unwrap();
-    let module_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
+    let module_dir = std::path::Path::new("scripts");
     fs::write(&script, r#"import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])

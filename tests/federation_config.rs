@@ -125,9 +125,17 @@ fn duplicate_effective_prefixes_are_rejected_before_secondary_host_rewrite() {
 
 #[test]
 fn shipped_example_configs_pass_the_strict_loader() {
-    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    // cargo runs test binaries with the package root as the current
+    // directory, so the relative path tracks the checkout under test even
+    // when a binary compiled in one extraction is reused in another via the
+    // shared target dir. An absolute env!("CARGO_MANIFEST_DIR") path is
+    // baked in at compile time, outlives its directory, and made this check
+    // flake between NotFound and another extraction's stale examples.
+    let examples = Path::new("examples");
     let mut checked = 0;
-    for entry in fs::read_dir(&examples).unwrap() {
+    let entries = fs::read_dir(examples)
+        .unwrap_or_else(|error| panic!("examples under {:?}: {error}", std::env::current_dir()));
+    for entry in entries {
         let path = entry.unwrap().path();
         if path
             .extension()
